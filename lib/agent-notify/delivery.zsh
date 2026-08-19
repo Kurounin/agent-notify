@@ -86,7 +86,7 @@ agent_notify_deliver() {
   local kind=$1 source=$2 project=$3 title message priority credentials credential_result generation user_key app_token output
   case $kind in
     attention) message='Attention required'; priority=0 ;;
-    completed) message='Turn complete'; priority=-1 ;;
+    completed) message='Turn complete'; priority=0 ;;
     failed) message='Agent error'; priority=0 ;;
     *) return 1 ;;
   esac

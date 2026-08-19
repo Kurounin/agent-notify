@@ -248,7 +248,7 @@ agent_notify_curl_request() {
   [[ $request_config == *"data-urlencode = \"title=$AGENT_NOTIFY_EXPECTED_TITLE\""* && $request_config == *"data-urlencode = \"message=$AGENT_NOTIFY_EXPECTED_MESSAGE\""* && $request_config == *"data-urlencode = \"priority=$AGENT_NOTIFY_EXPECTED_PRIORITY\""* ]] || return 1
   print -rn -- $'{"status":1,"request":"delivery-content"}\nAGENT_NOTIFY_META:200:{}'
 }
-for delivery_case in 'attention|Attention required|0' 'completed|Turn complete|-1' 'failed|Agent error|0'; do
+for delivery_case in 'attention|Attention required|0' 'completed|Turn complete|0' 'failed|Agent error|0'; do
   IFS='|' read -r delivery_kind AGENT_NOTIFY_EXPECTED_MESSAGE AGENT_NOTIFY_EXPECTED_PRIORITY <<< "$delivery_case"
   AGENT_NOTIFY_EXPECTED_TITLE='Claude Code — delivery-project'
   agent_notify_deliver "$delivery_kind" claude-code delivery-project || { print -u2 -- 'delivery content did not match event kind'; exit 1; }

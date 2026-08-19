@@ -39,7 +39,7 @@ The system SHALL maintain short-lived local state keyed by a non-reversible deri
 - **THEN** the system SHALL NOT deliver a later completion notification for that turn
 
 ### Requirement: Deliver privacy-minimized Pushover messages
-The system SHALL retrieve the Pushover user key and application token from the logged-in user's macOS Keychain and deliver messages only to Pushover's fixed HTTPS endpoint with TLS verification, redirects disabled, a five-second total timeout, and no retries. It SHALL send only the agent name, a sanitized and length-bounded basename of the session directory, and a normalized state message to Pushover. It SHALL use quiet priority for completion and normal priority for attention and agent-error notifications. Adapter values SHALL be treated as untrusted data and SHALL NOT alter transport options, destination, or request structure.
+The system SHALL retrieve the Pushover user key and application token from the logged-in user's macOS Keychain and deliver messages only to Pushover's fixed HTTPS endpoint with TLS verification, redirects disabled, a five-second total timeout, and no retries. It SHALL send only the agent name, a sanitized and length-bounded basename of the session directory, and a normalized state message to Pushover. It SHALL use normal priority for completion, attention, and agent-error notifications. Adapter values SHALL be treated as untrusted data and SHALL NOT alter transport options, destination, or request structure.
 
 #### Scenario: A permission request requires action
 - **WHEN** an adapter submits an `attention` event with a session directory
@@ -47,7 +47,7 @@ The system SHALL retrieve the Pushover user key and application token from the l
 
 #### Scenario: A completion is eligible for delivery
 - **WHEN** a `completed` event passes the suppression rules
-- **THEN** the system SHALL deliver a quiet notification indicating that the turn is complete
+- **THEN** the system SHALL deliver a normal-priority notification indicating that the turn is complete
 
 ### Requirement: Fail open without exposing secrets
 The system SHALL return success to adapter-invoked lifecycle processing when credential lookup, state handling, or Pushover delivery fails. It SHALL NOT write secrets, prompt content, assistant messages, tool input/output, source code, raw events, session identifiers, paths, Pushover request bodies, or third-party response bodies to state or diagnostic logs. It SHALL NOT place Pushover credentials in process arguments, environment variables, temporary files, or persistent curl configuration. State and diagnostic directories SHALL be user-only, and diagnostics SHALL contain only timestamp, component, categorical error code, HTTP status, and Pushover request identifier with bounded retention.

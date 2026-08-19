@@ -1,0 +1,94 @@
+#!/bin/zsh
+
+unsetopt xtrace verbose
+emulate -R zsh
+setopt no_unset pipe_fail
+
+typeset executable_path
+if [[ $0 == */* ]]; then
+  executable_path=${0:A}
+else
+  executable_path=$(whence -p -- "$0") || {
+    print -u2 -- 'agent-notify: executable path cannot be resolved'
+    exit 1
+  }
+fi
+export PATH='/usr/bin:/bin:/usr/sbin:/sbin'
+unset CDPATH ENV BASH_ENV ZDOTDIR
+
+typeset -gr AGENT_NOTIFY_HOME=${executable_path:h:h}
+typeset -gr AGENT_NOTIFY_LIB_DIR="$AGENT_NOTIFY_HOME/lib/agent-notify"
+[[ -r "$AGENT_NOTIFY_LIB_DIR/config.zsh" ]] || {
+  print -u2 -- 'agent-notify: installed library tree is missing'
+  exit 1
+}
+source "$AGENT_NOTIFY_LIB_DIR/config.zsh"
+source "$AGENT_NOTIFY_LIB_DIR/version.zsh"
+source "$AGENT_NOTIFY_LIB_DIR/json.zsh"
+source "$AGENT_NOTIFY_LIB_DIR/state.zsh"
+source "$AGENT_NOTIFY_LIB_DIR/delivery.zsh"
+source "$AGENT_NOTIFY_LIB_DIR/event.zsh"
+
+agent_notify_usage() {
+  print -u2 -- "usage: agent-notify {event|smoke-test|supported-versions|validate-version}"
+}
+
+agent_notify_smoke_terminate_tree() {
+  local pid=$1 excluded_pid=$2 child
+  for child in $(/usr/bin/pgrep -P "$pid" 2>/dev/null); do
+    [[ $child == "$excluded_pid" ]] || agent_notify_smoke_terminate_tree "$child" "$excluded_pid"
+  done
+  /bin/kill -TERM "$pid" 2>/dev/null || true
+}
+
+agent_notify_smoke_watchdog() {
+  local target_pid=$1 timeout=$2 watchdog_pid
+  watchdog_pid=$(/bin/sh -c 'printf "%s\n" "$PPID"')
+  /bin/sleep "$timeout"
+  kill -0 "$target_pid" 2>/dev/null || return 0
+  agent_notify_diag transport smoke_timeout 0 -
+  print -u2 -- "agent-notify: smoke test timed out (see sanitized diagnostics)"
+  agent_notify_smoke_terminate_tree "$target_pid" "$watchdog_pid"
+}
+
+agent_notify_smoke_test() {
+  local timeout=${AGENT_NOTIFY_SMOKE_TEST_TIMEOUT_SECONDS:-30} watchdog_pid result
+  [[ $timeout =~ '^[1-9][0-9]*$' ]] || timeout=30
+  agent_notify_smoke_watchdog "$$" "$timeout" &
+  watchdog_pid=$!
+  agent_notify_deliver attention claude-code "Notifier smoke test"
+  result=$?
+  /bin/kill -TERM "$watchdog_pid" 2>/dev/null || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  if (( result )); then
+    print -u2 -- "agent-notify: smoke test delivery failed (see sanitized diagnostics)"
+    return 1
+  fi
+  print -- "agent-notify: smoke test delivered"
+}
+
+case ${1:-} in
+  event)
+    shift
+    (( $# == 0 )) || { agent_notify_usage; exit 2; }
+    agent_notify_event
+    ;;
+  __locked)
+    AGENT_NOTIFY_LOCKED_PROCESS=1
+    agent_notify_event
+    ;;
+  smoke-test)
+    agent_notify_smoke_test
+    ;;
+  supported-versions)
+    agent_notify_print_supported_versions
+    ;;
+  validate-version)
+    (( $# == 3 )) || { agent_notify_usage; exit 2; }
+    agent_notify_validate_version "$2" "$3"
+    ;;
+  *)
+    agent_notify_usage
+    exit 2
+    ;;
+esac

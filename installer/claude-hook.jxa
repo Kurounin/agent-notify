@@ -1,0 +1,38 @@
+#!/usr/bin/osascript -l JavaScript
+
+ObjC.import('Foundation');
+
+const processArguments = $.NSProcessInfo.processInfo.arguments;
+const args = [];
+for (let index = 0; index < processArguments.count; index += 1) args.push(ObjC.unwrap(processArguments.objectAtIndex(index)));
+const event = args[4];
+const rawData = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+const raw = ObjC.unwrap($.NSString.alloc.initWithDataEncoding(rawData, $.NSUTF8StringEncoding));
+
+function output(value) {
+  $.NSFileHandle.fileHandleWithStandardOutput.writeData($(value + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
+}
+
+function value(object, names) {
+  for (const name of names) {
+    if (typeof object[name] === 'string' && object[name].length > 0) return object[name];
+  }
+  return undefined;
+}
+
+try {
+  const payload = JSON.parse(raw);
+  const agentType = payload.agent_type || payload.agentType || payload.agent?.type;
+  if (payload.is_background === true || payload.is_subagent === true || payload.agent?.is_background === true || payload.agent?.is_subagent === true || payload.parent_tool_use_id || ['subagent', 'background', 'background_agent'].includes(agentType)) throw new Error('ignored non-main agent');
+  if (agentType && !['main', 'main_agent'].includes(agentType)) throw new Error('ignored agent type');
+  const sessionID = value(payload, ['session_id', 'sessionId']);
+  const sessionDir = value(payload, ['session_dir', 'cwd', 'directory']);
+  if (!sessionID || !sessionDir) throw new Error('ignored incomplete payload');
+  if (event === 'attention' && !['permission_prompt', 'elicitation_dialog', 'elicitation_url_dialog'].includes(payload.notification_type)) throw new Error('ignored notification type');
+  const normalized = { source: 'claude-code', kind: event, session_id: sessionID, session_dir: sessionDir };
+  const requestID = value(payload, ['request_id', 'requestId', 'notification_id']) || (event === 'attention' ? `claude-notification:${sessionID}:${payload.notification_type}` : undefined);
+  if (requestID) normalized.request_id = requestID;
+  output(JSON.stringify(normalized));
+} catch (_) {
+  // Hooks are advisory: malformed payloads must not change Claude execution.
+}

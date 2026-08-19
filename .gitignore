@@ -1,0 +1,10 @@
+# dev env
+/openspec/changes/
+.DS_Store
+
+# AI agent / dev-tool local state (never commit)
+.claude/
+.junie/
+.opencode/
+.serena/
+.superpowers/

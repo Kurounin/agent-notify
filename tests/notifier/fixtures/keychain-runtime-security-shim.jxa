@@ -1,0 +1,38 @@
+(() => {
+  const account = 'agent-notify';
+  const values = {
+    'agent-notify.pushover.v2.active-generation': '1720000000-54321',
+    'agent-notify.pushover.v2.user-key.1720000000-54321': 'userkey012345678901234567890123',
+    'agent-notify.pushover.v2.app-token.1720000000-54321': 'apptoken01234567890123456789012',
+  };
+
+  function securityString(constant) {
+    return $(ObjC.unwrap(ObjC.castRefToObject(constant)));
+  }
+
+  function securityBoolean(constant) {
+    return ObjC.castRefToObject(constant);
+  }
+
+  function value(dictionary, key) {
+    return dictionary.objectForKey(securityString(key));
+  }
+
+  function service(query) {
+    const itemClass = value(query, $.kSecClass);
+    const itemService = value(query, $.kSecAttrService);
+    const itemAccount = value(query, $.kSecAttrAccount);
+    if (Number(query.count) !== 5 || !itemClass || ObjC.unwrap(itemClass) !== ObjC.unwrap(securityString($.kSecClassGenericPassword)) || !itemService || ObjC.unwrap(itemAccount) !== account || !value(query, $.kSecReturnData).isEqual(securityBoolean($.kCFBooleanTrue)) || ObjC.unwrap(value(query, $.kSecMatchLimit)) !== ObjC.unwrap(securityString($.kSecMatchLimitOne))) {
+      throw new Error('invalid runtime Keychain query');
+    }
+    return ObjC.unwrap(itemService);
+  }
+
+  return {
+    copyMatching: (query, result) => {
+      const itemService = service(query);
+      if (!(itemService in values)) return { status: -25300 };
+      return { status: 0, data: $(values[itemService]).dataUsingEncoding($.NSUTF8StringEncoding) };
+    },
+  };
+})()

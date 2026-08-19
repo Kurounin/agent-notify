@@ -1,0 +1,77 @@
+(() => {
+  const logPath = ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey('AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM_LOG'));
+  const items = new Set();
+
+  function log(value) {
+    const handle = $.NSFileHandle.fileHandleForWritingAtPath($(logPath));
+    handle.seekToEndOfFile;
+    handle.writeData($(value + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
+    handle.closeFile;
+  }
+
+  function securityString(constant) {
+    return $(ObjC.unwrap(ObjC.castRefToObject(constant)));
+  }
+
+  function value(dictionary, key) {
+    return dictionary.objectForKey(securityString(key));
+  }
+
+  function service(query) {
+    const itemClass = value(query, $.kSecClass);
+    const itemService = value(query, $.kSecAttrService);
+    const itemAccount = value(query, $.kSecAttrAccount);
+    if (!itemClass) throw new Error('missing Keychain item class');
+    if (ObjC.unwrap(itemClass) !== ObjC.unwrap(securityString($.kSecClassGenericPassword))) throw new Error('invalid Keychain item class');
+    if (!itemService) throw new Error('missing Keychain item service');
+    if (ObjC.unwrap(itemAccount) !== 'agent-notify') throw new Error('invalid Keychain item account');
+    return ObjC.unwrap(itemService);
+  }
+
+  function hasPasswordData(dictionary) {
+    if (!value(dictionary, $.kSecValueData)) throw new Error('missing Keychain password data');
+  }
+
+  function hasReturnAttributes(dictionary) {
+    if (!value(dictionary, $.kSecReturnAttributes)) throw new Error('missing Keychain return attributes');
+  }
+
+  function hasNoReturnAttributes(dictionary) {
+    if (value(dictionary, $.kSecReturnAttributes)) throw new Error('Keychain update query included return attributes');
+  }
+
+  return {
+    add: (query) => {
+      if (Number(query.count) !== 4) throw new Error('malformed Keychain add query');
+      hasPasswordData(query);
+      const itemService = service(query);
+      log(`add ${itemService}`);
+      if (items.has(itemService)) return -25299;
+      items.add(itemService);
+      return 0;
+    },
+    copyMatching: (query, result) => {
+      if (Number(query.count) !== 4) throw new Error('malformed Keychain lookup query');
+      const itemService = service(query);
+      hasReturnAttributes(query);
+      log(`lookup ${itemService}`);
+      return items.has(itemService) ? 0 : -25300;
+    },
+    update: (query, attributes) => {
+      if (Number(query.count) !== 3) throw new Error('malformed Keychain update query');
+      hasPasswordData(attributes);
+      const itemService = service(query);
+      hasNoReturnAttributes(query);
+      log(`update ${itemService}`);
+      return items.has(itemService) ? 0 : -25300;
+    },
+    remove: (query) => {
+      if (Number(query.count) !== 3) throw new Error('malformed Keychain remove query');
+      const itemService = service(query);
+      log(`remove ${itemService}`);
+      if (!items.has(itemService)) return -25300;
+      items.delete(itemService);
+      return 0;
+    },
+  };
+})()

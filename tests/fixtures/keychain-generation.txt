@@ -1,0 +1,3 @@
+agent-notify.pushover.v2.active-generation	generation-test-01
+agent-notify.pushover.v2.user-key.generation-test-01	userkey012345678901234567890123
+agent-notify.pushover.v2.app-token.generation-test-01	apptoken01234567890123456789012

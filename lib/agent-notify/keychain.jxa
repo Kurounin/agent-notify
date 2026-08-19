@@ -1,0 +1,76 @@
+#!/usr/bin/osascript -l JavaScript
+
+ObjC.import('Foundation');
+ObjC.import('Security');
+
+const processArguments = $.NSProcessInfo.processInfo.arguments;
+const args = [];
+for (let index = 0; index < processArguments.count; index += 1) args.push(ObjC.unwrap(processArguments.objectAtIndex(index)));
+const action = args[4];
+const account = 'agent-notify';
+const selectorService = 'agent-notify.pushover.v2.active-generation';
+const userService = (generation) => `agent-notify.pushover.v2.user-key.${generation}`;
+const tokenService = (generation) => `agent-notify.pushover.v2.app-token.${generation}`;
+
+function securityString(constant) {
+  return $(ObjC.unwrap(ObjC.castRefToObject(constant)));
+}
+
+function securityBoolean(constant) {
+  return ObjC.castRefToObject(constant);
+}
+
+function output(value) {
+  $.NSFileHandle.fileHandleWithStandardOutput.writeData($(value + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
+}
+
+function keychainQuery(service) {
+  const query = $.NSMutableDictionary.dictionary;
+  query.setObjectForKey(securityString($.kSecClassGenericPassword), securityString($.kSecClass));
+  query.setObjectForKey($(service), securityString($.kSecAttrService));
+  query.setObjectForKey($(account), securityString($.kSecAttrAccount));
+  query.setObjectForKey(securityBoolean($.kCFBooleanTrue), securityString($.kSecReturnData));
+  query.setObjectForKey(securityString($.kSecMatchLimitOne), securityString($.kSecMatchLimit));
+  return query;
+}
+
+function securityInterface() {
+  const shimPath = ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey('AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM'));
+  if (shimPath) {
+    const shimData = $.NSData.dataWithContentsOfFile($(shimPath));
+    if (!shimData) throw new Error('Keychain security shim unavailable');
+    return eval(ObjC.unwrap($.NSString.alloc.initWithDataEncoding(shimData, $.NSUTF8StringEncoding)));
+  }
+  return { copyMatching: (query, result) => $.SecItemCopyMatching(query, result) };
+}
+
+const security = securityInterface();
+
+function readValue(stage, service) {
+  const result = ObjC.Ref();
+  const response = security.copyMatching(keychainQuery(service), result);
+  const status = typeof response === 'number' ? response : response.status;
+  if (status !== 0) return { stage, status };
+  const resultData = typeof response === 'number' ? ObjC.castRefToObject(result[0]) : response.data;
+  const value = ObjC.unwrap($.NSString.alloc.initWithDataEncoding(resultData, $.NSUTF8StringEncoding));
+  return value ? { value } : { stage, status: -50 };
+}
+
+try {
+  if (action !== 'read') output('error\taction\t-50');
+  else {
+    const selector = readValue('selector', selectorService);
+    if (selector.status !== undefined) output(`error\t${selector.stage}\t${selector.status}`);
+    else if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(selector.value)) output('error\tselector\t-50');
+    else {
+      const user = readValue('user', userService(selector.value));
+      const token = readValue('token', tokenService(selector.value));
+      if (user.status !== undefined) output(`error\t${user.stage}\t${user.status}`);
+      else if (token.status !== undefined) output(`error\t${token.stage}\t${token.status}`);
+      else if (!/^[A-Za-z0-9]+$/.test(user.value) || !/^[A-Za-z0-9]+$/.test(token.value)) output('error\tcredential\t-50');
+      else output(`ok\t${selector.value}\t${user.value}\t${token.value}`);
+    }
+  }
+} catch (error) {
+  output('error\truntime\t-50');
+}

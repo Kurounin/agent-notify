@@ -1,0 +1,17 @@
+{
+  "unrelated": {
+    "enabled": true
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/local/bin/keep-this"
+          }
+        ]
+      }
+    ]
+  }
+}

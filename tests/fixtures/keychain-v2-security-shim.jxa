@@ -1,0 +1,90 @@
+(() => {
+  const account = 'agent-notify';
+  const generation = '1720000000-54321';
+  const v2Selector = 'agent-notify.pushover.v2.active-generation';
+  const values = {
+    [v2Selector]: generation,
+    [`agent-notify.pushover.v2.user-key.${generation}`]: 'userkey012345678901234567890123',
+    [`agent-notify.pushover.v2.app-token.${generation}`]: 'apptoken01234567890123456789012',
+  };
+  const items = new Set();
+  const environment = $.NSProcessInfo.processInfo.environment;
+  const logPath = ObjC.unwrap(environment.objectForKey('AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM_LOG'));
+  const failureStage = ObjC.unwrap(environment.objectForKey('AGENT_NOTIFY_KEYCHAIN_TEST_FAILURE_STAGE'));
+
+  function log(value) {
+    if (!logPath) return;
+    const handle = $.NSFileHandle.fileHandleForWritingAtPath($(logPath));
+    handle.seekToEndOfFile;
+    handle.writeData($(value + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
+    handle.closeFile;
+  }
+
+  function securityString(constant) {
+    return $(ObjC.unwrap(ObjC.castRefToObject(constant)));
+  }
+
+  function securityBoolean(constant) {
+    return ObjC.castRefToObject(constant);
+  }
+
+  function value(dictionary, key) {
+    return dictionary.objectForKey(securityString(key));
+  }
+
+  function service(query) {
+    const itemClass = value(query, $.kSecClass);
+    const itemService = value(query, $.kSecAttrService);
+    const itemAccount = value(query, $.kSecAttrAccount);
+    if (!itemClass || ObjC.unwrap(itemClass) !== ObjC.unwrap(securityString($.kSecClassGenericPassword)) || !itemService || ObjC.unwrap(itemAccount) !== account) {
+      throw new Error('invalid Keychain query');
+    }
+    return ObjC.unwrap(itemService);
+  }
+
+  function stage(itemService) {
+    if (itemService === v2Selector) return 'selector';
+    if (itemService.startsWith('agent-notify.pushover.v2.user-key.')) return 'user';
+    if (itemService.startsWith('agent-notify.pushover.v2.app-token.')) return 'token';
+    return 'legacy';
+  }
+
+  return {
+    add: (query) => {
+      if (Number(query.count) !== 4 || !value(query, $.kSecValueData)) throw new Error('invalid Keychain add query');
+      const itemService = service(query);
+      log(`add ${itemService}`);
+      if (items.has(itemService)) return -25299;
+      items.add(itemService);
+      return 0;
+    },
+    copyMatching: (query, result) => {
+      const itemService = service(query);
+      const itemStage = stage(itemService);
+      log(`lookup ${itemService}`);
+      if (value(query, $.kSecReturnData)) {
+        if (Number(query.count) !== 5 || !value(query, $.kSecReturnData).isEqual(securityBoolean($.kCFBooleanTrue)) || ObjC.unwrap(value(query, $.kSecMatchLimit)) !== ObjC.unwrap(securityString($.kSecMatchLimitOne)) || typeof result !== 'function') throw new Error('invalid runtime Keychain query');
+        if (itemStage === 'legacy') return { status: -25293 };
+        if (failureStage === itemStage) return { status: -25291 };
+        if (!(itemService in values)) return { status: -25300 };
+        return { status: 0, data: $(values[itemService]).dataUsingEncoding($.NSUTF8StringEncoding) };
+      }
+      if (Number(query.count) !== 4 || !value(query, $.kSecReturnAttributes)) throw new Error('invalid Keychain lookup query');
+      return items.has(itemService) ? 0 : -25300;
+    },
+    update: (query, attributes) => {
+      if (Number(query.count) !== 3 || !value(attributes, $.kSecValueData) || value(query, $.kSecReturnAttributes)) throw new Error('invalid Keychain update');
+      const itemService = service(query);
+      log(`update ${itemService}`);
+      return items.has(itemService) ? 0 : -25300;
+    },
+    remove: (query) => {
+      if (Number(query.count) !== 3) throw new Error('invalid Keychain remove query');
+      const itemService = service(query);
+      log(`remove ${itemService}`);
+      if (!items.has(itemService)) return -25300;
+      items.delete(itemService);
+      return 0;
+    },
+  };
+})()

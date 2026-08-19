@@ -1,0 +1,123 @@
+#!/usr/bin/osascript -l JavaScript
+
+// Credentials arrive only over standard input. Service/account identifiers are fixed
+// public metadata; no credential is passed through argv, environment, or a file.
+ObjC.import('Foundation');
+ObjC.import('Security');
+
+const processArguments = $.NSProcessInfo.processInfo.arguments;
+const args = [];
+for (let index = 0; index < processArguments.count; index += 1) args.push(ObjC.unwrap(processArguments.objectAtIndex(index)));
+const action = args[4];
+const account = 'agent-notify';
+const selectorService = 'agent-notify.pushover.v2.active-generation';
+const userService = (generation) => `agent-notify.pushover.v2.user-key.${generation}`;
+const tokenService = (generation) => `agent-notify.pushover.v2.app-token.${generation}`;
+
+function stdin() {
+  const data = $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+  return ObjC.unwrap($.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding));
+}
+
+function data(value) {
+  return $(value).dataUsingEncoding($.NSUTF8StringEncoding);
+}
+
+function securityString(constant) {
+  return $(ObjC.unwrap(ObjC.castRefToObject(constant)));
+}
+
+function output(value) {
+  $.NSFileHandle.fileHandleWithStandardOutput.writeData($(value + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
+}
+
+function keychainQuery(service) {
+  const query = $.NSMutableDictionary.dictionary;
+  query.setObjectForKey(securityString($.kSecClassGenericPassword), securityString($.kSecClass));
+  query.setObjectForKey($(service), securityString($.kSecAttrService));
+  query.setObjectForKey($(account), securityString($.kSecAttrAccount));
+  return query;
+}
+
+function securityInterface() {
+  const shimPath = ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey('AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM'));
+  if (shimPath) {
+    const shimData = $.NSData.dataWithContentsOfFile($(shimPath));
+    if (!shimData) throw new Error('Keychain security shim unavailable');
+    return eval(ObjC.unwrap($.NSString.alloc.initWithDataEncoding(shimData, $.NSUTF8StringEncoding)));
+  }
+  return {
+    add: (query) => $.SecItemAdd(query, null),
+    copyMatching: (query, result) => $.SecItemCopyMatching(query, result),
+    update: (query, attributes) => $.SecItemUpdate(query, attributes),
+    remove: (query) => $.SecItemDelete(query),
+  };
+}
+
+const security = securityInterface();
+
+function exists(service) {
+  const query = keychainQuery(service);
+  query.setObjectForKey($.NSNumber.numberWithBool(true), securityString($.kSecReturnAttributes));
+  const result = $();
+  return security.copyMatching(query, result);
+}
+
+// Replacements create a new generation first and flip the selector last.
+function addNew(service, value) {
+  const query = keychainQuery(service);
+  query.setObjectForKey(data(value), securityString($.kSecValueData));
+  const status = security.add(query);
+  if (status !== 0) throw new Error(`Keychain add failed (${status})`);
+}
+
+function replace(service, value) {
+  const lookupStatus = exists(service);
+  if (lookupStatus === -25300) return addNew(service, value);
+  if (lookupStatus !== 0) throw new Error(`Keychain lookup failed (${lookupStatus})`);
+  const attributes = $.NSMutableDictionary.alloc.init;
+  attributes.setObjectForKey(data(value), securityString($.kSecValueData));
+  const status = security.update(keychainQuery(service), attributes);
+  if (status !== 0) throw new Error(`Keychain update failed (${status})`);
+}
+
+function remove(service) {
+  const query = keychainQuery(service);
+  const lookupStatus = exists(service);
+  if (lookupStatus === -25300) return;
+  if (lookupStatus !== 0) throw new Error(`Keychain lookup failed (${lookupStatus})`);
+  const status = security.remove(query);
+  if (status !== 0) throw new Error(`Keychain delete failed (${status})`);
+}
+
+function state() {
+  // State inspection deliberately uses no password retrieval. The shell performs
+  // equivalent `security find-generic-password` probes when this helper is injected.
+  output('unknown');
+}
+
+try {
+  if (action === 'state') state();
+  else {
+    const input = JSON.parse(stdin());
+    if (action === 'store') {
+      addNew(userService(input.generation), input.user);
+      addNew(tokenService(input.generation), input.token);
+      replace(selectorService, input.generation);
+    } else if (action === 'rollback') {
+      if (input.selector) replace(selectorService, input.selector);
+      else remove(selectorService);
+      remove(userService(input.generation));
+      remove(tokenService(input.generation));
+    } else if (action === 'remove') {
+      remove(selectorService);
+      remove(userService(input.generation));
+      remove(tokenService(input.generation));
+      if (input.previous) { remove(userService(input.previous)); remove(tokenService(input.previous)); }
+    } else if (action === 'retire') {
+      if (input.previous) { remove(userService(input.previous)); remove(tokenService(input.previous)); }
+    } else throw new Error('unknown action');
+  }
+} catch (error) {
+  throw error;
+}

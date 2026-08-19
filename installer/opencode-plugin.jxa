@@ -1,0 +1,33 @@
+#!/usr/bin/osascript -l JavaScript
+
+ObjC.import('Foundation');
+
+const processArguments = $.NSProcessInfo.processInfo.arguments;
+const args = [];
+for (let index = 0; index < processArguments.count; index += 1) args.push(ObjC.unwrap(processArguments.objectAtIndex(index)));
+const sourcePath = args[4];
+const outputPath = args[5];
+const notifierPath = args[6];
+
+function readText(path) {
+  const error = Ref();
+  const text = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, error);
+  if (text === null) throw new Error(ObjC.unwrap(error[0].localizedDescription));
+  return ObjC.unwrap(text);
+}
+
+function writeText(path, text) {
+  const error = Ref();
+  if (!$(text).writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, error)) throw new Error(ObjC.unwrap(error[0].localizedDescription));
+}
+
+try {
+  let source = readText(sourcePath);
+  if (!source.includes('binary = "agent-notify"')) throw new Error('unrecognized OpenCode binary template');
+  if (!source.includes('spawn([binary, "event"], {')) throw new Error('OpenCode template does not invoke the event subcommand');
+  if (!source.includes('session_dir') || !source.includes('request_id')) throw new Error('OpenCode template does not use the normalized event contract');
+  source = source.replace('binary = "agent-notify"', `binary = ${JSON.stringify(notifierPath)}`);
+  writeText(outputPath, `// >>> agent-notify managed plugin >>>\n${source}`);
+} catch (error) {
+  throw error;
+}

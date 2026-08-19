@@ -1,0 +1,25 @@
+#!/usr/bin/osascript -l JavaScript
+
+ObjC.import('Foundation');
+
+const processArguments = $.NSProcessInfo.processInfo.arguments;
+const args = [];
+for (let index = 0; index < processArguments.count; index += 1) args.push(ObjC.unwrap(processArguments.objectAtIndex(index)));
+const path = args[4];
+const field = args[5];
+const error = Ref();
+function output(value) {
+  $.NSFileHandle.fileHandleWithStandardOutput.writeData($(value + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
+}
+const text = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, error);
+if (text === null) {
+  throw new Error(ObjC.unwrap(error[0].localizedDescription));
+}
+try {
+  const manifest = JSON.parse(ObjC.unwrap(text));
+  const value = field.split('.').reduce((object, key) => object[key], manifest);
+  if (typeof value !== 'string' && typeof value !== 'boolean') throw new Error('manifest field is not a scalar');
+  output(String(value));
+} catch (exception) {
+  throw exception;
+}

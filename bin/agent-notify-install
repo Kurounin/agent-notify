@@ -1,0 +1,429 @@
+#!/usr/bin/env zsh
+
+unsetopt xtrace verbose
+setopt errexit no_unset pipe_fail
+
+typeset root=${0:A:h:h}
+source "$root/lib/agent-notify/config.zsh"
+source "$root/lib/agent-notify/version.zsh"
+typeset -r keychain_account='agent-notify'
+typeset -r keychain_selector_service="$AGENT_NOTIFY_KEYCHAIN_SELECTOR_SERVICE"
+
+typeset install_home=${AGENT_NOTIFY_INSTALL_HOME:-$HOME}
+typeset security_bin=${AGENT_NOTIFY_INSTALL_SECURITY_BIN:-$AGENT_NOTIFY_SECURITY_BIN}
+typeset jxa_bin=${AGENT_NOTIFY_INSTALL_JXA_BIN:-$AGENT_NOTIFY_JXA_BIN}
+typeset curl_bin=${AGENT_NOTIFY_INSTALL_CURL_BIN:-/usr/bin/curl}
+typeset keychain_helper=${AGENT_NOTIFY_INSTALL_KEYCHAIN_HELPER:-$root/installer/keychain.jxa}
+typeset settings_helper=${AGENT_NOTIFY_INSTALL_SETTINGS_HELPER:-$root/installer/claude-settings.jxa}
+typeset manifest_helper=${AGENT_NOTIFY_INSTALL_MANIFEST_HELPER:-$root/installer/manifest.jxa}
+typeset plugin_helper=${AGENT_NOTIFY_INSTALL_PLUGIN_HELPER:-$root/installer/opencode-plugin.jxa}
+typeset install_bin="$install_home/.local/bin/agent-notify"
+typeset install_lib="$install_home/.local/lib/agent-notify"
+typeset claude_hook_path="$install_home/.local/bin/agent-notify-claude-hook"
+typeset claude_hook_jxa_path="$install_home/.local/bin/agent-notify-claude-hook.jxa"
+typeset plugin_path="$install_home/.config/opencode/plugins/agent-notify.js"
+typeset settings_path="$install_home/.claude/settings.json"
+typeset state_dir="$install_home/Library/Application Support/agent-notify"
+typeset manifest_path="$state_dir/install-manifest.json"
+typeset backup_root="$state_dir/install-backups"
+typeset command_prefix="$claude_hook_path"
+typeset dry_run=0 rollback=0 backup_dir='' preflight_stage='' generation='' selector_before='' backup_root_created=0 state_dir_existed=0
+typeset user_key='' app_token='' settings_existed=0 bin_existed=0 lib_existed=0 hook_existed=0 hook_jxa_existed=0 plugin_existed=0
+typeset bin_post_hash='' lib_post_hash='' hook_post_hash='' hook_jxa_post_hash='' plugin_post_hash='' settings_post_hash='' manifest_post_hash='' manifest_existed=0 mutation_started=0 completed=0
+typeset -a attempt_created_dirs
+
+usage() { print -u2 -- 'usage: agent-notify-install [--dry-run|--rollback]'; }
+die() { print -u2 -- "agent-notify-install: $*"; exit 1; }
+sha256() { /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'; }
+mode() { /usr/bin/stat -f '%Lp' "$1"; }
+command_path() { command -v "$1" 2>/dev/null || true; }
+
+probe_keychain() {
+  "$security_bin" find-generic-password -a "$keychain_account" -s "$1" >/dev/null 2>&1
+}
+
+read_tty() {
+  local prompt=$1 value
+  if [[ -n ${AGENT_NOTIFY_INSTALL_TEST_INPUT:-} ]]; then
+    value=${(s.:.)AGENT_NOTIFY_INSTALL_TEST_INPUT}[1]
+    AGENT_NOTIFY_INSTALL_TEST_INPUT=${AGENT_NOTIFY_INSTALL_TEST_INPUT#*:}
+    REPLY=$value
+    return 0
+  fi
+  [[ -r /dev/tty ]] || return 1
+  print -n -u2 -- "$prompt"
+  IFS= read -r value </dev/tty || return 1
+  REPLY=$value
+}
+
+read_secret_tty() {
+  local prompt=$1 value
+  if [[ -n ${AGENT_NOTIFY_INSTALL_TEST_INPUT_FD:-} ]]; then
+    IFS= read -ru "$AGENT_NOTIFY_INSTALL_TEST_INPUT_FD" value || return 1
+    REPLY=$value
+    return 0
+  fi
+  [[ -r /dev/tty ]] || return 1
+  print -n -u2 -- "$prompt"
+  /bin/stty -echo </dev/tty
+  IFS= read -r value </dev/tty || { /bin/stty echo </dev/tty; return 1; }
+  /bin/stty echo </dev/tty
+  print -u2 -- ''
+  REPLY=$value
+}
+
+tree_hash() {
+  [[ -d $1 ]] || { print -- '-'; return; }
+  (cd "$1" && /usr/bin/find . -type f -print | /usr/bin/sort | while IFS= read -r file; do print -- "$file"; /usr/bin/shasum -a 256 "$file"; done) | /usr/bin/shasum -a 256 | /usr/bin/awk '{print $1}'
+}
+
+confirm() {
+  local question=$1
+  if [[ -n ${AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE:-} ]]; then
+    local answer=${AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE%%:*}
+    AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=${AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE#*:}
+    [[ $answer == yes ]]
+    return
+  fi
+  if [[ ${AGENT_NOTIFY_INSTALL_TEST_CONFIRM:-} == yes ]]; then return 0; fi
+  read_tty "$question [y/N] " || return 1
+  [[ $REPLY == [yY] || $REPLY == [yY][eE][sS] ]]
+}
+
+version_from() {
+  local output=$1
+  [[ $output =~ '([0-9]+\.[0-9]+(\.[0-9]+)?)' ]] || return 1
+  REPLY=$match[1]
+}
+
+preflight() {
+  local macos claude_bin opencode_bin version
+  [[ ${AGENT_NOTIFY_INSTALL_SKIP_PLATFORM_CHECK:-0} == 1 ]] || [[ $(/usr/bin/uname -s) == Darwin ]] || die 'macOS is required'
+  for tool in "$security_bin" "$jxa_bin" "$curl_bin" /usr/bin/shasum /usr/bin/mktemp /bin/cp /bin/mkdir /bin/chmod /bin/mv /usr/bin/find /usr/bin/sort; do
+    [[ -x $tool ]] || die "required executable unavailable: $tool"
+  done
+  claude_bin=${AGENT_NOTIFY_INSTALL_CLAUDE_BIN:-$(command_path claude)}
+  opencode_bin=${AGENT_NOTIFY_INSTALL_OPENCODE_BIN:-$(command_path opencode)}
+  [[ -n $claude_bin && -x $claude_bin ]] || die 'supported Claude Code installation unavailable'
+  [[ -n $opencode_bin && -x $opencode_bin ]] || die 'supported OpenCode installation unavailable'
+  macos=${AGENT_NOTIFY_INSTALL_MACOS_VERSION:-$(/usr/bin/sw_vers -productVersion)}
+  agent_notify_validate_version macos "$macos" || die "unsupported macOS version: $macos"
+  version_from "$("$claude_bin" --version 2>/dev/null)" || die 'unparseable Claude Code version'
+  agent_notify_validate_version claude-code "$REPLY" || die "unsupported Claude Code version: $REPLY"
+  version_from "$("$opencode_bin" --version 2>/dev/null)" || die 'unparseable OpenCode version'
+  agent_notify_validate_version opencode "$REPLY" || die "unsupported OpenCode version: $REPLY"
+  [[ -x $root/bin/agent-notify && -d $root/lib/agent-notify && -r $root/integrations/opencode/agent-notify.js && -r $root/installer/claude-hook.zsh && -r $root/installer/claude-hook.jxa ]] || die 'repository installation sources are incomplete'
+  [[ -r $keychain_helper && -r $settings_helper && -r $plugin_helper && -r $manifest_helper ]] || die 'installer helper unavailable'
+  if [[ -e $settings_path ]]; then
+    settings_existed=1
+    [[ $("$jxa_bin" -l JavaScript "$settings_helper" inspect "$settings_path" - "$command_prefix") == valid ]] || die 'Claude settings are unparseable; no changes made'
+  fi
+  preflight_stage=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/agent-notify-preflight.XXXXXX") || die 'unable to stage installation artifacts'
+  /bin/cp "$root/bin/agent-notify" "$preflight_stage/agent-notify" || die 'unable to stage notifier'
+  stage_plugin "$preflight_stage/agent-notify.js" || die 'unable to stage OpenCode plugin'
+  "$jxa_bin" -l JavaScript "$settings_helper" merge "$settings_path" "$preflight_stage/settings.json" "$command_prefix" || die 'unable to stage Claude settings'
+  [[ $("$jxa_bin" -l JavaScript "$settings_helper" inspect "$preflight_stage/settings.json" - "$command_prefix") == valid ]] || die 'generated Claude settings failed validation'
+  /bin/rm -rf "$preflight_stage" || die 'unable to clean staged artifacts'
+  preflight_stage=''
+}
+
+cleanup_attempt() {
+  (( completed )) && return 0
+  [[ -n $preflight_stage && -d $preflight_stage ]] && /bin/rm -rf "$preflight_stage"
+  [[ -n $backup_dir && -d $backup_dir ]] && /bin/rm -rf "$backup_dir"
+  (( backup_root_created )) && [[ -d $backup_root ]] && /bin/rmdir "$backup_root" 2>/dev/null || true
+  local directory
+  for directory in ${(Oa)attempt_created_dirs}; do /bin/rmdir "$directory" 2>/dev/null || true; done
+}
+
+mark_new_directory() {
+  [[ -d $1 ]] || attempt_created_dirs+=("$1")
+}
+
+rollback_preflight() {
+  [[ -x $jxa_bin ]] || die "required executable unavailable: $jxa_bin"
+  [[ -r $manifest_path ]] || die 'no installation manifest found'
+}
+
+classify_file() {
+  local target=$1 source=$2 label=$3
+  [[ -e $target ]] || { print -- "$label: absent"; return; }
+  if [[ $(sha256 "$target") == $(sha256 "$source") ]]; then print -- "$label: installer-managed exact"; else print -- "$label: conflict"; fi
+}
+
+plugin_is_managed() {
+  local first_line recorded_hash
+  [[ -e $plugin_path ]] || return 1
+  IFS= read -r first_line < "$plugin_path"
+  [[ $first_line == '// >>> agent-notify managed plugin >>>' && -r $manifest_path ]] || return 1
+  recorded_hash=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.plugin.post_hash 2>/dev/null) || return 1
+  [[ $(sha256 "$plugin_path") == $recorded_hash ]]
+}
+
+has_conflict() {
+  [[ -e $install_bin && $(sha256 "$install_bin") != $(sha256 "$root/bin/agent-notify") ]] && return 0
+  [[ -e $install_lib && ! -d $install_lib ]] && return 0
+  [[ -d $install_lib && $(tree_hash "$install_lib") != $(tree_hash "$root/lib/agent-notify") ]] && return 0
+  [[ -e $claude_hook_path && $(sha256 "$claude_hook_path") != $(sha256 "$root/installer/claude-hook.zsh") ]] && return 0
+  [[ -e $claude_hook_jxa_path && $(sha256 "$claude_hook_jxa_path") != $(sha256 "$root/installer/claude-hook.jxa") ]] && return 0
+  [[ -e $plugin_path ]] && ! plugin_is_managed && return 0
+  return 1
+}
+
+preview() {
+  print -- 'agent-notify installation plan (no changes have been made):'
+  print -- "  executable: $install_bin"
+  print -- "  notifier library: $install_lib"
+  print -- "  Claude hook adapter: $claude_hook_path"
+  print -- "  OpenCode plugin: $plugin_path"
+  print -- "  Claude settings: $settings_path (managed hooks only)"
+  print -- "  Claude hook JXA: $claude_hook_jxa_path"
+  print -- "  Keychain services: ${AGENT_NOTIFY_KEYCHAIN_USER_SERVICE_PREFIX}<generation>, ${AGENT_NOTIFY_KEYCHAIN_TOKEN_SERVICE_PREFIX}<generation>, $keychain_selector_service"
+  print -- '  Keychain migration: creates independent v2 credentials; legacy v1 items are not read, changed, or removed.'
+  print -- '  Keychain migration requires entering new Pushover credentials after confirmation.'
+  print -- "  backups: $backup_root/<unique>/ (0700 directory; 0600 files)"
+  print -- '  Pushover downstream service: api.pushover.net; it receives agent name, project-directory basename, normalized state, and timing metadata only.'
+  probe_keychain "$keychain_selector_service" && print -- '  existing v2 credential generation: will be replaced after confirmation' || print -- '  existing v2 credential generation: absent'
+  classify_file "$install_bin" "$root/bin/agent-notify" executable
+  classify_file "$plugin_path" "$root/integrations/opencode/agent-notify.js" OpenCode-plugin
+}
+
+stage_plugin() {
+  local target=$1
+  "$jxa_bin" -l JavaScript "$plugin_helper" "$root/integrations/opencode/agent-notify.js" "$target" "$install_bin"
+  /bin/chmod 600 "$target"
+}
+
+backup_file() {
+  local source=$1 name=$2
+  [[ -e $source ]] || return 0
+  /bin/cp -p "$source" "$backup_dir/$name" || return 1
+  print -- "$name $(mode "$source")" >> "$backup_dir/modes" || return 1
+  /bin/chmod 600 "$backup_dir/$name" || return 1
+  /bin/chmod 600 "$backup_dir/modes" || return 1
+}
+
+write_manifest() {
+  local staged="$backup_dir/install-manifest.json.new"
+  print -r -- "{\"backup\":\"$backup_dir\",\"generation\":\"$generation\",\"files\":{\"binary\":{\"path\":\"$install_bin\",\"post_hash\":\"$bin_post_hash\",\"existed\":$bin_existed},\"library\":{\"path\":\"$install_lib\",\"post_hash\":\"$lib_post_hash\",\"existed\":$lib_existed},\"hook\":{\"path\":\"$claude_hook_path\",\"post_hash\":\"$hook_post_hash\",\"existed\":$hook_existed},\"hook_jxa\":{\"path\":\"$claude_hook_jxa_path\",\"post_hash\":\"$hook_jxa_post_hash\",\"existed\":$hook_jxa_existed},\"plugin\":{\"path\":\"$plugin_path\",\"post_hash\":\"$plugin_post_hash\",\"existed\":$plugin_existed},\"settings\":{\"path\":\"$settings_path\",\"post_hash\":\"$settings_post_hash\",\"existed\":$settings_existed}}}" > "$staged" || return 1
+  /bin/chmod 600 "$staged" || return 1
+  /bin/mv "$staged" "$manifest_path" || return 1
+  manifest_post_hash=$(sha256 "$manifest_path") || return 1
+}
+
+replace_library() {
+  local previous="$backup_dir/lib.previous"
+  if [[ -d $install_lib ]]; then /bin/mv "$install_lib" "$previous" || return 1; fi
+  if [[ ${AGENT_NOTIFY_INSTALL_FAIL_AT:-} == library ]]; then
+    [[ -d $previous ]] && /bin/mv "$previous" "$install_lib"
+    return 1
+  fi
+  if ! /bin/mv "$stage_lib" "$install_lib"; then
+    [[ -d $previous ]] && /bin/mv "$previous" "$install_lib"
+    return 1
+  fi
+  lib_post_hash=$(tree_hash "$install_lib") || return 1
+}
+
+restore_if_unchanged() {
+  local target=$1 backup=$2 post_hash=$3 existed=$4 backup_name entry saved_mode
+  backup_name=${backup:t}
+  [[ -e $target ]] || return 0
+  [[ -n $post_hash && $(sha256 "$target") == $post_hash ]] || return 0
+  if (( existed )); then
+    /bin/cp -p "$backup" "$target"
+    while read -r entry saved_mode; do
+      [[ $entry == $backup_name ]] && { /bin/chmod "$saved_mode" "$target"; break; }
+    done < "$backup_dir/modes"
+  else /bin/rm -f "$target"; fi
+}
+
+rollback_attempt() {
+  (( completed )) && return 0
+  [[ -n $backup_dir ]] || { cleanup_attempt; return 0; }
+  restore_if_unchanged "$settings_path" "$backup_dir/settings.json" "$settings_post_hash" "$settings_existed"
+  restore_if_unchanged "$plugin_path" "$backup_dir/agent-notify.js" "$plugin_post_hash" "$plugin_existed"
+  if [[ -d $install_lib && $(tree_hash "$install_lib") == $lib_post_hash ]]; then
+    if (( lib_existed )); then /bin/rm -rf "$install_lib"; /bin/cp -pR "$backup_dir/lib" "$install_lib"; else /bin/rm -rf "$install_lib"; fi
+  fi
+  restore_if_unchanged "$claude_hook_jxa_path" "$backup_dir/agent-notify-claude-hook.jxa" "$hook_jxa_post_hash" "$hook_jxa_existed"
+  restore_if_unchanged "$claude_hook_path" "$backup_dir/agent-notify-claude-hook" "$hook_post_hash" "$hook_existed"
+  restore_if_unchanged "$install_bin" "$backup_dir/agent-notify" "$bin_post_hash" "$bin_existed"
+  if [[ -n $manifest_post_hash && -e $manifest_path && $(sha256 "$manifest_path") == $manifest_post_hash ]]; then
+    if (( manifest_existed )); then
+      /bin/cp -p "$backup_dir/install-manifest.json" "$manifest_path"
+      local entry saved_mode
+      while read -r entry saved_mode; do [[ $entry == install-manifest.json ]] && { /bin/chmod "$saved_mode" "$manifest_path"; break; }; done < "$backup_dir/modes"
+    else
+      /bin/rm -f "$manifest_path"
+    fi
+  fi
+  [[ -n $generation ]] && print -rn -- "{\"generation\":\"$generation\",\"selector\":\"$selector_before\"}" | "$jxa_bin" -l JavaScript "$keychain_helper" rollback || true
+  cleanup_attempt
+  print -u2 -- 'agent-notify-install: installation failed; restored only unchanged attempt artifacts'
+}
+
+install() {
+  local stage_bin stage_lib stage_hook stage_hook_jxa stage_plugin_file stage_settings
+  confirm 'Proceed with the displayed plan?' || { print -- 'Installation declined; no changes made.'; return 0; }
+  has_conflict && ! confirm 'Replace conflicting installer target(s)?' && die 'conflicting target not replaced'
+  read_secret_tty 'Pushover user key: ' || die 'unable to read user key from /dev/tty'
+  user_key=$REPLY
+  read_secret_tty 'Pushover application token: ' || die 'unable to read application token from /dev/tty'
+  app_token=$REPLY
+  [[ -n $user_key && -n $app_token ]] || die 'both credentials are required'
+  local backup_root_existed=0
+  [[ -d $backup_root ]] && backup_root_existed=1
+  /bin/mkdir -p "$backup_root" || return 1
+  [[ -d $backup_root ]] || return 1
+  if (( ! backup_root_existed )); then /bin/chmod 700 "$backup_root" || return 1; backup_root_created=1; fi
+  backup_dir=$(/usr/bin/mktemp -d "$backup_root/install.XXXXXX") || return 1
+  /bin/chmod 700 "$backup_dir" || return 1
+  [[ -e $manifest_path ]] && { manifest_existed=1; backup_file "$manifest_path" install-manifest.json || return 1; }
+  backup_file "$install_bin" agent-notify || return 1
+  [[ -d $install_lib ]] && /bin/cp -pR "$install_lib" "$backup_dir/lib" || [[ ! -d $install_lib ]] || return 1
+  backup_file "$claude_hook_path" agent-notify-claude-hook || return 1
+  backup_file "$claude_hook_jxa_path" agent-notify-claude-hook.jxa || return 1
+  backup_file "$plugin_path" agent-notify.js || return 1
+  backup_file "$settings_path" settings.json || return 1
+  stage_bin="$backup_dir/agent-notify.new"; stage_lib="$backup_dir/lib.new"; stage_hook="$backup_dir/agent-notify-claude-hook.new"; stage_hook_jxa="$backup_dir/agent-notify-claude-hook.jxa.new"; stage_plugin_file="$backup_dir/agent-notify.js.new"; stage_settings="$backup_dir/settings.json.new"
+  /bin/cp "$root/bin/agent-notify" "$stage_bin" || return 1; /bin/chmod 700 "$stage_bin" || return 1
+  /bin/cp -pR "$root/lib/agent-notify" "$stage_lib" || return 1
+  /bin/cp "$root/installer/claude-hook.zsh" "$stage_hook" || return 1; /bin/chmod 700 "$stage_hook" || return 1
+  /bin/cp "$root/installer/claude-hook.jxa" "$stage_hook_jxa" || return 1; /bin/chmod 600 "$stage_hook_jxa" || return 1
+  stage_plugin "$stage_plugin_file" || return 1
+  "$jxa_bin" -l JavaScript "$settings_helper" merge "$settings_path" "$stage_settings" "$command_prefix" || return 1
+  [[ $("$jxa_bin" -l JavaScript "$settings_helper" inspect "$stage_settings" - "$command_prefix") == valid ]] || die 'generated Claude settings failed validation'
+  generation="$(/bin/date +%s)-$RANDOM"
+  # The v2 selector is non-secret generation metadata. Reading it is required
+  # only to restore a previous v2 selector if a later file mutation fails.
+  selector_before=$("$security_bin" find-generic-password -a "$keychain_account" -s "$keychain_selector_service" -w 2>/dev/null || true)
+  mutation_started=1
+  trap rollback_attempt EXIT INT TERM
+  print -rn -- "{\"generation\":\"$generation\",\"user\":\"$user_key\",\"token\":\"$app_token\"}" | "$jxa_bin" -l JavaScript "$keychain_helper" store || return 1
+  [[ ${AGENT_NOTIFY_INSTALL_FAIL_AT:-} == keychain ]] && return 1
+  local bin_dir_existed=0 plugin_dir_existed=0
+  mark_new_directory "${install_bin:h}"
+  mark_new_directory "${install_lib:h}"
+  mark_new_directory "${plugin_path:h}"
+  mark_new_directory "${settings_path:h}"
+  [[ -d ${install_bin:h} ]] && bin_dir_existed=1
+  [[ -d ${plugin_path:h} ]] && plugin_dir_existed=1
+  /bin/mkdir -p "${install_bin:h}" "${install_lib:h}" "${plugin_path:h}" "${settings_path:h}" || return 1
+  (( bin_dir_existed )) || /bin/chmod 700 "${install_bin:h}" || return 1
+  (( plugin_dir_existed )) || /bin/chmod 700 "${plugin_path:h}" || return 1
+  [[ -e $install_bin ]] && bin_existed=1; [[ -d $install_lib ]] && lib_existed=1; [[ -e $claude_hook_path ]] && hook_existed=1; [[ -e $claude_hook_jxa_path ]] && hook_jxa_existed=1; [[ -e $plugin_path ]] && plugin_existed=1
+  /bin/mv "$stage_bin" "$install_bin" || return 1; bin_post_hash=$(sha256 "$install_bin") || return 1
+  replace_library || return 1
+  /bin/mv "$stage_hook" "$claude_hook_path" || return 1; hook_post_hash=$(sha256 "$claude_hook_path") || return 1
+  /bin/mv "$stage_hook_jxa" "$claude_hook_jxa_path" || return 1; hook_jxa_post_hash=$(sha256 "$claude_hook_jxa_path") || return 1
+  [[ ${AGENT_NOTIFY_INSTALL_FAIL_AT:-} == binary ]] && return 1
+  /bin/mv "$stage_plugin_file" "$plugin_path" || return 1; plugin_post_hash=$(sha256 "$plugin_path") || return 1
+  [[ ${AGENT_NOTIFY_INSTALL_FAIL_AT:-} == plugin ]] && return 1
+  if [[ ${AGENT_NOTIFY_INSTALL_TEST_CREATE_SETTINGS_BEFORE_RENAME:-0} == 1 && ! -e $settings_path ]]; then
+    print -- '{}' > "$settings_path" || return 1
+  fi
+  if (( settings_existed )); then
+    local preimage expected_preimage
+    [[ -e $settings_path ]] || { print -u2 -- 'agent-notify-install: Claude settings disappeared during installation; refusing to overwrite'; return 1; }
+    preimage=$(sha256 "$settings_path")
+    expected_preimage=$(sha256 "$backup_dir/settings.json")
+    [[ $preimage == $expected_preimage ]] || { print -u2 -- 'agent-notify-install: Claude settings changed during installation; refusing to overwrite'; return 1; }
+  elif [[ -e $settings_path ]]; then
+    print -u2 -- 'agent-notify-install: Claude settings appeared during installation; refusing to overwrite'
+    return 1
+  fi
+  /bin/mv "$stage_settings" "$settings_path" || return 1; /bin/chmod 600 "$settings_path" || return 1; settings_post_hash=$(sha256 "$settings_path") || return 1
+  [[ ${AGENT_NOTIFY_INSTALL_FAIL_AT:-} == settings ]] && return 1
+  [[ -d $state_dir ]] && state_dir_existed=1 || mark_new_directory "$state_dir"
+  /bin/mkdir -p "$state_dir" || return 1
+  (( state_dir_existed )) || /bin/chmod 700 "$state_dir" || return 1
+  write_manifest || return 1
+  completed=1
+  trap - EXIT INT TERM
+  if [[ -n $selector_before ]] && ! print -rn -- "{\"previous\":\"$selector_before\"}" | "$jxa_bin" -l JavaScript "$keychain_helper" retire; then
+    print -u2 -- "agent-notify-install: installed successfully, but prior v2 Keychain generation $selector_before could not be retired; remove it manually after verifying delivery"
+  fi
+  print -- 'agent-notify installation complete:'
+  print -- "  notifier: $install_bin"
+  print -- "  Claude hook adapter: $claude_hook_path"
+  print -- "  plugin: $plugin_path"
+  print -- "  settings: $settings_path"
+  print -- "  Claude hook JXA: $claude_hook_jxa_path"
+  print -- "  backups: $backup_dir"
+  print -- "  manifest: $manifest_path"
+  print -- "  installed hashes: notifier=$bin_post_hash library=$lib_post_hash plugin=$plugin_post_hash settings=$settings_post_hash"
+  print -- "  smoke test: $install_bin smoke-test"
+  print -- "  rollback: $0 --rollback (uses post-install hashes; it restores an exact backup only when the current hash still matches, otherwise manually remove commands prefixed '$command_prefix')"
+}
+
+rollback() {
+  [[ -r $manifest_path ]] || die 'no installation manifest found'
+  local binary library hook hook_jxa plugin settings generation_value previous_generation backup post
+  binary=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.binary.path)
+  library=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.library.path)
+  hook=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.hook.path)
+  hook_jxa=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.hook_jxa.path)
+  plugin=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.plugin.path)
+  settings=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.settings.path)
+  backup=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" backup)
+  generation_value=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" generation)
+  previous_generation=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" previous_generation 2>/dev/null || true)
+  for label in binary hook hook_jxa plugin; do
+    local existed backup_name
+    post=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" "files.$label.post_hash")
+    existed=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" "files.$label.existed")
+    local target=${(P)label}
+    case $label in binary) backup_name=agent-notify;; hook) backup_name=agent-notify-claude-hook;; hook_jxa) backup_name=agent-notify-claude-hook.jxa;; plugin) backup_name=agent-notify.js;; esac
+    if [[ -e $target && $(sha256 "$target") == $post ]]; then
+      if [[ $existed == true ]]; then
+        /bin/cp -p "$backup/$backup_name" "$target"
+        local entry saved_mode
+        while read -r entry saved_mode; do [[ $entry == $backup_name ]] && { /bin/chmod "$saved_mode" "$target"; break; }; done < "$backup/modes"
+      else
+        /bin/rm -f "$target"
+      fi
+    else
+      print -u2 -- "rollback: left externally changed $label in place"
+    fi
+  done
+  post=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.library.post_hash)
+  local library_existed
+  library_existed=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.library.existed)
+  if [[ -d $library && $(tree_hash "$library") == $post ]]; then
+    /bin/rm -rf "$library"
+    [[ $library_existed == true ]] && /bin/cp -pR "$backup/lib" "$library"
+  else print -u2 -- 'rollback: left externally changed library in place'; fi
+  local settings_existed_before
+  post=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.settings.post_hash)
+  settings_existed_before=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.settings.existed)
+  if [[ -e $settings && $(sha256 "$settings") == $post ]]; then
+    if [[ $settings_existed_before == true ]]; then
+      /bin/cp -p "$backup/settings.json" "$settings"
+      local entry saved_mode
+      while read -r entry saved_mode; do [[ $entry == settings.json ]] && { /bin/chmod "$saved_mode" "$settings"; break; }; done < "$backup/modes"
+    else
+      /bin/rm -f "$settings"
+    fi
+  else print -u2 -- 'rollback: Claude settings changed; manually remove commands beginning with the recorded notifier prefix'; fi
+  if confirm 'Also remove the Pushover credentials from Keychain?'; then
+    print -rn -- "{\"generation\":\"$generation_value\",\"previous\":\"$previous_generation\"}" | "$jxa_bin" -l JavaScript "$keychain_helper" remove
+  fi
+  print -- 'Selective rollback complete.'
+}
+
+while (( $# )); do case $1 in --dry-run) dry_run=1;; --rollback) rollback=1;; *) usage; exit 2;; esac; shift; done
+trap cleanup_attempt EXIT INT TERM
+if (( rollback )); then rollback_preflight; rollback; exit 0; fi
+preflight
+preview
+(( dry_run )) && { print -- 'Dry run complete; no credentials collected and no changes made.'; exit 0; }
+set +e
+install
+install_status=$?
+set -e
+if (( install_status )); then
+  rollback_attempt
+  trap - EXIT INT TERM
+  exit 1
+fi

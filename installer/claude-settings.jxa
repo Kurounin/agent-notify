@@ -1,0 +1,130 @@
+#!/usr/bin/osascript -l JavaScript
+
+ObjC.import('Foundation');
+
+const processArguments = $.NSProcessInfo.processInfo.arguments;
+const args = [];
+for (let index = 0; index < processArguments.count; index += 1) args.push(ObjC.unwrap(processArguments.objectAtIndex(index)));
+const action = args[4];
+const settingsPath = args[5];
+const outputPath = args[6];
+const commandPrefix = args[7];
+
+function readText(path) {
+  const error = Ref();
+  const value = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, error);
+  if (value === null) throw new Error(ObjC.unwrap(error[0].localizedDescription));
+  return ObjC.unwrap(value);
+}
+
+function writeText(path, value) {
+  const error = Ref();
+  const ok = $(value).writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, error);
+  if (!ok) throw new Error(ObjC.unwrap(error[0].localizedDescription));
+}
+
+function output(value) {
+  $.NSFileHandle.fileHandleWithStandardOutput.writeData($(value + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
+}
+
+function load(path) {
+  const manager = $.NSFileManager.defaultManager;
+  if (!manager.fileExistsAtPath(path)) return {};
+  const parsed = JSON.parse(readText(path));
+  if (parsed === null || Array.isArray(parsed) || typeof parsed !== 'object') {
+    throw new Error('settings root must be an object');
+  }
+  return parsed;
+}
+
+function validateHooks(settings) {
+  if (settings.hooks === undefined) return;
+  if (settings.hooks === null || Array.isArray(settings.hooks) || typeof settings.hooks !== 'object') throw new Error('settings hooks must be an object');
+  Object.keys(settings.hooks).forEach((event) => {
+    const entries = settings.hooks[event];
+    if (!Array.isArray(entries)) throw new Error(`hooks.${event} must be an array`);
+    entries.forEach((entry) => {
+      if (entry && typeof entry === 'object' && !Array.isArray(entry) && entry.hooks !== undefined && !Array.isArray(entry.hooks)) throw new Error(`hooks.${event} entry hooks must be an array`);
+    });
+  });
+}
+
+function managed(command) {
+  return typeof command === 'string' && command.indexOf(`${commandPrefix} `) === 0;
+}
+
+function requireEntries(event, entries) {
+  if (entries === undefined) return [];
+  if (!Array.isArray(entries)) throw new Error(`hooks.${event} must be an array`);
+  return entries;
+}
+
+function removeManagedEntries(entries) {
+  return entries.reduce((retainedEntries, entry) => {
+    if (entry === null || typeof entry !== 'object' || Array.isArray(entry) || entry.hooks === undefined) {
+      retainedEntries.push(entry);
+      return retainedEntries;
+    }
+    if (!Array.isArray(entry.hooks)) throw new Error('hook entry hooks must be an array');
+    const retainedCommands = entry.hooks.filter((nested) => !managed(nested && nested.command));
+    if (retainedCommands.length > 0) retainedEntries.push(Object.assign({}, entry, { hooks: retainedCommands }));
+    return retainedEntries;
+  }, []);
+}
+
+function hook(command, matcher) {
+  const entry = { hooks: [{ type: 'command', command }] };
+  if (matcher) entry.matcher = matcher;
+  return entry;
+}
+
+function inspect() {
+  try {
+    validateHooks(load(settingsPath));
+    output('valid');
+  } catch (error) {
+    output('unparseable');
+  }
+}
+
+function merge() {
+  const settings = load(settingsPath);
+  validateHooks(settings);
+  const hooks = settings.hooks || {};
+  const commands = {
+    UserPromptSubmit: [ `${commandPrefix} began` ],
+    Notification: [ `${commandPrefix} attention`, 'permission_prompt|elicitation_dialog|elicitation_url_dialog' ],
+    Stop: [ `${commandPrefix} completed` ],
+    StopFailure: [ `${commandPrefix} failed` ],
+  };
+  Object.keys(commands).forEach((event) => {
+    const [command, matcher] = commands[event];
+    const retained = removeManagedEntries(requireEntries(event, hooks[event]));
+    hooks[event] = retained.concat([hook(command, matcher)]);
+  });
+  settings.hooks = hooks;
+  writeText(outputPath, `${JSON.stringify(settings, null, 2)}\n`);
+}
+
+function removeManaged() {
+  const settings = load(settingsPath);
+  validateHooks(settings);
+  if (settings.hooks && typeof settings.hooks === 'object' && !Array.isArray(settings.hooks)) {
+    Object.keys(settings.hooks).forEach((event) => {
+      const retained = removeManagedEntries(requireEntries(event, settings.hooks[event]));
+      if (retained.length === 0) delete settings.hooks[event];
+      else settings.hooks[event] = retained;
+    });
+    if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
+  }
+  writeText(outputPath, `${JSON.stringify(settings, null, 2)}\n`);
+}
+
+try {
+  if (action === 'inspect') inspect();
+  else if (action === 'merge') merge();
+  else if (action === 'remove-managed') removeManaged();
+  else throw new Error('unknown action');
+} catch (error) {
+  throw error;
+}

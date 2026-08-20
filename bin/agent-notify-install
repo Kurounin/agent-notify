@@ -112,7 +112,7 @@ preflight() {
   agent_notify_validate_version claude-code "$REPLY" || die "unsupported Claude Code version: $REPLY"
   version_from "$("$opencode_bin" --version 2>/dev/null)" || die 'unparseable OpenCode version'
   agent_notify_validate_version opencode "$REPLY" || die "unsupported OpenCode version: $REPLY"
-  [[ -x $root/bin/agent-notify && -d $root/lib/agent-notify && -r $root/integrations/opencode/agent-notify.js && -r $root/installer/claude-hook.zsh && -r $root/installer/claude-hook.jxa ]] || die 'repository installation sources are incomplete'
+  [[ -x $root/bin/agent-notify && -d $root/lib/agent-notify && -r $root/integrations/opencode/agent-notify.js && -r $root/integrations/claude/agent-notify-hook.zsh && -r $root/integrations/claude/agent-notify-hook.jxa ]] || die 'repository installation sources are incomplete'
   [[ -r $keychain_helper && -r $settings_helper && -r $plugin_helper && -r $manifest_helper ]] || die 'installer helper unavailable'
   if [[ -e $settings_path ]]; then
     settings_existed=1
@@ -164,8 +164,8 @@ has_conflict() {
   [[ -e $install_bin && $(sha256 "$install_bin") != $(sha256 "$root/bin/agent-notify") ]] && return 0
   [[ -e $install_lib && ! -d $install_lib ]] && return 0
   [[ -d $install_lib && $(tree_hash "$install_lib") != $(tree_hash "$root/lib/agent-notify") ]] && return 0
-  [[ -e $claude_hook_path && $(sha256 "$claude_hook_path") != $(sha256 "$root/installer/claude-hook.zsh") ]] && return 0
-  [[ -e $claude_hook_jxa_path && $(sha256 "$claude_hook_jxa_path") != $(sha256 "$root/installer/claude-hook.jxa") ]] && return 0
+  [[ -e $claude_hook_path && $(sha256 "$claude_hook_path") != $(sha256 "$root/integrations/claude/agent-notify-hook.zsh") ]] && return 0
+  [[ -e $claude_hook_jxa_path && $(sha256 "$claude_hook_jxa_path") != $(sha256 "$root/integrations/claude/agent-notify-hook.jxa") ]] && return 0
   [[ -e $plugin_path ]] && ! plugin_is_managed && return 0
   return 1
 }
@@ -289,8 +289,8 @@ install() {
   stage_bin="$backup_dir/agent-notify.new"; stage_lib="$backup_dir/lib.new"; stage_hook="$backup_dir/agent-notify-claude-hook.new"; stage_hook_jxa="$backup_dir/agent-notify-claude-hook.jxa.new"; stage_plugin_file="$backup_dir/agent-notify.js.new"; stage_settings="$backup_dir/settings.json.new"
   /bin/cp "$root/bin/agent-notify" "$stage_bin" || return 1; /bin/chmod 700 "$stage_bin" || return 1
   /bin/cp -pR "$root/lib/agent-notify" "$stage_lib" || return 1
-  /bin/cp "$root/installer/claude-hook.zsh" "$stage_hook" || return 1; /bin/chmod 700 "$stage_hook" || return 1
-  /bin/cp "$root/installer/claude-hook.jxa" "$stage_hook_jxa" || return 1; /bin/chmod 600 "$stage_hook_jxa" || return 1
+  /bin/cp "$root/integrations/claude/agent-notify-hook.zsh" "$stage_hook" || return 1; /bin/chmod 700 "$stage_hook" || return 1
+  /bin/cp "$root/integrations/claude/agent-notify-hook.jxa" "$stage_hook_jxa" || return 1; /bin/chmod 600 "$stage_hook_jxa" || return 1
   stage_plugin "$stage_plugin_file" || return 1
   "$jxa_bin" -l JavaScript "$settings_helper" merge "$settings_path" "$stage_settings" "$command_prefix" || return 1
   [[ $("$jxa_bin" -l JavaScript "$settings_helper" inspect "$stage_settings" - "$command_prefix") == valid ]] || die 'generated Claude settings failed validation'

@@ -3,80 +3,111 @@
 setopt errexit no_unset pipe_fail
 
 typeset root=${0:A:h:h:h}
-typeset adapter="$root/integrations/claude/agent-notify-hook.zsh"
-typeset template="$root/integrations/claude/settings.json.template"
+typeset adapter_source="$root/integrations/claude/agent-notify-hook.zsh"
+typeset normalizer="$root/integrations/claude/agent-notify-hook.jxa"
 typeset test_root
 test_root=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/agent-notify-claude-test.XXXXXX")
 trap '/bin/rm -rf "$test_root"' EXIT
 
-typeset mock_notifier="$test_root/mock-notifier.zsh"
+# The adapter resolves its normalizer and the notifier as siblings, so mirror the installed layout.
+typeset stage="$test_root/bin"
+typeset adapter="$stage/agent-notify-claude-hook"
 typeset calls="$test_root/calls"
+/bin/mkdir -p "$stage"
+/bin/cp "$adapter_source" "$adapter"
+/bin/cp "$normalizer" "$stage/agent-notify-claude-hook.jxa"
+/bin/chmod 700 "$adapter"
 
-cat > "$mock_notifier" <<'EOF'
+cat > "$stage/agent-notify" <<'EOF'
 #!/usr/bin/env zsh
 setopt no_unset pipe_fail
 typeset payload
 payload=$(command /bin/cat)
 print -r -- "$*|$payload" >> "$AGENT_NOTIFY_TEST_CALLS"
 EOF
-/bin/chmod 700 "$mock_notifier"
+/bin/chmod 700 "$stage/agent-notify"
 
 assert_equals() {
   [[ $1 == "$2" ]] || { print -u2 -- "expected '$2', got '$1'"; exit 1; }
 }
 
 submit() {
-  AGENT_NOTIFY_BIN="$mock_notifier" AGENT_NOTIFY_TEST_CALLS="$calls" "$adapter"
+  AGENT_NOTIFY_TEST_CALLS="$calls" "$adapter" "$1"
 }
 
-submit <<'EOF'
+normalize() {
+  print -rn -- "$2" | /usr/bin/osascript -l JavaScript "$normalizer" "$1"
+}
+
+assert_ignored() {
+  [[ -z $(normalize "$1" "$2") ]] || { print -u2 -- "expected '$3' to be ignored"; exit 1; }
+}
+
+submit began <<'EOF'
 {"hook_event_name":"UserPromptSubmit","session_id":"session-a","cwd":"/work/project"}
 EOF
-submit <<'EOF'
-{"hook_event_name":"Notification","notification_type":"permission_prompt","session_id":"session-a","cwd":"/work/project"}
+submit attention <<'EOF'
+{"hook_event_name":"Notification","notification_type":"permission_prompt","notification_id":"request-a","session_id":"session-a","cwd":"/work/project"}
 EOF
-submit <<'EOF'
-{"hook_event_name":"Stop","session_id":"session-a","cwd":"/work/project","agent_type":"main"}
+submit completed <<'EOF'
+{"hook_event_name":"Stop","session_id":"session-a","cwd":"/work/project","stop_hook_active":false,"background_tasks":[]}
 EOF
-submit <<'EOF'
-{"hook_event_name":"StopFailure","session_id":"session-a","cwd":"/work/project","agent_type":"main_agent"}
+submit failed <<'EOF'
+{"hook_event_name":"StopFailure","session_id":"session-a","cwd":"/work/project","error":"unknown"}
 EOF
 
-assert_equals "$(<"$calls")" $'event|{"source":"claude-code","event":"began","session_id":"session-a","session_dir":"/work/project"}\nevent|{"source":"claude-code","event":"attention","session_id":"session-a","session_dir":"/work/project","request_id":"permission_prompt"}\nevent|{"source":"claude-code","event":"completed","session_id":"session-a","session_dir":"/work/project"}\nevent|{"source":"claude-code","event":"failed","session_id":"session-a","session_dir":"/work/project"}'
+assert_equals "$(<"$calls")" $'event|{"source":"claude-code","kind":"began","session_id":"session-a","session_dir":"/work/project"}\nevent|{"source":"claude-code","kind":"attention","session_id":"session-a","session_dir":"/work/project","request_id":"request-a"}\nevent|{"source":"claude-code","kind":"completed","session_id":"session-a","session_dir":"/work/project"}\nevent|{"source":"claude-code","kind":"failed","session_id":"session-a","session_dir":"/work/project"}'
 
 /bin/rm -f "$calls"
-submit <<'EOF'
-{"hook_event_name":"Notification","notification_type":"idle_prompt","session_id":"session-b","cwd":"/work/project"}
+submit unsupported <<'EOF'
+{"hook_event_name":"Stop","session_id":"session-a","cwd":"/work/project"}
 EOF
-submit <<'EOF'
-{"hook_event_name":"Notification","notification_type":"permission_prompt","session_id":"session-b","cwd":"/work/project","agent_type":"background"}
-EOF
-submit <<'EOF'
-{"hook_event_name":"Notification","notification_type":"elicitation_dialog","session_id":"session-b","cwd":"/work/project","is_background":true}
-EOF
-submit <<'EOF'
-{"hook_event_name":"Notification","notification_type":"elicitation_url_dialog","session_id":"session-b","cwd":"/work/project","is_subagent":true}
-EOF
-submit <<'EOF'
-{"hook_event_name":"Stop","session_id":"session-b","cwd":"/work/project","agent_type":"subagent"}
-EOF
+[[ ! -e $calls ]] || { print -u2 -- 'an unsupported event kind reached the notifier'; exit 1; }
 
-[[ ! -e $calls ]] || { print -u2 -- 'ignored Claude hooks reached the notifier'; exit 1; }
+# Claude reports in-flight background work on the Stop that pauses the turn, and wakes the session
+# with an empty list once it settles; only the latter is a completion.
+assert_ignored completed \
+  '{"hook_event_name":"Stop","session_id":"session-a","cwd":"/work/project","background_tasks":[{"id":"task-1","type":"workflow","status":"running","description":"review"}]}' \
+  'completion with in-flight background work'
+assert_ignored completed \
+  '{"hook_event_name":"Stop","session_id":"session-a","cwd":"/work/project","background_tasks":[{"id":"task-1","type":"shell","status":"running","description":"sleep 40","command":"sleep 40"},{"id":"task-2","type":"subagent","status":"running","description":"explore","agent_type":"Explore"}]}' \
+  'completion with several in-flight background tasks'
 
-template_summary=$(command /bin/cat "$template" | /usr/bin/osascript -l JavaScript -e '
-ObjC.import("Foundation");
-const input = $.NSString.alloc.initWithDataEncoding(
-  $.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile,
-  $.NSUTF8StringEncoding
-).js;
-const settings = JSON.parse(input);
-const expected = ["UserPromptSubmit", "Notification", "Stop", "StopFailure"];
-if (JSON.stringify(Object.keys(settings.hooks)) !== JSON.stringify(expected)) $.exit(1);
-const commands = expected.map((name) => settings.hooks[name][0].hooks[0].command);
-if (!commands.every((command) => command === "__AGENT_NOTIFY_CLAUDE_HOOK__ # agent-notify:claude-hook")) $.exit(1);
-if (settings.hooks.Notification[0].matcher !== "permission_prompt|elicitation_dialog|elicitation_url_dialog") $.exit(1);
-JSON.stringify({ commands: commands.length, matcher: settings.hooks.Notification[0].matcher });
-')
-assert_equals "$template_summary" '{"commands":4,"matcher":"permission_prompt|elicitation_dialog|elicitation_url_dialog"}'
+typeset settled_completion
+settled_completion=$(normalize completed '{"hook_event_name":"Stop","session_id":"session-a","cwd":"/work/project","background_tasks":[]}')
+assert_equals "$settled_completion" '{"source":"claude-code","kind":"completed","session_id":"session-a","session_dir":"/work/project"}'
+
+typeset failure_with_background_work
+failure_with_background_work=$(normalize failed '{"hook_event_name":"StopFailure","session_id":"session-a","cwd":"/work/project","background_tasks":[{"id":"task-1","type":"workflow","status":"running","description":"review"}]}')
+assert_equals "$failure_with_background_work" '{"source":"claude-code","kind":"failed","session_id":"session-a","session_dir":"/work/project"}'
+
+assert_ignored attention \
+  '{"hook_event_name":"Notification","notification_type":"idle_prompt","session_id":"session-b","cwd":"/work/project"}' \
+  'an unsupported notification type'
+assert_ignored attention \
+  '{"hook_event_name":"Notification","notification_type":"permission_prompt","session_id":"session-b","cwd":"/work/project","agent_type":"background"}' \
+  'a background agent type'
+assert_ignored attention \
+  '{"hook_event_name":"Notification","notification_type":"elicitation_dialog","session_id":"session-b","cwd":"/work/project","is_background":true}' \
+  'an is_background payload'
+assert_ignored attention \
+  '{"hook_event_name":"Notification","notification_type":"elicitation_url_dialog","session_id":"session-b","cwd":"/work/project","is_subagent":true}' \
+  'an is_subagent payload'
+assert_ignored completed \
+  '{"hook_event_name":"Stop","session_id":"session-b","cwd":"/work/project","agent_type":"subagent"}' \
+  'a subagent stop'
+assert_ignored completed \
+  '{"hook_event_name":"Stop","session_id":"session-b","cwd":"/work/project","parent_tool_use_id":"toolu_1"}' \
+  'a nested tool-use stop'
+assert_ignored completed \
+  '{"hook_event_name":"Stop","cwd":"/work/project"}' \
+  'a payload without a session id'
+assert_ignored completed \
+  '{"hook_event_name":"Stop","session_id":"session-b"}' \
+  'a payload without a session directory'
+
+typeset notification_fallback
+notification_fallback=$(normalize attention '{"hook_event_name":"Notification","notification_type":"permission_prompt","session_id":"session-c","cwd":"/work/project"}')
+assert_equals "$notification_fallback" '{"source":"claude-code","kind":"attention","session_id":"session-c","session_dir":"/work/project","request_id":"claude-notification:session-c:permission_prompt"}'
 
 print -- 'Claude hook adapter tests passed'

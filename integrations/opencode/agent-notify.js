@@ -10,7 +10,7 @@ const NORMALIZED_EVENT_KINDS = new Set([
   "failed",
 ]);
 
-export const LEGACY_ATTENTION_EVENTS = Object.freeze([
+const LEGACY_ATTENTION_EVENTS = Object.freeze([
   "permission.asked",
   "permission.replied",
   "question.asked",
@@ -98,7 +98,7 @@ function encodeEvent(event) {
   return encoded;
 }
 
-export function createBinarySubmitter({
+function createBinarySubmitter({
   spawn = globalThis.Bun?.spawn,
   binary = "agent-notify",
   timeoutMs = SUBPROCESS_TIMEOUT_MS,
@@ -125,17 +125,164 @@ export function createBinarySubmitter({
   };
 }
 
-export function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
+function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
   const activeTurns = new Set();
   const terminatedTurns = new Set();
   const attention = new Map();
+  const sessionTrees = new Map();
+  const sessionRoots = new Map();
 
   async function lookup(sessionID) {
     try {
       const result = await client.session.get({ path: { id: sessionID } });
-      return boundedDirectory(result?.data?.directory);
+      const details = result?.data;
+      const directory = boundedDirectory(details?.directory);
+      const parentValue = details?.parentID;
+      const parentID = parentValue === null || parentValue === undefined
+        ? undefined
+        : boundedIdentifier(parentValue);
+      // OpenCode omits parentID entirely for root sessions, so an absent key means root.
+      const treeMetadata = Boolean(
+        directory &&
+        (parentValue === null || parentValue === undefined || (parentID && parentID !== sessionID)),
+      );
+      return { directory, parentID, treeMetadata };
     } catch {
-      return undefined;
+      return { directory: undefined, treeMetadata: false };
+    }
+  }
+
+  function removeTree(rootID) {
+    const tree = sessionTrees.get(rootID);
+    if (!tree) return;
+
+    for (const sessionID of tree.keys()) sessionRoots.delete(sessionID);
+    sessionTrees.delete(rootID);
+  }
+
+  function mergeTree(fromRootID, toRootID) {
+    if (fromRootID === toRootID) return;
+
+    const fromTree = sessionTrees.get(fromRootID);
+    if (!fromTree) return;
+
+    const toTree = sessionTrees.get(toRootID) ?? new Map();
+    for (const [sessionID, session] of fromTree) {
+      if (!toTree.has(sessionID)) toTree.set(sessionID, session);
+      sessionRoots.set(sessionID, toRootID);
+    }
+    sessionTrees.set(toRootID, toTree);
+    sessionTrees.delete(fromRootID);
+  }
+
+  function recordSession(sessionID, details, status) {
+    const rootID = details.parentID
+      ? sessionRoots.get(details.parentID) ?? details.parentID
+      : sessionID;
+    const previousRootID = sessionRoots.get(sessionID);
+    if (previousRootID && previousRootID !== rootID) {
+      mergeTree(previousRootID, rootID);
+    }
+    if (sessionID !== rootID && sessionTrees.has(sessionID)) {
+      mergeTree(sessionID, rootID);
+    }
+
+    const tree = sessionTrees.get(rootID) ?? new Map();
+    const previous = tree.get(sessionID);
+    tree.set(sessionID, {
+      directory: details.directory,
+      parentID: details.parentID,
+      status,
+      pending: status === "busy" || status === "retry" ? false : previous?.pending,
+    });
+    sessionTrees.set(rootID, tree);
+    sessionRoots.set(sessionID, rootID);
+    return rootID;
+  }
+
+  function hasPendingCompletion(sessionID) {
+    return sessionTrees.get(sessionID)?.get(sessionID)?.pending === true;
+  }
+
+  async function completePendingRoot(rootID) {
+    const tree = sessionTrees.get(rootID);
+    const root = tree?.get(rootID);
+    if (!root?.pending || root.status !== "idle") return;
+
+    for (const [sessionID, session] of tree) {
+      if (sessionID !== rootID && (session.status === "busy" || session.status === "retry")) return;
+    }
+
+    root.pending = false;
+    await notify("completed", rootID, root.directory);
+    removeTree(rootID);
+  }
+
+  function pruneSettledTree(rootID) {
+    const tree = sessionTrees.get(rootID);
+    if (!tree) return;
+
+    const root = tree.get(rootID);
+    const hasActiveSession = [...tree.values()].some(
+      (session) => session.status === "busy" || session.status === "retry",
+    );
+    if (!root?.pending && !hasActiveSession) removeTree(rootID);
+  }
+
+  async function fallBackToSessionLifecycle(sessionID, details, status) {
+    const rootID = sessionRoots.get(sessionID);
+    const session = rootID ? sessionTrees.get(rootID)?.get(sessionID) : undefined;
+    const directory = details.directory ?? session?.directory;
+
+    if (session) {
+      if (directory) session.directory = directory;
+
+      if (status === "busy" || status === "retry") {
+        session.status = status;
+        if (status !== "busy" || activeTurns.has(sessionID)) return;
+
+        terminatedTurns.delete(sessionID);
+        activeTurns.add(sessionID);
+        if (!directory) {
+          activeTurns.delete(sessionID);
+          return;
+        }
+        if (sessionID === rootID && !session.pending) await notify("began", sessionID, directory);
+        return;
+      }
+
+      if (status === "idle") {
+        session.status = "idle";
+        const wasActive = activeTurns.delete(sessionID);
+        if (wasActive) attention.delete(sessionID);
+        if (sessionID === rootID) {
+          if (!wasActive && session.pending) return;
+          removeTree(rootID);
+          if (wasActive && directory) await notify("completed", sessionID, directory);
+          return;
+        }
+        await completePendingRoot(rootID);
+        pruneSettledTree(rootID);
+      }
+      return;
+    }
+
+    if (status === "busy") {
+      if (activeTurns.has(sessionID)) return;
+      terminatedTurns.delete(sessionID);
+      activeTurns.add(sessionID);
+      if (!directory) {
+        activeTurns.delete(sessionID);
+        return;
+      }
+      await notify("began", sessionID, directory);
+      return;
+    }
+
+    if (status === "idle" && activeTurns.has(sessionID)) {
+      activeTurns.delete(sessionID);
+      attention.delete(sessionID);
+      if (directory) await notify("completed", sessionID, directory);
     }
   }
 
@@ -155,25 +302,41 @@ export function createOpenCodeAdapter({ client, submit = createBinarySubmitter()
       if (!sessionID) return;
 
       if (event.type === "session.status") {
-        if (event.properties?.status?.type === "busy") {
-          if (activeTurns.has(sessionID)) return;
-          terminatedTurns.delete(sessionID);
-          activeTurns.add(sessionID);
-          const directory = await lookup(sessionID);
-          if (!directory) {
-            activeTurns.delete(sessionID);
-            return;
-          }
-          if (!activeTurns.has(sessionID)) return;
-          await notify("began", sessionID, directory);
+        const status = event.properties?.status?.type;
+        const details = await lookup(sessionID);
+        if (!details.treeMetadata) {
+          await fallBackToSessionLifecycle(sessionID, details, status);
           return;
         }
 
-        if (event.properties?.status?.type === "idle" && activeTurns.has(sessionID)) {
-          activeTurns.delete(sessionID);
-          attention.delete(sessionID);
-          const directory = await lookup(sessionID);
-          if (directory) await notify("completed", sessionID, directory);
+        const isTracked = sessionRoots.has(sessionID);
+        if (
+          status !== "busy" &&
+          status !== "retry" &&
+          (status !== "idle" || (!isTracked && !activeTurns.has(sessionID)))
+        ) return;
+
+        // A background task waking its root resumes the turn the user is still waiting on, so the
+        // turn must not restart: the notifier times a completion from the began it last recorded.
+        const resumesPendingTurn = hasPendingCompletion(sessionID);
+        const rootID = recordSession(sessionID, details, status);
+        if (status === "busy") {
+          if (activeTurns.has(sessionID)) return;
+          terminatedTurns.delete(sessionID);
+          activeTurns.add(sessionID);
+          if (sessionID === rootID && !resumesPendingTurn) await notify("began", sessionID, details.directory);
+          return;
+        }
+
+        if (status === "idle") {
+          const wasActive = activeTurns.delete(sessionID);
+          if (wasActive) attention.delete(sessionID);
+          if (sessionID === rootID) {
+            const session = sessionTrees.get(rootID)?.get(sessionID);
+            if (wasActive) session.pending = true;
+          }
+          await completePendingRoot(rootID);
+          pruneSettledTree(rootID);
         }
         return;
       }
@@ -184,7 +347,32 @@ export function createOpenCodeAdapter({ client, submit = createBinarySubmitter()
         terminatedTurns.add(sessionID);
         activeTurns.delete(sessionID);
         attention.delete(sessionID);
-        const directory = await lookup(sessionID);
+        const details = await lookup(sessionID);
+        const rootID = sessionRoots.get(sessionID);
+        const session = rootID ? sessionTrees.get(rootID)?.get(sessionID) : undefined;
+        const directory = details.directory ?? session?.directory;
+        if (details.treeMetadata) {
+          const trackedRootID = recordSession(sessionID, details, "terminal");
+          if (details.directory) await notify("failed", sessionID, details.directory);
+          if (sessionID === trackedRootID) removeTree(trackedRootID);
+          else {
+            await completePendingRoot(trackedRootID);
+            pruneSettledTree(trackedRootID);
+          }
+          return;
+        }
+
+        if (session) {
+          session.status = "terminal";
+          if (directory) await notify("failed", sessionID, directory);
+          if (sessionID === rootID) removeTree(rootID);
+          else {
+            await completePendingRoot(rootID);
+            pruneSettledTree(rootID);
+          }
+          return;
+        }
+
         if (directory) await notify("failed", sessionID, directory);
         return;
       }
@@ -193,7 +381,7 @@ export function createOpenCodeAdapter({ client, submit = createBinarySubmitter()
 
       const requestID = requestIDFrom(event);
       if (!requestID) return;
-      const directory = await lookup(sessionID);
+      const { directory } = await lookup(sessionID);
       if (!directory) return;
 
       const key = attentionKey(event.type, requestID);
@@ -215,6 +403,6 @@ export function createOpenCodeAdapter({ client, submit = createBinarySubmitter()
   };
 }
 
-export default async function agentNotifyPlugin({ client }) {
-  return createOpenCodeAdapter({ client });
+export default async function agentNotifyPlugin({ client, submit }) {
+  return createOpenCodeAdapter({ client, submit });
 }

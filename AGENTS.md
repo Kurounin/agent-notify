@@ -4,7 +4,8 @@
 
 - `bin/agent-notify` is the event entry point; `lib/agent-notify/` owns normalization, state transitions, Keychain reads, diagnostics, and Pushover delivery.
 - `integrations/claude/` and `integrations/opencode/` only adapt host events to the normalized event contract. Keep them advisory: failures must not affect the host agent.
-- `installer/` owns staging, Keychain v2 writes, managed plugin generation, Claude settings merge, backups, manifests, and selective rollback. Do not move installer policy into integrations.
+- `integrations/` holds the only adapter sources. `integrations/claude/agent-notify-hook.zsh` and its `agent-notify-hook.jxa` normalizer are installed verbatim as a pair; do not add a second copy under `installer/` or leave an adapter there that nothing installs.
+- `installer/` owns staging, Keychain v2 writes, managed plugin generation, Claude settings merge, backups, manifests, and selective rollback. It stages adapters from `integrations/`; do not move installer policy into integrations.
 
 ## Secrets and privacy
 

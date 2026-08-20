@@ -68,12 +68,12 @@ typeset staged_plugin="$test_root/agent-notify.js"
 /usr/bin/osascript -l JavaScript "$root/installer/opencode-plugin.jxa" "$root/integrations/opencode/agent-notify.js" "$staged_plugin" '/tmp/agent-notify'
 typeset plugin_content=$(<"$staged_plugin")
 [[ $plugin_content == *'spawn([binary, "event"], {'* && $plugin_content == *session_dir* && $plugin_content == *request_id* ]] || { print -u2 -- 'OpenCode template is not normalized'; exit 1; }
-typeset claude_event=$(print -rn -- '{"agent_type":"main","session_id":"session","cwd":"/tmp/project","notification_type":"permission_prompt","request_id":"request"}' | /usr/bin/osascript -l JavaScript "$root/installer/claude-hook.jxa" attention)
+typeset claude_event=$(print -rn -- '{"agent_type":"main","session_id":"session","cwd":"/tmp/project","notification_type":"permission_prompt","request_id":"request"}' | /usr/bin/osascript -l JavaScript "$root/integrations/claude/agent-notify-hook.jxa" attention)
 [[ $claude_event == *'"session_dir":"/tmp/project"'* && $claude_event == *'"request_id":"request"'* ]] || { print -u2 -- 'Claude template is not normalized'; exit 1; }
-typeset fallback_event=$(print -rn -- '{"agent_type":"main_agent","session_id":"session","cwd":"/tmp/project","notification_type":"permission_prompt"}' | /usr/bin/osascript -l JavaScript "$root/installer/claude-hook.jxa" attention)
+typeset fallback_event=$(print -rn -- '{"agent_type":"main_agent","session_id":"session","cwd":"/tmp/project","notification_type":"permission_prompt"}' | /usr/bin/osascript -l JavaScript "$root/integrations/claude/agent-notify-hook.jxa" attention)
 [[ $fallback_event == *'"request_id":"claude-notification:session:permission_prompt"'* ]] || { print -u2 -- 'Claude fallback request id missing'; exit 1; }
-[[ -z $(print -rn -- '{"agent_type":"subagent","session_id":"session","cwd":"/tmp/project","notification_type":"permission_prompt"}' | /usr/bin/osascript -l JavaScript "$root/installer/claude-hook.jxa" attention) ]] || { print -u2 -- 'subagent hook was not filtered'; exit 1; }
-[[ -z $(print -rn -- '{"agent_type":"main","is_background":true,"session_id":"session","cwd":"/tmp/project","notification_type":"permission_prompt"}' | /usr/bin/osascript -l JavaScript "$root/installer/claude-hook.jxa" attention) ]] || { print -u2 -- 'background hook was not filtered'; exit 1; }
+[[ -z $(print -rn -- '{"agent_type":"subagent","session_id":"session","cwd":"/tmp/project","notification_type":"permission_prompt"}' | /usr/bin/osascript -l JavaScript "$root/integrations/claude/agent-notify-hook.jxa" attention) ]] || { print -u2 -- 'subagent hook was not filtered'; exit 1; }
+[[ -z $(print -rn -- '{"agent_type":"main","is_background":true,"session_id":"session","cwd":"/tmp/project","notification_type":"permission_prompt"}' | /usr/bin/osascript -l JavaScript "$root/integrations/claude/agent-notify-hook.jxa" attention) ]] || { print -u2 -- 'background hook was not filtered'; exit 1; }
 
 make_client "$fake/bad-claude" 'claude unknown'
 env $env AGENT_NOTIFY_INSTALL_CLAUDE_BIN="$fake/bad-claude" "$root/bin/agent-notify-install" --dry-run >/dev/null 2>&1 && { print -u2 -- 'unparseable client accepted'; exit 1; }

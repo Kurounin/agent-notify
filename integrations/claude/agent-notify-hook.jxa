@@ -29,6 +29,9 @@ try {
   const sessionDir = value(payload, ['session_dir', 'cwd', 'directory']);
   if (!sessionID || !sessionDir) throw new Error('ignored incomplete payload');
   if (event === 'attention' && !['permission_prompt', 'elicitation_dialog', 'elicitation_url_dialog'].includes(payload.notification_type)) throw new Error('ignored notification type');
+  // Claude stops the turn while background work stays registered, then wakes the session when it
+  // settles; that later Stop reports an empty list and carries the completion.
+  if (event === 'completed' && Array.isArray(payload.background_tasks) && payload.background_tasks.length > 0) throw new Error('ignored completion pending background work');
   const normalized = { source: 'claude-code', kind: event, session_id: sessionID, session_dir: sessionDir };
   const requestID = value(payload, ['request_id', 'requestId', 'notification_id']) || (event === 'attention' ? `claude-notification:${sessionID}:${payload.notification_type}` : undefined);
   if (requestID) normalized.request_id = requestID;

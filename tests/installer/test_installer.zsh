@@ -95,6 +95,8 @@ env $env AGENT_NOTIFY_INSTALL_JXA_BIN=/usr/bin/osascript AGENT_NOTIFY_INSTALL_SE
 typeset plan=$(env $env "$root/bin/agent-notify-install" --dry-run)
 [[ $plan == *'existing v2 credential generation: will be replaced'* ]] || { print -u2 -- 'existing v2 credentials were not disclosed'; exit 1; }
 [[ $plan == *'Keychain migration: creates independent v2 credentials; legacy v1 items are not read, changed, or removed.'* && $plan == *'Keychain migration requires entering new Pushover credentials after confirmation.'* ]] || { print -u2 -- 'v2 Keychain migration was not disclosed'; exit 1; }
+[[ $plan == *"normalized state, timing metadata, and a bounded excerpt of the agent's final message text."* ]] || { print -u2 -- 'the transmitted message excerpt was not disclosed'; exit 1; }
+[[ $plan == *'Message excerpts are enabled by default; set EXCERPT=0 in '*'/settings.conf to stop sending them.'* ]] || { print -u2 -- 'the excerpt default and opt-out setting were not disclosed'; exit 1; }
 [[ ! -e "$test_root/home/.local/bin/agent-notify" ]] || { print -u2 -- 'dry run wrote files'; exit 1; }
 env $env AGENT_NOTIFY_INSTALL_TEST_CONFIRM=no "$root/bin/agent-notify-install" >/dev/null 2>&1
 [[ ! -e "$test_root/home/.local/bin/agent-notify" ]] || { print -u2 -- 'decline wrote files'; exit 1; }
@@ -125,6 +127,9 @@ typeset success_output=$(print -- $'hiddenUser42\nhiddenToken42' | env $env AGEN
 [[ $success_output != *hiddenUser42* && $success_output != *hiddenToken42* ]] || { print -u2 -- 'credentials were emitted in installer output'; exit 1; }
 [[ -x "$test_root/home/.local/bin/agent-notify" && -e "$test_root/home/.config/opencode/plugins/agent-notify.js" ]] || { print -u2 -- 'confirmed install missing artifact'; exit 1; }
 [[ -r "$test_root/home/.local/lib/agent-notify/config.zsh" ]] || { print -u2 -- 'notifier library tree was not installed'; exit 1; }
+typeset installed_settings="$test_root/home/Library/Application Support/agent-notify/settings.conf"
+[[ -r $installed_settings && $(<"$installed_settings") == *'EXCERPT=1'* ]] || { print -u2 -- 'the excerpt settings file was not created with the documented default'; exit 1; }
+[[ $(/usr/bin/stat -f '%Lp' "$installed_settings") == 600 ]] || { print -u2 -- 'the excerpt settings file is not user-only'; exit 1; }
 print -rn -- '{"agent_type":"main","session_id":"installed","cwd":"/tmp/project","notification_type":"permission_prompt"}' | HOME="$test_root/home" "$test_root/home/.local/bin/agent-notify-claude-hook" attention
 [[ -z $(print -rn -- '{"agent":{"type":"subagent"},"session_id":"installed","cwd":"/tmp/project","notification_type":"permission_prompt"}' | /usr/bin/osascript -l JavaScript "$test_root/home/.local/bin/agent-notify-claude-hook.jxa" attention) ]] || { print -u2 -- 'installed nested subagent adapter was not filtered'; exit 1; }
 [[ -z $(print -rn -- '{"agentType":"background","session_id":"installed","cwd":"/tmp/project","notification_type":"permission_prompt"}' | /usr/bin/osascript -l JavaScript "$test_root/home/.local/bin/agent-notify-claude-hook.jxa" attention) ]] || { print -u2 -- 'installed agentType adapter was not filtered'; exit 1; }
@@ -136,8 +141,10 @@ env $env AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes:no "$root/bin/agent-noti
 /bin/cp "$root/lib/agent-notify/config.zsh" "$test_root/home/.local/lib/agent-notify/config.zsh"
 env $env AGENT_NOTIFY_INSTALL_CLAUDE_BIN=/missing/claude AGENT_NOTIFY_INSTALL_OPENCODE_BIN=/missing/opencode AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=no "$root/bin/agent-notify-install" --rollback >/dev/null
 [[ $(<"$test_root/home/.claude/settings.json") == '{"unrelated":true}' && $(/usr/bin/stat -f '%Lp' "$test_root/home/.claude/settings.json") == 640 ]] || { print -u2 -- 'unchanged settings rollback did not restore exact backup bytes and mode'; exit 1; }
+print -- 'EXCERPT=0' > "$installed_settings"
 print -- $'user\ntoken' | env $env AGENT_NOTIFY_INSTALL_TEST_CONFIRM=yes AGENT_NOTIFY_INSTALL_TEST_INPUT_FD=0 "$root/bin/agent-notify-install" >/dev/null
 print -- $'user\ntoken' | env $env AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes:no AGENT_NOTIFY_INSTALL_TEST_INPUT_FD=0 "$root/bin/agent-notify-install" >/dev/null || { print -u2 -- 'exact reinstall falsely reported a conflict'; exit 1; }
+[[ $(<"$installed_settings") == 'EXCERPT=0' ]] || { print -u2 -- 'a reinstall overwrote the excerpt setting'; exit 1; }
 print -- '// >>> agent-notify managed plugin >>>' > "$test_root/home/.config/opencode/plugins/agent-notify.js"
 print -- '{"changed":true}' > "$test_root/home/.claude/settings.json"
 env $env AGENT_NOTIFY_INSTALL_CLAUDE_BIN=/missing/claude AGENT_NOTIFY_INSTALL_OPENCODE_BIN=/missing/opencode AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=no "$root/bin/agent-notify-install" --rollback >/dev/null

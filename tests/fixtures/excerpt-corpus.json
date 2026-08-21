@@ -1,0 +1,144 @@
+{
+  "cases": [
+    {
+      "name": "plain-text",
+      "input": "All tests pass.",
+      "excerpt": "All tests pass."
+    },
+    {
+      "name": "line-breaks",
+      "input": "Line one\nLine two\r\nLine three",
+      "excerpt": "Line one Line two Line three"
+    },
+    {
+      "name": "vertical-tab-and-form-feed",
+      "input": "a\u000bb\fc",
+      "excerpt": "a b c"
+    },
+    {
+      "name": "unicode-line-breaks",
+      "input": "ab c d",
+      "excerpt": "a b c d"
+    },
+    {
+      "name": "ansi-colour",
+      "input": "\u001b[31mred\u001b[0m text",
+      "excerpt": "red text"
+    },
+    {
+      "name": "ansi-hyperlink",
+      "input": "\u001b]8;;https://example.com\u0007link\u001b]8;;\u0007 done",
+      "excerpt": "link done"
+    },
+    {
+      "name": "c0-and-delete",
+      "input": "a\u0000b\u0007cd",
+      "excerpt": "abcd"
+    },
+    {
+      "name": "c1-controls",
+      "input": "abc",
+      "excerpt": "abc"
+    },
+    {
+      "name": "bidi-override",
+      "input": "safe‮reversed‬ tail",
+      "excerpt": "safereversed tail"
+    },
+    {
+      "name": "bidi-isolates",
+      "input": "a⁦b⁩c؜d",
+      "excerpt": "abcd"
+    },
+    {
+      "name": "zero-width",
+      "input": "a​b‌c﻿d‎e",
+      "excerpt": "abcde"
+    },
+    {
+      "name": "zwj-emoji-preserved",
+      "input": "family 👨‍👩‍👦 done",
+      "excerpt": "family 👨‍👩‍👦 done"
+    },
+    {
+      "name": "variation-selector-preserved",
+      "input": "warning ⚠️ raised",
+      "excerpt": "warning ⚠️ raised"
+    },
+    {
+      "name": "skin-tone-preserved",
+      "input": "👍🏽 ok",
+      "excerpt": "👍🏽 ok"
+    },
+    {
+      "name": "code-fence",
+      "input": "before\n```js\nconst a = 1;\n```\nafter",
+      "excerpt": "before [code] after"
+    },
+    {
+      "name": "unterminated-fence",
+      "input": "start ```js const a = 1;",
+      "excerpt": "start js const a = 1;"
+    },
+    {
+      "name": "inline-backticks",
+      "input": "run `npm test` now",
+      "excerpt": "run npm test now"
+    },
+    {
+      "name": "nfc-normalisation",
+      "input": "éclair",
+      "excerpt": "éclair"
+    },
+    {
+      "name": "cjk",
+      "input": "処理が完了しました",
+      "excerpt": "処理が完了しました"
+    },
+    {
+      "name": "whitespace-collapse",
+      "input": "  a \t\t b  ",
+      "excerpt": "a b"
+    },
+    {
+      "name": "no-break-space",
+      "input": "a b",
+      "excerpt": "a b"
+    },
+    {
+      "name": "empty",
+      "input": "",
+      "excerpt": ""
+    },
+    {
+      "name": "whitespace-only",
+      "input": "   \n\t  ",
+      "excerpt": ""
+    },
+    {
+      "name": "control-only",
+      "input": "\u0000\u0007",
+      "excerpt": ""
+    },
+    {
+      "name": "at-grapheme-limit",
+      "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "excerpt": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "grapheme-bound-truncation",
+      "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "excerpt": "…aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "name": "utf16-bound-truncation",
+      "input": "👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦",
+      "excerpt": "…👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦👨‍👩‍👦"
+    },
+    {
+      "name": "utf8-byte-bound-truncation",
+      "input": "文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛",
+      "excerpt": "…文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛文⃛"
+    }
+  ]
+}

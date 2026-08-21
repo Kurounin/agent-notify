@@ -25,6 +25,7 @@ typeset plugin_path="$install_home/.config/opencode/plugins/agent-notify.js"
 typeset settings_path="$install_home/.claude/settings.json"
 typeset state_dir="$install_home/Library/Application Support/agent-notify"
 typeset manifest_path="$state_dir/install-manifest.json"
+typeset settings_conf_path="$state_dir/$AGENT_NOTIFY_SETTINGS_FILE_NAME"
 typeset backup_root="$state_dir/install-backups"
 typeset command_prefix="$claude_hook_path"
 typeset dry_run=0 rollback=0 backup_dir='' preflight_stage='' generation='' selector_before='' backup_root_created=0 state_dir_existed=0
@@ -182,7 +183,9 @@ preview() {
   print -- '  Keychain migration: creates independent v2 credentials; legacy v1 items are not read, changed, or removed.'
   print -- '  Keychain migration requires entering new Pushover credentials after confirmation.'
   print -- "  backups: $backup_root/<unique>/ (0700 directory; 0600 files)"
-  print -- '  Pushover downstream service: api.pushover.net; it receives agent name, project-directory basename, normalized state, and timing metadata only.'
+  print -- "  excerpt settings: $settings_conf_path (created only if absent; never overwritten by a reinstall)"
+  print -- "  Pushover downstream service: api.pushover.net; it receives agent name, project-directory basename, normalized state, timing metadata, and a bounded excerpt of the agent's final message text."
+  print -- "  Message excerpts are enabled by default; set EXCERPT=0 in $settings_conf_path to stop sending them."
   probe_keychain "$keychain_selector_service" && print -- '  existing v2 credential generation: will be replaced after confirmation' || print -- '  existing v2 credential generation: absent'
   classify_file "$install_bin" "$root/bin/agent-notify" executable
   classify_file "$plugin_path" "$root/integrations/opencode/agent-notify.js" OpenCode-plugin
@@ -201,6 +204,19 @@ backup_file() {
   print -- "$name $(mode "$source")" >> "$backup_dir/modes" || return 1
   /bin/chmod 600 "$backup_dir/$name" || return 1
   /bin/chmod 600 "$backup_dir/modes" || return 1
+}
+
+write_settings() {
+  # User-editable and deliberately outside the manifest: a reinstall must not discard the choice.
+  [[ -e $settings_conf_path ]] && return 0
+  ( umask 077
+    {
+      print -- '# agent-notify settings. Reinstalling does not overwrite this file.'
+      print -- '# EXCERPT=0 stops both adapters from producing message excerpts.'
+      print -- "EXCERPT=$AGENT_NOTIFY_EXCERPT_DEFAULT"
+    } > "$settings_conf_path"
+  ) || return 1
+  /bin/chmod 600 "$settings_conf_path"
 }
 
 write_manifest() {
@@ -341,6 +357,7 @@ install() {
   write_manifest || return 1
   completed=1
   trap - EXIT INT TERM
+  write_settings || print -u2 -- "agent-notify-install: installed successfully, but $settings_conf_path could not be created; excerpts stay enabled"
   if [[ -n $selector_before ]] && ! print -rn -- "{\"previous\":\"$selector_before\"}" | "$jxa_bin" -l JavaScript "$keychain_helper" retire; then
     print -u2 -- "agent-notify-install: installed successfully, but prior v2 Keychain generation $selector_before could not be retired; remove it manually after verifying delivery"
   fi
@@ -352,6 +369,7 @@ install() {
   print -- "  Claude hook JXA: $claude_hook_jxa_path"
   print -- "  backups: $backup_dir"
   print -- "  manifest: $manifest_path"
+  print -- "  excerpt settings: $settings_conf_path"
   print -- "  installed hashes: notifier=$bin_post_hash library=$lib_post_hash plugin=$plugin_post_hash settings=$settings_post_hash"
   print -- "  smoke test: $install_bin smoke-test"
   print -- "  rollback: $0 --rollback (uses post-install hashes; it restores an exact backup only when the current hash still matches, otherwise manually remove commands prefixed '$command_prefix')"

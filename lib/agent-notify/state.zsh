@@ -151,7 +151,7 @@ agent_notify_project_name() {
 }
 
 agent_notify_transition() {
-  local state_key=$1 source=$2 kind=$3 session_dir=$4 request_id=$5
+  local state_key=$1 source=$2 kind=$3 session_dir=$4 request_id=$5 excerpt=${6:-}
   local now state_path request_key runtime deliver_kind='' project
   now=$(agent_notify_now)
   state_path="$AGENT_NOTIFY_STATE_DIR/$state_key.state"
@@ -213,7 +213,7 @@ agent_notify_transition() {
   agent_notify_save_state "$state_path" || return 1
   if [[ -n $deliver_kind ]]; then
     project=$(agent_notify_project_name "$session_dir")
-    agent_notify_deliver "$deliver_kind" "$source" "$project" || true
+    agent_notify_deliver "$deliver_kind" "$source" "$project" "$excerpt" || true
   fi
 }
 

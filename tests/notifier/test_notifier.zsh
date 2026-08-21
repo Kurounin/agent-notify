@@ -254,9 +254,88 @@ for delivery_case in 'attention|Attention required|0' 'completed|Turn complete|0
   agent_notify_deliver "$delivery_kind" claude-code delivery-project || { print -u2 -- 'delivery content did not match event kind'; exit 1; }
 done
 
+AGENT_NOTIFY_EXPECTED_TITLE='Claude Code — delivery-project'
+AGENT_NOTIFY_EXPECTED_PRIORITY=0
+AGENT_NOTIFY_EXPECTED_MESSAGE='Turn complete — Reticulated 41 splines.'
+agent_notify_deliver completed claude-code delivery-project 'Reticulated 41 splines.' || { print -u2 -- 'completion excerpt was not composed after the state message'; exit 1; }
+AGENT_NOTIFY_EXPECTED_MESSAGE='Agent error — rate_limit'
+agent_notify_deliver failed claude-code delivery-project 'rate_limit' || { print -u2 -- 'failure excerpt was not composed after the state message'; exit 1; }
+AGENT_NOTIFY_EXPECTED_MESSAGE='Attention required'
+agent_notify_deliver attention claude-code delivery-project 'must not reach an attention message' || { print -u2 -- 'attention message was not left unchanged'; exit 1; }
+# A sanitization escape must cost only the excerpt: curl refuses to quote a line break.
+AGENT_NOTIFY_EXPECTED_MESSAGE='Turn complete'
+agent_notify_deliver completed claude-code delivery-project $'escaped\nexcerpt' || { print -u2 -- 'an unquotable excerpt cost the whole notification'; exit 1; }
+
+typeset delivered_message_file="$test_root/delivered-message" delivered_message
+agent_notify_curl_request() {
+  local request_config
+  request_config=$(/bin/cat)
+  print -r -- "$request_config" | /usr/bin/grep '^data-urlencode = "message=' > "$delivered_message_file" || true
+  print -rn -- $'{"status":1,"request":"end-to-end"}\nAGENT_NOTIFY_META:200:{}'
+}
+delivered_message_for() {
+  local now=$1 payload=$2 captured
+  : > "$delivered_message_file"
+  print -rn -- "$payload" | AGENT_NOTIFY_NOW=$now agent_notify_event
+  captured=$(<"$delivered_message_file")
+  captured=${captured#'data-urlencode = "message='}
+  print -r -- "${captured%\"}"
+}
+
+# A five-field event predates excerpts entirely and must still deliver the original message.
+AGENT_NOTIFY_NOW=800 agent_notify_event <<'EOF'
+{"source":"claude-code","kind":"began","session_id":"excerpt-absent","session_dir":"/tmp/excerpt-project"}
+EOF
+assert_equals "$(delivered_message_for 840 '{"source":"claude-code","kind":"completed","session_id":"excerpt-absent","session_dir":"/tmp/excerpt-project"}')" 'Turn complete'
+
+AGENT_NOTIFY_NOW=800 agent_notify_event <<'EOF'
+{"source":"claude-code","kind":"began","session_id":"excerpt-present","session_dir":"/tmp/excerpt-project"}
+EOF
+assert_equals "$(delivered_message_for 840 '{"source":"claude-code","kind":"completed","session_id":"excerpt-present","session_dir":"/tmp/excerpt-project","excerpt":"Reticulated 41 splines."}')" 'Turn complete — Reticulated 41 splines.'
+
+# An invalid excerpt is dropped by itself; the event that carried it still reaches delivery.
+AGENT_NOTIFY_NOW=800 agent_notify_event <<'EOF'
+{"source":"claude-code","kind":"began","session_id":"excerpt-invalid","session_dir":"/tmp/excerpt-project"}
+EOF
+assert_equals "$(delivered_message_for 840 '{"source":"claude-code","kind":"completed","session_id":"excerpt-invalid","session_dir":"/tmp/excerpt-project","excerpt":"line\nbreak"}')" 'Turn complete'
+AGENT_NOTIFY_NOW=800 agent_notify_event <<'EOF'
+{"source":"claude-code","kind":"began","session_id":"excerpt-oversized","session_dir":"/tmp/excerpt-project"}
+EOF
+typeset oversized_excerpt
+oversized_excerpt=$(/usr/bin/printf 'x%.0s' {1..300})
+assert_equals "$(delivered_message_for 840 "{\"source\":\"claude-code\",\"kind\":\"completed\",\"session_id\":\"excerpt-oversized\",\"session_dir\":\"/tmp/excerpt-project\",\"excerpt\":\"$oversized_excerpt\"}")" 'Turn complete'
+
+assert_equals "$(delivered_message_for 850 '{"source":"opencode","kind":"failed","session_id":"excerpt-failed","session_dir":"/tmp/excerpt-project","excerpt":"ProviderAuthError"}')" 'Agent error — ProviderAuthError'
+assert_equals "$(delivered_message_for 860 '{"source":"opencode","kind":"attention","session_id":"excerpt-attention","session_dir":"/tmp/excerpt-project","request_id":"request-x","excerpt":"must not reach an attention message"}')" 'Attention required'
+
+typeset excerpt_state_key excerpt_state_contents
+excerpt_state_key=$(agent_notify_session_key claude-code excerpt-present)
+excerpt_state_contents=$(<"$AGENT_NOTIFY_STATE_DIR/$excerpt_state_key.state")
+[[ $excerpt_state_contents != *Reticulated* ]] || { print -u2 -- 'an excerpt reached the session state file'; exit 1; }
+
+# Delivery failure must record no excerpt text, in state or diagnostics.
+agent_notify_curl_request() {
+  while IFS= read -r _; do :; done
+  print -rn -- $'{"status":0,"request":"excerpt-failure"}\nAGENT_NOTIFY_META:503:{}'
+}
+AGENT_NOTIFY_NOW=900 agent_notify_event <<'EOF'
+{"source":"claude-code","kind":"began","session_id":"excerpt-failed-delivery","session_dir":"/tmp/excerpt-project"}
+EOF
+AGENT_NOTIFY_NOW=940 agent_notify_event <<'EOF'
+{"source":"claude-code","kind":"completed","session_id":"excerpt-failed-delivery","session_dir":"/tmp/excerpt-project","excerpt":"Diagnosticmarker excerpt text"}
+EOF
+typeset excerpt_diagnostics
+excerpt_diagnostics=$(/bin/cat "$AGENT_NOTIFY_DIAGNOSTIC_DIR"/*.log(N))
+[[ $excerpt_diagnostics != *Diagnosticmarker* ]] || { print -u2 -- 'a failed delivery recorded excerpt text in diagnostics'; exit 1; }
+typeset failed_delivery_state
+failed_delivery_state=$(<"$AGENT_NOTIFY_STATE_DIR/$(agent_notify_session_key claude-code excerpt-failed-delivery).state")
+[[ $failed_delivery_state != *Diagnosticmarker* ]] || { print -u2 -- 'a failed delivery recorded excerpt text in session state'; exit 1; }
+
 typeset curl_config hostile_home="$test_root/hostile-home"
 curl_config=$(agent_notify_curl_config userkey012345678901234567890123 apptoken01234567890123456789012 'Claude Code — project' 'Attention required' 0)
 [[ $curl_config != *'location'* && $curl_config == *'max-redirs = 0'* && $curl_config == *'proto = "=https"'* ]] || { print -u2 -- 'curl redirect or protocol policy is missing'; exit 1; }
+# A code-bearing excerpt would be parsed as markup or rejected if Pushover rendered the message.
+[[ $curl_config != *html* ]] || { print -u2 -- 'the Pushover request enabled html rendering'; exit 1; }
 /bin/mkdir -p "$hostile_home"
 print -- '--this-option-does-not-exist' > "$hostile_home/.curlrc"
 print -rn -- "$curl_config" | HOME="$hostile_home" /usr/bin/curl --disable --config - --proto '=file' --request GET --url file:///dev/null --output /dev/null --silent >/dev/null 2>&1

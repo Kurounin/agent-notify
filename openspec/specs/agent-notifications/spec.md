@@ -61,15 +61,43 @@ The system SHALL return success to adapter-invoked lifecycle processing when cre
 - **THEN** it SHALL return nonzero with a sanitized diagnostic unless Pushover returns an HTTP success response with `status: 1`
 
 ### Requirement: Integrate supported Claude Code and OpenCode events
-The system SHALL map Claude Code main-agent attention, completion, and failure hooks to normalized events. Claude attention SHALL be limited to `permission_prompt`, `elicitation_dialog`, and `elicitation_url_dialog`; all other notification types, including background-agent and subagent events, SHALL be ignored. Claude `began` events SHALL clear stale Claude attention; the adapter SHALL NOT claim a request-specific clear when Claude does not expose one. The OpenCode adapter SHALL track `session.status` transitions, obtain event-session details through the plugin client, use one declared permission/question event family, and avoid treating the compatibility `session.idle` event as a second completion signal. For a session-associated non-aborted terminal `session.error`, it SHALL emit one `failed` event, clear that session's busy and attention state, and suppress later completion; retry, recoverable, tool, user-abort, and session-less errors SHALL NOT emit `failed`.
+The system SHALL map Claude Code main-agent attention, completion, and failure hooks to normalized events. Claude attention SHALL be limited to `permission_prompt`, `elicitation_dialog`, and `elicitation_url_dialog`; all other notification types, including background-agent and subagent events, SHALL be ignored. Claude `began` events SHALL clear stale Claude attention; the adapter SHALL NOT claim a request-specific clear when Claude does not expose one. The OpenCode runtime module SHALL expose only its default plugin factory so supported OpenCode loaders can register it. The OpenCode adapter SHALL track `session.status` transitions, obtain event-session details through the plugin client, use one declared permission/question event family, and avoid treating the compatibility `session.idle` event as a second completion signal. The adapter SHALL treat session details without a parent identifier as a root session, because OpenCode omits that field entirely for roots. It SHALL submit `began` and `completed` only for root sessions; descendant sessions SHALL be tracked for root-tree settlement without emitting their own lifecycle events. For an OpenCode root session, the adapter SHALL defer a `completed` event until that root is idle and every known descendant session is settled. It SHALL re-evaluate a deferred root completion when a known descendant changes lifecycle state. While a root completion is deferred, the adapter SHALL NOT submit another `began` event for that root, so a turn resumed to consume background results keeps the start it was already recorded with. This root-tree decision SHALL be best effort, using only session relationships and lifecycle states the adapter has observed or resolved through the plugin client; if the adapter cannot resolve usable session details or a usable parent identifier, it SHALL preserve the existing per-session lifecycle behavior for that event. For a session-associated non-aborted terminal `session.error`, it SHALL emit one `failed` event, clear that session's busy and attention state, and suppress later completion; retry, recoverable, tool, user-abort, and session-less errors SHALL NOT emit `failed`.
 
 #### Scenario: Claude Code requests permission
 - **WHEN** Claude Code emits an eligible permission or input notification for a main-agent session
 - **THEN** its hook SHALL submit an `attention` event without altering the permission decision
 
-#### Scenario: OpenCode transitions from busy to idle
-- **WHEN** an OpenCode session previously observed as busy reports `session.status` as idle
-- **THEN** the adapter SHALL submit one `completed` event and remove the session from its in-memory busy set
+#### Scenario: OpenCode loads the adapter
+- **WHEN** a supported OpenCode version loads the managed local plugin module
+- **THEN** the module SHALL provide only its default plugin factory and OpenCode SHALL be able to register its event hook
+
+#### Scenario: OpenCode reports session details without a parent identifier
+- **WHEN** the plugin client returns usable session details that carry no parent identifier
+- **THEN** the adapter SHALL treat that session as a root and apply root-tree deferral to it rather than the per-session fallback
+
+#### Scenario: An OpenCode descendant session runs a background task
+- **WHEN** a known descendant session reports `session.status` as busy and later idle
+- **THEN** the adapter SHALL NOT submit `began` or `completed` for that descendant, and SHALL use its transitions only to settle its root
+
+#### Scenario: OpenCode root transitions from busy to idle without an active known descendant
+- **WHEN** an OpenCode root session previously observed as busy reports `session.status` as idle and every known descendant is settled
+- **THEN** the adapter SHALL submit one `completed` event for that root and clear its active root-tree state
+
+#### Scenario: An OpenCode root becomes idle while a known descendant is active
+- **WHEN** an OpenCode root session reports `session.status` as idle while a known descendant reports `busy` or `retry`
+- **THEN** the adapter SHALL defer the root `completed` event
+
+#### Scenario: A finished descendant wakes a root whose completion is deferred
+- **WHEN** an OpenCode root with a deferred completion reports `session.status` as busy again to consume background results
+- **THEN** the adapter SHALL NOT submit another `began` event for that root, and SHALL submit one `completed` event once the root and its known descendants next settle
+
+#### Scenario: The final known descendant settles after its root is idle
+- **WHEN** an OpenCode root has a deferred completion and its final known active descendant reports `session.status` as idle
+- **THEN** the adapter SHALL submit one `completed` event for the root without requiring another root idle event
+
+#### Scenario: OpenCode session-tree metadata is unavailable
+- **WHEN** the adapter cannot resolve usable parent or session metadata for an OpenCode lifecycle event
+- **THEN** it SHALL process that event with the existing per-session lifecycle behavior and return success to OpenCode
 
 #### Scenario: OpenCode reports a terminal session error
 - **WHEN** OpenCode reports a session-associated non-aborted terminal error

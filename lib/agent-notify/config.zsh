@@ -12,6 +12,12 @@ typeset -gr AGENT_NOTIFY_JXA_BIN='/usr/bin/osascript'
 typeset -gr AGENT_NOTIFY_FLOCK_BIN='/usr/bin/flock'
 typeset -gr AGENT_NOTIFY_OPEN_CODE_ATTENTION_FAMILY='permission.asked/replied and question.asked/replied/rejected'
 
+# Adapters read this file from the application-support directory themselves; the notifier declares
+# only its name and default, because a disabled excerpt must never be extracted in the first place
+# rather than merely dropped before delivery.
+typeset -gr AGENT_NOTIFY_SETTINGS_FILE_NAME='settings.conf'
+typeset -gr AGENT_NOTIFY_EXCERPT_DEFAULT=1
+
 : ${AGENT_NOTIFY_STATE_DIR:=${HOME}/Library/Application Support/agent-notify/state}
 : ${AGENT_NOTIFY_DIAGNOSTIC_DIR:=${HOME}/Library/Application Support/agent-notify/diagnostics}
 : ${AGENT_NOTIFY_MIN_RUNTIME_SECONDS:=30}

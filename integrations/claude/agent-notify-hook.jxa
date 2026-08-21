@@ -2,6 +2,24 @@
 
 ObjC.import('Foundation');
 
+const MAX_EXCERPT_GRAPHEMES = 200;
+const MAX_EXCERPT_LENGTH = 240;
+const MAX_EXCERPT_BYTES = 700;
+const EXCERPT_TRUNCATION_MARKER = '…';
+const EXCERPT_CODE_MARKER = '[code]';
+const SETTINGS_RELATIVE_PATH = '/Library/Application Support/agent-notify/settings.conf';
+const EXCERPT_DISABLED = /^[ \t]*EXCERPT[ \t]*=[ \t]*0[ \t]*$/m;
+// Escape payloads go before ESC itself becomes a deletable control character, and line breaks
+// become spaces before the remaining control characters are deleted, or their text runs together.
+const ANSI_ESCAPE = /\x1b\][\s\S]*?(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -\/]*[@-~]|\x1b[@-Z\\-_]/g;
+const LINE_BREAK = new RegExp('[\\u000a\\u000b\\u000c\\u000d\\u0085\\u2028\\u2029]', 'g');
+const CONTROL = /[\x00-\x1f\x7f-\x9f]/g;
+// Bidirectional and zero-width formatting can rewrite how the notification renders. ZWJ and VS16
+// stay because removing them breaks emoji.
+const INVISIBLE = new RegExp('[\\u061c\\u200b\\u200c\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069\\ufeff]', 'g');
+const CODE_FENCE = /```[\s\S]*?```/g;
+const BACKTICKS = /`+/g;
+
 const processArguments = $.NSProcessInfo.processInfo.arguments;
 const args = [];
 for (let index = 0; index < processArguments.count; index += 1) args.push(ObjC.unwrap(processArguments.objectAtIndex(index)));
@@ -20,6 +38,92 @@ function value(object, names) {
   return undefined;
 }
 
+function settingsPath() {
+  const override = ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey('AGENT_NOTIFY_SETTINGS_FILE'));
+  if (typeof override === 'string' && override.length > 0) return override;
+  return ObjC.unwrap($.NSHomeDirectory()) + SETTINGS_RELATIVE_PATH;
+}
+
+// The hook is a fresh process per event, so reading the file here already honours a change made
+// while the session is running.
+function excerptsEnabled() {
+  try {
+    const contents = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(settingsPath(), $.NSUTF8StringEncoding, null));
+    if (typeof contents !== 'string') return true;
+    return !EXCERPT_DISABLED.test(contents);
+  } catch (_) {
+    // An absent, unreadable, or malformed settings file leaves excerpts enabled.
+    return true;
+  }
+}
+
+function sanitizeExcerpt(text) {
+  return text
+    .normalize('NFC')
+    .replace(ANSI_ESCAPE, '')
+    .replace(LINE_BREAK, ' ')
+    .replace(CONTROL, '')
+    .replace(INVISIBLE, '')
+    .replace(CODE_FENCE, EXCERPT_CODE_MARKER)
+    .replace(BACKTICKS, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function utf8ByteLength(text) {
+  let bytes = 0;
+  for (const character of text) {
+    const codePoint = character.codePointAt(0);
+    bytes += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+  }
+  return bytes;
+}
+
+function graphemeClusters(text) {
+  const clusters = [];
+  for (const cluster of new Intl.Segmenter(undefined, { granularity: 'grapheme' }).segment(text)) clusters.push(cluster.segment);
+  return clusters;
+}
+
+function boundExcerpt(text) {
+  if (text.length === 0) return '';
+  const clusters = graphemeClusters(text);
+  if (clusters.length <= MAX_EXCERPT_GRAPHEMES && text.length <= MAX_EXCERPT_LENGTH && utf8ByteLength(text) <= MAX_EXCERPT_BYTES) return text;
+
+  const maxGraphemes = MAX_EXCERPT_GRAPHEMES - 1;
+  const maxUnits = MAX_EXCERPT_LENGTH - EXCERPT_TRUNCATION_MARKER.length;
+  const maxBytes = MAX_EXCERPT_BYTES - utf8ByteLength(EXCERPT_TRUNCATION_MARKER);
+  let graphemes = 0;
+  let units = 0;
+  let bytes = 0;
+  let index = clusters.length;
+  while (index > 0) {
+    const cluster = clusters[index - 1];
+    const clusterBytes = utf8ByteLength(cluster);
+    if (graphemes + 1 > maxGraphemes || units + cluster.length > maxUnits || bytes + clusterBytes > maxBytes) break;
+    graphemes += 1;
+    units += cluster.length;
+    bytes += clusterBytes;
+    index -= 1;
+  }
+  return EXCERPT_TRUNCATION_MARKER + clusters.slice(index).join('');
+}
+
+// Pinned to two fields by name: the same payload also carries background task commands and cron
+// prompts, which a generalized search for text would leak.
+function excerptFrom(payload) {
+  try {
+    if (event !== 'completed' && event !== 'failed') return undefined;
+    if (!excerptsEnabled()) return undefined;
+    const source = event === 'failed' ? payload.error : payload.last_assistant_message;
+    if (typeof source !== 'string' || source.length === 0) return undefined;
+    return boundExcerpt(sanitizeExcerpt(source)) || undefined;
+  } catch (_) {
+    // An excerpt failure must never suppress the event that carried it.
+    return undefined;
+  }
+}
+
 try {
   const payload = JSON.parse(raw);
   const agentType = payload.agent_type || payload.agentType || payload.agent?.type;
@@ -35,6 +139,8 @@ try {
   const normalized = { source: 'claude-code', kind: event, session_id: sessionID, session_dir: sessionDir };
   const requestID = value(payload, ['request_id', 'requestId', 'notification_id']) || (event === 'attention' ? `claude-notification:${sessionID}:${payload.notification_type}` : undefined);
   if (requestID) normalized.request_id = requestID;
+  const excerpt = excerptFrom(payload);
+  if (excerpt) normalized.excerpt = excerpt;
   output(JSON.stringify(normalized));
 } catch (_) {
   // Hooks are advisory: malformed payloads must not change Claude execution.

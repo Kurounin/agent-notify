@@ -5,7 +5,7 @@ Define safe installation and rollback behavior for the agent notifier.
 ## Requirements
 
 ### Requirement: Preview and confirm all user-environment changes
-The installer SHALL detect the required macOS tools, supported client versions, target configuration locations, existing credential state, and managed-file conflicts before collecting credentials or performing any persistent or externally visible action. It SHALL disclose the files and Keychain service names it intends to create or update, the agent name, project-directory basename, normalized state, and timing metadata transmitted to Pushover and downstream push services, and require explicit confirmation before mutation.
+The installer SHALL detect the required macOS tools, supported client versions, target configuration locations, existing credential state, and managed-file conflicts before collecting credentials or performing any persistent or externally visible action. It SHALL disclose the files and Keychain service names it intends to create or update, the agent name, project-directory basename, normalized state, timing metadata, and — when excerpts are enabled — a bounded excerpt of the agent's final message text transmitted to Pushover and downstream push services, and require explicit confirmation before mutation. The disclosure SHALL state that excerpts are enabled by default and name the setting that disables them.
 
 #### Scenario: The user declines installation
 - **WHEN** the user does not explicitly confirm the displayed installation plan
@@ -14,6 +14,10 @@ The installer SHALL detect the required macOS tools, supported client versions, 
 #### Scenario: Prerequisites are unavailable
 - **WHEN** a required executable or supported Claude Code/OpenCode installation is unavailable
 - **THEN** the installer SHALL report the missing prerequisite and SHALL NOT modify configuration
+
+#### Scenario: The user reviews what is transmitted
+- **WHEN** the installer displays its plan before collecting credentials
+- **THEN** the disclosure SHALL name the message excerpt among the values transmitted to Pushover, state that it is enabled by default, and name the setting that disables it
 
 ### Requirement: Collect and protect Pushover credentials
 The installer SHALL prompt for the Pushover user key and application token without echoing their values, retain them only in memory until confirmation, and save them to distinct Keychain items for the logged-in user after confirmation. It SHALL NOT write credentials to repository files, shell profiles, agent configuration, state files, logs, process arguments, environment variables, or temporary files.

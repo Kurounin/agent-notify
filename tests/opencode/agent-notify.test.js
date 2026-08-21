@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn as spawnChild } from "node:child_process";
 import { once } from "node:events";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,10 +9,20 @@ import test from "node:test";
 
 import agentNotifyPlugin, * as pluginModule from "../../integrations/opencode/agent-notify.js";
 
-function createClient({ sessions = {}, getSession } = {}) {
+// Excerpt settings are read from an injected path so the suite never touches the live home.
+const settingsDirectory = await mkdtemp(join(tmpdir(), "agent-notify-settings-"));
+const settingsFile = join(settingsDirectory, "settings.conf");
+process.env.AGENT_NOTIFY_SETTINGS_FILE = settingsFile;
+process.on("exit", () => rmSync(settingsDirectory, { force: true, recursive: true }));
+
+const corpus = JSON.parse(readFileSync(new URL("../fixtures/excerpt-corpus.json", import.meta.url), "utf8"));
+
+function createClient({ sessions = {}, getSession, messages, getMessages } = {}) {
   const requests = [];
+  const messageRequests = [];
   return {
     requests,
+    messageRequests,
     client: {
       session: {
         async get(request) {
@@ -19,6 +30,12 @@ function createClient({ sessions = {}, getSession } = {}) {
           if (getSession) return getSession(request.path.id);
           // OpenCode omits parentID entirely for root sessions.
           return { data: sessions[request.path.id] ?? { directory: `/work/${request.path.id}` } };
+        },
+        async messages(request) {
+          messageRequests.push(request);
+          if (getMessages) return getMessages(request.path.id);
+          if (!messages) throw new Error("session messages unavailable");
+          return { data: messages[request.path.id] ?? [] };
         },
       },
     },
@@ -29,12 +46,26 @@ function status(sessionID, type) {
   return { type: "session.status", properties: { sessionID, status: { type } } };
 }
 
+function retryStatus(sessionID, attempt, action = undefined) {
+  const status = { type: "retry", attempt };
+  if (action !== undefined) status.action = action;
+  return { type: "session.status", properties: { sessionID, status } };
+}
+
+function assistantMessage(...parts) {
+  return { info: { role: "assistant" }, parts };
+}
+
+function textPart(text, extra = {}) {
+  return { type: "text", text, ...extra };
+}
+
 test("exports only a callable default plugin factory for the OpenCode loader", () => {
   assert.deepEqual(Object.keys(pluginModule), ["default"]);
   assert.ok(Object.values(pluginModule).every((value) => typeof value === "function"));
 });
 
-test("submits one busy-to-idle lifecycle and ignores deprecated session.idle", async () => {
+test("submits one busy-to-idle lifecycle when deprecated session.idle and status idle both arrive", async () => {
   const { client, requests } = createClient();
   const submitted = [];
   const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
@@ -47,7 +78,23 @@ test("submits one busy-to-idle lifecycle and ignores deprecated session.idle", a
     { source: "opencode", kind: "began", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
     { source: "opencode", kind: "completed", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
   ]);
-  assert.equal(requests.length, 2);
+  assert.equal(requests.length, 3);
+});
+
+test("deduplicates prompted and admitted busy signals with session.status busy", async () => {
+  const { client } = createClient();
+  const submitted = [];
+  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
+
+  await adapter.event({ event: { type: "session.next.prompted", properties: { sessionID: "session-a", prompt: "private prompt text" } } });
+  await adapter.event({ event: { type: "session.next.prompt.admitted", properties: { sessionID: "session-a", prompt: "more private prompt text" } } });
+  await adapter.event({ event: status("session-a", "busy") });
+  await adapter.event({ event: status("session-a", "idle") });
+
+  assert.deepEqual(submitted, [
+    { source: "opencode", kind: "began", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
+    { source: "opencode", kind: "completed", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
+  ]);
 });
 
 test("does not complete an idle session without a prior busy status", async () => {
@@ -59,6 +106,52 @@ test("does not complete an idle session without a prior busy status", async () =
 
   assert.deepEqual(submitted, []);
   assert.equal(requests.length, 1);
+});
+
+test("alerts once for a retry action while preserving deferred root completion", async () => {
+  const { client } = createClient({
+    sessions: {
+      root: { directory: "/work/root" },
+      child: { directory: "/work/child", parentID: "root" },
+    },
+  });
+  const submitted = [];
+  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
+  const action = {
+    reason: "quota",
+    provider: "openai",
+    title: "Plan limit reached",
+    message: "Upgrade your plan",
+    label: "Manage plan",
+    link: "https://example.test/billing",
+  };
+
+  await adapter.event({ event: status("root", "busy") });
+  await adapter.event({ event: retryStatus("child", 2, action) });
+  await adapter.event({ event: retryStatus("child", 2, action) });
+  await adapter.event({ event: status("root", "idle") });
+  await adapter.event({ event: status("child", "idle") });
+
+  assert.deepEqual(submitted, [
+    { source: "opencode", kind: "began", session_id: "root", session_dir: "/work/root", request_id: "" },
+    { source: "opencode", kind: "attention", session_id: "child", session_dir: "/work/child", request_id: "retry:2" },
+    { source: "opencode", kind: "completed", session_id: "root", session_dir: "/work/root", request_id: "" },
+  ]);
+});
+
+test("keeps retry statuses without an action lifecycle-only", async () => {
+  const { client } = createClient();
+  const submitted = [];
+  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
+
+  await adapter.event({ event: status("session-a", "busy") });
+  await adapter.event({ event: retryStatus("session-a", 1) });
+  await adapter.event({ event: status("session-a", "idle") });
+
+  assert.deepEqual(submitted, [
+    { source: "opencode", kind: "began", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
+    { source: "opencode", kind: "completed", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
+  ]);
 });
 
 test("completes an idle root immediately when it has no known active descendants", async () => {
@@ -441,6 +534,36 @@ test("clears only matching legacy attention requests", async () => {
   ]);
 });
 
+test("shares attention keys between legacy and V2 permission and question events", async () => {
+  const { client } = createClient();
+  const submitted = [];
+  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
+
+  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session-a", id: "permission-1" } } });
+  await adapter.event({ event: { type: "permission.v2.replied", properties: { sessionID: "session-a", requestID: "permission-1" } } });
+  await adapter.event({ event: { type: "permission.v2.asked", properties: { sessionID: "session-a", id: "permission-2" } } });
+  await adapter.event({ event: { type: "permission.replied", properties: { sessionID: "session-a", requestID: "permission-2" } } });
+  await adapter.event({ event: { type: "question.v2.asked", properties: { sessionID: "session-a", id: "question-1" } } });
+  await adapter.event({ event: { type: "question.replied", properties: { sessionID: "session-a", requestID: "question-1" } } });
+  await adapter.event({ event: { type: "question.asked", properties: { sessionID: "session-a", id: "question-2" } } });
+  await adapter.event({ event: { type: "question.v2.rejected", properties: { sessionID: "session-a", requestID: "question-2" } } });
+  await adapter.event({ event: { type: "question.v2.asked", properties: { sessionID: "session-a", id: "question-3" } } });
+  await adapter.event({ event: { type: "question.v2.replied", properties: { sessionID: "session-a", requestID: "question-3" } } });
+
+  assert.deepEqual(submitted.map(({ kind, request_id }) => ({ kind, request_id })), [
+    { kind: "attention", request_id: "permission-1" },
+    { kind: "attention-cleared", request_id: "permission-1" },
+    { kind: "attention", request_id: "permission-2" },
+    { kind: "attention-cleared", request_id: "permission-2" },
+    { kind: "attention", request_id: "question-1" },
+    { kind: "attention-cleared", request_id: "question-1" },
+    { kind: "attention", request_id: "question-2" },
+    { kind: "attention-cleared", request_id: "question-2" },
+    { kind: "attention", request_id: "question-3" },
+    { kind: "attention-cleared", request_id: "question-3" },
+  ]);
+});
+
 test("only terminal non-aborted session errors fail and prevent a later idle completion", async () => {
   const { client } = createClient();
   const submitted = [];
@@ -530,6 +653,41 @@ test("uses the canonical notifier subprocess arguments and JSON payload", async 
   }]);
 });
 
+test("uses and clears the 10-second outer subprocess deadline", async (t) => {
+  const scheduled = [];
+  const cleared = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  const bunDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Bun");
+  globalThis.setTimeout = (_callback, delay) => {
+    const timer = { delay };
+    scheduled.push(timer);
+    return timer;
+  };
+  globalThis.clearTimeout = (timer) => cleared.push(timer);
+  Object.defineProperty(globalThis, "Bun", {
+    configurable: true,
+    value: {
+      spawn() {
+        return { exited: Promise.resolve(), kill() {} };
+      },
+    },
+  });
+  t.after(() => {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+    if (bunDescriptor) Object.defineProperty(globalThis, "Bun", bunDescriptor);
+    else delete globalThis.Bun;
+  });
+  const { client } = createClient();
+  const adapter = await agentNotifyPlugin({ client });
+
+  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session-a", id: "request-a" } } });
+
+  assert.deepEqual(scheduled, [{ delay: 10_000 }]);
+  assert.deepEqual(cleared, scheduled);
+});
+
 test("propagates canonical JSON to the notifier process stdin", async (t) => {
   const fixtureDirectory = await mkdtemp(join(tmpdir(), "agent-notify-opencode-"));
   const notifier = join(fixtureDirectory, "notifier.mjs");
@@ -608,6 +766,233 @@ test("clears attention for only the exact session when a turn terminates", async
     { kind: "completed", session_id: "a" },
     { kind: "attention-cleared", session_id: "a:similar" },
   ]);
+});
+
+test("carries the tail of the root session's last assistant message on a completion", async () => {
+  const { client, messageRequests } = createClient({
+    messages: {
+      "session-a": [
+        { info: { role: "user" }, parts: [textPart("run the suite")] },
+        assistantMessage(textPart("All 14 tests pass.")),
+      ],
+    },
+  });
+  const submitted = [];
+  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
+
+  await adapter.event({ event: status("session-a", "busy") });
+  await adapter.event({ event: status("session-a", "idle") });
+
+  assert.deepEqual(submitted, [
+    { source: "opencode", kind: "began", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
+    { source: "opencode", kind: "completed", session_id: "session-a", session_dir: "/work/session-a", request_id: "", excerpt: "All 14 tests pass." },
+  ]);
+  assert.deepEqual(messageRequests, [{ path: { id: "session-a" }, query: { limit: 12 } }]);
+});
+
+test("takes a deferred root completion's excerpt from the root, never from a descendant", async () => {
+  const { client, messageRequests } = createClient({
+    sessions: {
+      root: { directory: "/work/root" },
+      child: { directory: "/work/child", parentID: "root" },
+    },
+    messages: {
+      root: [assistantMessage(textPart("A focused lifecycle review is still running."))],
+      child: [assistantMessage(textPart("Subagent internal report."))],
+    },
+  });
+  const submitted = [];
+  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
+
+  await adapter.event({ event: status("root", "busy") });
+  await adapter.event({ event: status("child", "busy") });
+  await adapter.event({ event: status("root", "idle") });
+  await adapter.event({ event: status("child", "idle") });
+
+  // The excerpt predates the background work it was waiting on; that staleness is accepted.
+  assert.deepEqual(submitted.map(({ kind, session_id, excerpt }) => ({ kind, session_id, excerpt })), [
+    { kind: "began", session_id: "root", excerpt: undefined },
+    { kind: "completed", session_id: "root", excerpt: "A focused lifecycle review is still running." },
+  ]);
+  assert.deepEqual(messageRequests.map((request) => request.path.id), ["root"]);
+});
+
+test("selects only non-synthetic, non-ignored text parts of the most recent assistant message", async () => {
+  const cases = [
+    { parts: [textPart("hidden", { synthetic: true }), textPart("visible")], excerpt: "visible" },
+    { parts: [textPart("hidden", { ignored: true }), textPart("visible")], excerpt: "visible" },
+    { parts: [{ type: "reasoning", text: "thinking out loud" }], excerpt: undefined },
+    { parts: [textPart("only synthetic", { synthetic: true })], excerpt: undefined },
+    { parts: [textPart("   ")], excerpt: undefined },
+  ];
+
+  for (const [index, entry] of cases.entries()) {
+    const sessionID = `session-${index}`;
+    const { client } = createClient({
+      messages: {
+        [sessionID]: [
+          assistantMessage(textPart("an older assistant message")),
+          assistantMessage(...entry.parts),
+        ],
+      },
+    });
+    const submitted = [];
+    const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
+
+    await adapter.event({ event: status(sessionID, "busy") });
+    await adapter.event({ event: status(sessionID, "idle") });
+
+    assert.equal(submitted[1].excerpt, entry.excerpt, `case ${index}`);
+  }
+});
+
+test("treats both message-fetch failure modes as no excerpt available", async () => {
+  for (const getMessages of [() => { throw new Error("transport failure"); }, () => ({ data: undefined, error: {} })]) {
+    const { client } = createClient({ getMessages });
+    const submitted = [];
+    const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
+
+    await adapter.event({ event: status("session-a", "busy") });
+    await adapter.event({ event: status("session-a", "idle") });
+
+    assert.deepEqual(submitted.map(({ kind, excerpt }) => ({ kind, excerpt })), [
+      { kind: "began", excerpt: undefined },
+      { kind: "completed", excerpt: undefined },
+    ]);
+  }
+});
+
+test("times out a stalled message fetch and submits an excerpt-free completion", async (t) => {
+  const scheduled = [];
+  const cleared = [];
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalClearTimeout = globalThis.clearTimeout;
+  globalThis.setTimeout = (callback, delay) => {
+    const timer = { callback, delay };
+    scheduled.push(timer);
+    return timer;
+  };
+  globalThis.clearTimeout = (timer) => cleared.push(timer);
+  t.after(() => {
+    globalThis.setTimeout = originalSetTimeout;
+    globalThis.clearTimeout = originalClearTimeout;
+  });
+  let markMessagesRequested;
+  const messagesRequested = new Promise((resolve) => {
+    markMessagesRequested = resolve;
+  });
+  const { client } = createClient({
+    getMessages: () => {
+      markMessagesRequested();
+      return new Promise(() => {});
+    },
+  });
+  const submitted = [];
+  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
+
+  await adapter.event({ event: status("session-a", "busy") });
+  const completion = adapter.event({ event: status("session-a", "idle") });
+  await messagesRequested;
+  assert.deepEqual(scheduled.map(({ delay }) => delay), [1_000]);
+  scheduled[0].callback();
+  await completion;
+
+  assert.deepEqual(submitted, [
+    { source: "opencode", kind: "began", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
+    { source: "opencode", kind: "completed", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
+  ]);
+  assert.deepEqual(cleared, scheduled);
+});
+
+test("carries the terminal error's message and falls back to its name", async () => {
+  const { client } = createClient();
+  const submitted = [];
+  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
+
+  await adapter.event({ event: { type: "session.error", properties: { sessionID: "with-message", error: { name: "ProviderAuthError", data: { message: "invalid api key" } } } } });
+  await adapter.event({ event: { type: "session.error", properties: { sessionID: "without-message", error: { name: "MessageOutputLengthError" } } } });
+
+  assert.deepEqual(submitted.map(({ kind, excerpt }) => ({ kind, excerpt })), [
+    { kind: "failed", excerpt: "invalid api key" },
+    { kind: "failed", excerpt: "MessageOutputLengthError" },
+  ]);
+});
+
+test("drops only the excerpt when the encoded payload would exceed its transport bound", async (t) => {
+  const calls = [];
+  const bunDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Bun");
+  Object.defineProperty(globalThis, "Bun", {
+    configurable: true,
+    value: {
+      spawn(command, options) {
+        calls.push({ command, options });
+        return { exited: Promise.resolve(), kill() {} };
+      },
+    },
+  });
+  t.after(() => {
+    if (bunDescriptor) Object.defineProperty(globalThis, "Bun", bunDescriptor);
+    else delete globalThis.Bun;
+  });
+
+  const wide = "実".repeat(256);
+  const { client } = createClient({
+    sessions: { [wide]: { directory: `/${"実".repeat(255)}` } },
+    messages: { [wide]: [assistantMessage(textPart("完了".repeat(200)))] },
+  });
+  const adapter = await agentNotifyPlugin({ client });
+
+  await adapter.event({ event: status(wide, "busy") });
+  await adapter.event({ event: status(wide, "idle") });
+
+  const payloads = calls.map(({ options }) => JSON.parse(new TextDecoder().decode(options.stdin)));
+  assert.equal(payloads.length, 2);
+  assert.equal(payloads[1].event, "completed");
+  assert.equal(payloads[1].excerpt, undefined);
+});
+
+test("honours the excerpt setting per decision, including a change made mid-session", async (t) => {
+  t.after(() => rmSync(settingsFile, { force: true }));
+  const { client, messageRequests } = createClient({
+    messages: { "session-a": [assistantMessage(textPart("All 14 tests pass."))] },
+  });
+  const submitted = [];
+  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
+
+  const completeOnce = async (sessionID) => {
+    await adapter.event({ event: status(sessionID, "busy") });
+    await adapter.event({ event: status(sessionID, "idle") });
+    return submitted.at(-1).excerpt;
+  };
+
+  rmSync(settingsFile, { force: true });
+  assert.equal(await completeOnce("session-a"), "All 14 tests pass.");
+  writeFileSync(settingsFile, "# agent-notify settings\nEXCERPT=1\n");
+  assert.equal(await completeOnce("session-a"), "All 14 tests pass.");
+  writeFileSync(settingsFile, "this file is not key=value at all\n");
+  assert.equal(await completeOnce("session-a"), "All 14 tests pass.");
+
+  const requestsBefore = messageRequests.length;
+  writeFileSync(settingsFile, "# agent-notify settings\nEXCERPT=0\n");
+  assert.equal(await completeOnce("session-a"), undefined);
+  // Disabled means the messages are never requested, not merely never forwarded.
+  assert.equal(messageRequests.length, requestsBefore);
+});
+
+test("produces the corpus excerpt for every sanitisation case", async () => {
+  for (const [index, entry] of corpus.cases.entries()) {
+    const sessionID = `corpus-${index}`;
+    const { client } = createClient({
+      messages: { [sessionID]: [assistantMessage(textPart(entry.input))] },
+    });
+    const submitted = [];
+    const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
+
+    await adapter.event({ event: status(sessionID, "busy") });
+    await adapter.event({ event: status(sessionID, "idle") });
+
+    assert.equal(submitted[1].excerpt, entry.excerpt === "" ? undefined : entry.excerpt, entry.name);
+  }
 });
 
 test("runs adapter events through the canonical notifier subprocess contract", async (t) => {

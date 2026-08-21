@@ -83,11 +83,11 @@ result;
 }
 
 agent_notify_deliver() {
-  local kind=$1 source=$2 project=$3 title message priority credentials credential_result generation user_key app_token output
+  local kind=$1 source=$2 project=$3 excerpt=${4:-} title state_message message priority credentials credential_result generation user_key app_token config output
   case $kind in
-    attention) message='Attention required'; priority=0 ;;
-    completed) message='Turn complete'; priority=0 ;;
-    failed) message='Agent error'; priority=0 ;;
+    attention) state_message='Attention required'; priority=0; excerpt='' ;;
+    completed) state_message='Turn complete'; priority=0 ;;
+    failed) state_message='Agent error'; priority=0 ;;
     *) return 1 ;;
   esac
   case $source in
@@ -95,6 +95,8 @@ agent_notify_deliver() {
     opencode) title="OpenCode — $project" ;;
     *) return 1 ;;
   esac
+  # Leading with the state message keeps the event kind readable when the excerpt is elided.
+  message="$state_message${excerpt:+ — $excerpt}"
   credentials=$(agent_notify_keychain_read) || { agent_notify_diag keychain runtime_-50 0 -; return 1; }
   IFS=$'\t' read -r credential_result generation user_key app_token <<< "$credentials"
   if [[ $credential_result == error ]]; then
@@ -105,7 +107,11 @@ agent_notify_deliver() {
   [[ $credential_result == ok ]] || { agent_notify_diag keychain runtime_-50 0 -; return 1; }
   [[ $generation =~ '^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$' ]] || { agent_notify_diag keychain selector_invalid 0 -; return 1; }
   [[ $user_key =~ '^[[:alnum:]]+$' && $app_token =~ '^[[:alnum:]]+$' ]] || { agent_notify_diag keychain invalid_credential 0 -; return 1; }
-  output=$(agent_notify_curl_config "$user_key" "$app_token" "$title" "$message" "$priority" | agent_notify_curl_request) || { agent_notify_diag transport curl_failed 0 -; return 1; }
+  # An excerpt that escapes adapter sanitization must cost the excerpt, never the notification.
+  config=$(agent_notify_curl_config "$user_key" "$app_token" "$title" "$message" "$priority") ||
+    config=$(agent_notify_curl_config "$user_key" "$app_token" "$title" "$state_message" "$priority") ||
+    { agent_notify_diag transport curl_failed 0 -; return 1; }
+  output=$(print -r -- "$config" | agent_notify_curl_request) || { agent_notify_diag transport curl_failed 0 -; return 1; }
   agent_notify_transport_result "$output"
   local result=$?
   if (( result )); then

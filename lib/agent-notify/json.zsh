@@ -20,7 +20,12 @@ const sessionDir = value.session_dir === undefined ? "" : value.session_dir;
 const requestId = value.request_id === undefined ? "" : value.request_id;
 if (!validString(sessionDir, false) || !validString(requestId, false)) $.exit(1);
 if ((kind === "attention" || kind === "attention-cleared") && !validString(requestId, true)) $.exit(1);
-JSON.stringify({source:value.source,kind:kind,session_id:value.session_id,session_dir:sessionDir,request_id:requestId});
+// The excerpt is the only field that fails open: an invalid one is dropped by itself so the event
+// still reaches delivery carrying the message it would have had before excerpts existed. Its
+// rejected set is wider than validString because C1, NEL, LS, and PS are line breaks curl refuses.
+const excerptControl = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]");
+const excerpt = validString(value.excerpt, true) && !excerptControl.test(value.excerpt) ? value.excerpt : "";
+JSON.stringify({source:value.source,kind:kind,session_id:value.session_id,session_dir:sessionDir,request_id:requestId,excerpt:excerpt});
 ' 2>/dev/null
 }
 
@@ -35,19 +40,23 @@ true;
 }
 
 agent_notify_event_fields() {
-  local normalized_json=$1 encoded line
+  local normalized_json=$1 encoded delimiters line
   encoded=$(print -rn -- "$normalized_json" | "$AGENT_NOTIFY_JXA_BIN" -l JavaScript -e '
 ObjC.import("Foundation");
 const text = $.NSString.alloc.initWithDataEncoding($.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile, $.NSUTF8StringEncoding).js;
 let value; try { value = JSON.parse(text); } catch (_) { $.exit(1); }
 const b64 = (s) => $.NSString.alloc.initWithString(s).dataUsingEncoding($.NSUTF8StringEncoding).base64EncodedStringWithOptions(0).js;
-[value.source, value.kind, value.session_id, value.session_dir, value.request_id].map(b64).join("\t");
+const excerpt = typeof value.excerpt === "string" ? value.excerpt : "";
+[value.source, value.kind, value.session_id, value.session_dir, value.request_id, excerpt].map(b64).join(":");
 ' 2>/dev/null) || return 1
-  local field_one field_two field_three field_four field_five
+  local field_one field_two field_three field_four field_five field_six
   local -a fields
-  IFS=$'\t' read -r field_one field_two field_three field_four field_five <<< "$encoded" || return 1
-  fields=("$field_one" "$field_two" "$field_three" "$field_four" "$field_five")
-  (( ${#fields} == 5 )) || return 1
+  # base64 emits neither a colon nor IFS whitespace, so the delimiter count is the field count and
+  # an empty field such as an absent request_id keeps its own position instead of collapsing.
+  delimiters=${encoded//[^:]/}
+  (( ${#delimiters} == 5 )) || return 1
+  IFS=':' read -r field_one field_two field_three field_four field_five field_six <<< "$encoded" || return 1
+  fields=("$field_one" "$field_two" "$field_three" "$field_four" "$field_five" "$field_six")
   AGENT_NOTIFY_EVENT_FIELDS=()
   for line in "${fields[@]}"; do
     AGENT_NOTIFY_EVENT_FIELDS+=("$(print -rn -- "$line" | /usr/bin/base64 -D)") || return 1

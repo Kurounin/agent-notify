@@ -38,6 +38,52 @@ The system SHALL maintain short-lived local state keyed by a non-reversible deri
 - **WHEN** a session has already processed a terminal `failed` event for its active turn
 - **THEN** the system SHALL NOT deliver a later completion notification for that turn
 
+### Requirement: Preserve Claude session-start project context
+The Claude Code adapter SHALL evaluate `CLAUDE_PROJECT_DIR`, then the hook payload's `session_dir`, `cwd`, and `directory` fields in that order, and SHALL use the first candidate that is a non-empty string of at most 256 UTF-16 code units containing no C0 or DEL control as the normalized session directory. It SHALL ignore the event only when none of those candidates is valid. A later change to the hook payload's current working directory SHALL NOT change the project fallback label while a valid session-start project root remains available.
+
+#### Scenario: Claude changes its current working directory
+- **WHEN** a Claude Code hook reports a current working directory different from the session-start `CLAUDE_PROJECT_DIR`
+- **THEN** the adapter SHALL normalize `CLAUDE_PROJECT_DIR` as `session_dir` and, when no valid `tmux_session` is selected, the project fallback label SHALL remain the basename of that session-start root
+
+#### Scenario: Claude project-root environment is unavailable or invalid
+- **WHEN** a Claude Code command hook has no valid non-empty `CLAUDE_PROJECT_DIR`
+- **THEN** the adapter SHALL use the first valid existing hook payload directory field and SHALL continue processing the event
+
+#### Scenario: An earlier payload directory is invalid
+- **WHEN** `CLAUDE_PROJECT_DIR` and an earlier payload directory candidate are invalid but a later payload directory candidate is valid
+- **THEN** the adapter SHALL use the first valid later candidate and SHALL continue processing the event
+
+### Requirement: Carry optional tmux session context
+For `attention`, `completed`, and `failed` events only, the Claude Code and OpenCode adapters SHALL attempt to resolve the tmux session name associated with the originating pane only when `TMUX` is non-empty and `TMUX_PANE` matches `^%[0-9]{1,255}$`. They SHALL invoke the resolved tmux executable directly, without shell interpolation, as `tmux display-message -p -t <pane> #S`, with a hard 500 ms deadline, no retry, discarded stderr, and captured stdout capped at 1,024 bytes. On timeout or output overflow, they SHALL request child termination, omit `tmux_session`, and continue fail-open without accepting later output. Any launch, read, termination, nonzero-exit, decoding, or validation failure SHALL omit `tmux_session` without suppressing event processing or affecting the host agent.
+
+An adapter SHALL accept a tmux result only when the command exits zero and its captured stdout is valid UTF-8 which, after removing at most one terminal LF, is a non-empty single line of at most 256 UTF-16 code units with no C0 or DEL controls. It SHALL attach only such a successful result to the normalized lifecycle event as the optional `tmux_session` field. The normalized-event boundary SHALL independently validate and length-bound that field; an absent, empty, oversized, or otherwise invalid tmux-session value SHALL be discarded without invalidating, delaying, or discarding the lifecycle event.
+
+Neither accepted nor rejected raw tmux names, `TMUX` or `TMUX_PANE`, pane or socket values, executable paths, subprocess stdout or stderr, nor command errors SHALL enter state or diagnostics. Only the centrally sanitized, bounded selected display label may enter the Pushover title.
+
+#### Scenario: Strict environment gating
+- **WHEN** `TMUX` is empty or `TMUX_PANE` does not match `^%[0-9]{1,255}$`
+- **THEN** the adapter SHALL submit the lifecycle event without attempting tmux lookup and without a tmux-session field
+
+#### Scenario: Agent runs in a named tmux session
+- **WHEN** a notification-producing event has a strictly gated environment and its pane-targeted tmux command exits zero with a valid session name
+- **THEN** the adapter SHALL submit that name in the optional normalized tmux-session field
+
+#### Scenario: Nonzero tmux exit has plausible stdout
+- **WHEN** the pane-targeted tmux command emits otherwise plausible stdout but exits nonzero
+- **THEN** the adapter SHALL submit the lifecycle event without a tmux-session field and SHALL return success to the host agent
+
+#### Scenario: Tmux lookup times out or overflows
+- **WHEN** the tmux lookup exceeds 500 ms or its stdout exceeds 1,024 bytes
+- **THEN** the adapter SHALL request child termination, disregard later output, and submit the lifecycle event without a tmux-session field
+
+#### Scenario: Tmux session output is invalid
+- **WHEN** zero-exit tmux output is malformed UTF-8, empty, multiline, exceeds 256 UTF-16 code units, or contains C0 or DEL controls
+- **THEN** the adapter SHALL submit the lifecycle event without a tmux-session field
+
+#### Scenario: Tmux context is private
+- **WHEN** tmux lookup accepts or rejects any environment value, pane value, executable path, stdout, stderr, or command error
+- **THEN** none of those raw values SHALL enter state, diagnostics, or host-visible output; only a successful validated session name MAY transiently populate the optional tmux-session field
+
 ### Requirement: Keep notifier event processing live under abandoned housekeeping locks
 The notifier SHALL process the current event before retention cleanup and SHALL treat cleanup as best-effort work that does not wait for a global prune lock or a locked session record. It SHALL rate-limit and batch full retention scans, SHALL rotate bounded passes so persistently locked records cannot permanently starve later records, and SHALL preserve the existing retention and maximum-active-age rules. Every lock mutation SHALL be restricted to a validated non-symlink lock directly under the canonical state directory.
 
@@ -84,18 +130,30 @@ The notifier SHALL serialize the current session's read, eligibility decision, d
 - **THEN** a later pass SHALL advance beyond that batch and inspect eligible later records
 
 ### Requirement: Deliver privacy-minimized Pushover messages
-The system SHALL retrieve the Pushover user key and application token from the logged-in user's macOS Keychain and deliver messages only to Pushover's fixed HTTPS endpoint with TLS verification, redirects disabled, a five-second total timeout, and no retries. It SHALL send only the agent name, a sanitized and length-bounded basename of the session directory, a normalized state message, and — when excerpts are enabled and an excerpt is available — a sanitized, single-line, length-bounded excerpt of the agent's final message text. It SHALL use normal priority for completion, attention, and agent-error notifications. Adapter values SHALL be treated as untrusted data and SHALL NOT alter transport options, destination, or request structure.
+The system SHALL retrieve the Pushover user key and application token from the logged-in user's macOS Keychain and deliver messages only to Pushover's fixed HTTPS endpoint with TLS verification, redirects disabled, a five-second total timeout, and no retries. Pushover and downstream push services SHALL receive only the agent name; a sanitized, length-bounded display context consisting of the valid tmux session name when one is available or otherwise the basename of the session directory; a normalized state message; and — when excerpts are enabled and an excerpt is available — a sanitized, bounded single-line excerpt. Claude completion excerpts SHALL be sourced only from final assistant output, while Claude failure excerpts SHALL use the categorical error identifier and never free-text error detail. OpenCode completion excerpts SHALL use relevant root-session assistant text, while OpenCode failure excerpts SHALL use the error message when present and the error name otherwise. The selected source MAY be transmitted in full when it already fits the bound and SHALL be truncated when longer; model output or OpenCode error messages can repeat sensitive content such as secrets or paths. It SHALL use normal priority for completion, attention, and agent-error notifications. Adapter values SHALL be treated as untrusted data and SHALL NOT alter transport options, destination, or request structure.
+
+The system SHALL sanitize `tmux_session` as an entire display label using the existing allowlist and 48-character bound; it SHALL NOT apply basename extraction to that value. A slash in `tmux_session` SHALL be replaced by that allowlist rather than treated as a path separator. It SHALL apply basename extraction only to `session_dir`. A whitespace-only tmux result is unusable. When neither candidate yields a usable label, the title context SHALL be `Unknown project`.
 
 #### Scenario: A permission request requires action
-- **WHEN** an adapter submits an `attention` event with a session directory
+- **WHEN** an adapter submits an `attention` event with a session directory and no valid tmux session name
 - **THEN** the system SHALL deliver a normal-priority notification titled with the agent and project basename and a message indicating that attention is required
 
 #### Scenario: A completion is eligible for delivery
 - **WHEN** a `completed` event passes the suppression rules
 - **THEN** the system SHALL deliver a normal-priority notification indicating that the turn is complete
 
+#### Scenario: A tmux-hosted event is eligible for delivery
+- **WHEN** an eligible event carries a valid tmux session name such as `team/api`
+- **THEN** the system SHALL title the notification with the agent and sanitized full tmux label such as `team_api` instead of the project basename
+
+#### Scenario: Tmux context is unavailable
+- **WHEN** an eligible event does not carry a usable tmux session name
+- **THEN** the system SHALL title the notification with the agent and sanitized project basename, or `Unknown project` when the project candidate is also unusable
+
 ### Requirement: Carry an optional message excerpt on the normalized event
 The normalized lifecycle event contract SHALL accept an optional excerpt field alongside its existing fields. The system SHALL validate the excerpt independently of the rest of the event: an excerpt that is absent, empty, oversized, or otherwise invalid SHALL be discarded on its own and SHALL NOT invalidate, delay, or discard the event that carried it. The excerpt SHALL be preserved across every normalization and re-encoding stage between adapter submission and delivery, and SHALL NOT be written to session state or diagnostic logs.
+
+For OpenCode's 2,048-byte encoded-event bound, the adapter SHALL first remove `tmux_session` and re-encode, then remove `excerpt` and re-encode; it SHALL discard the event only if the base event remains oversized.
 
 #### Scenario: An event carries an invalid excerpt
 - **WHEN** an adapter submits a lifecycle event whose excerpt field is oversized or contains disallowed characters
@@ -106,8 +164,8 @@ The normalized lifecycle event contract SHALL accept an optional excerpt field a
 - **THEN** the system SHALL process and deliver it exactly as it did before excerpts were introduced
 
 #### Scenario: An adapter payload would exceed its transport bound
-- **WHEN** including the excerpt would push an adapter's encoded event past its maximum payload size
-- **THEN** the adapter SHALL submit the event without the excerpt rather than discarding the event
+- **WHEN** an OpenCode encoded event containing `tmux_session` and an excerpt would exceed its 2,048-byte maximum payload size
+- **THEN** the adapter SHALL remove and re-encode without `tmux_session`, then remove and re-encode without the excerpt only if necessary, and SHALL discard the event only if the resulting base event still exceeds the bound
 
 #### Scenario: A delivery attempt fails
 - **WHEN** delivery of a notification carrying an excerpt fails at any stage

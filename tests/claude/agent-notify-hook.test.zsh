@@ -12,6 +12,7 @@ trap '/bin/rm -rf "$test_root"' EXIT
 
 # Excerpt settings are read from an injected path so the suite never touches the live home.
 export AGENT_NOTIFY_SETTINGS_FILE="$test_root/settings.conf"
+unset TMUX TMUX_PANE AGENT_NOTIFY_TMUX_PATH
 
 # The adapter resolves its normalizer and the notifier as siblings, so mirror the installed layout.
 typeset stage="$test_root/bin"
@@ -41,6 +42,11 @@ submit() {
 
 normalize() {
   print -rn -- "$2" | /usr/bin/osascript -l JavaScript "$normalizer" "$1"
+}
+
+normalize_fragmented() {
+  { print -rn -- "$2"; /bin/sleep 0.05; print -rn -- "$3"; } |
+    /usr/bin/osascript -l JavaScript "$normalizer" "$1"
 }
 
 assert_ignored() {
@@ -80,6 +86,12 @@ assert_ignored completed \
 typeset settled_completion
 settled_completion=$(normalize completed '{"hook_event_name":"Stop","session_id":"session-a","cwd":"/work/project","background_tasks":[]}')
 assert_equals "$settled_completion" '{"source":"claude-code","kind":"completed","session_id":"session-a","session_dir":"/work/project"}'
+
+typeset fragmented_completion
+fragmented_completion=$(normalize_fragmented completed \
+  '{"hook_event_name":"Stop","session_id":"session-fragmented",' \
+  '"cwd":"/work/project","background_tasks":[]}')
+assert_equals "$fragmented_completion" '{"source":"claude-code","kind":"completed","session_id":"session-fragmented","session_dir":"/work/project"}'
 
 typeset failure_with_background_work
 failure_with_background_work=$(normalize failed '{"hook_event_name":"StopFailure","session_id":"session-a","cwd":"/work/project","background_tasks":[{"id":"task-1","type":"workflow","status":"running","description":"review"}]}')
@@ -167,5 +179,170 @@ print -- 'this file is not key=value at all' > "$AGENT_NOTIFY_SETTINGS_FILE"
 assert_equals "$(normalize completed '{"hook_event_name":"Stop","session_id":"session-e","cwd":"/work/project","background_tasks":[],"last_assistant_message":"malformed"}')" \
   '{"source":"claude-code","kind":"completed","session_id":"session-e","session_dir":"/work/project","excerpt":"malformed"}'
 /bin/rm -f "$AGENT_NOTIFY_SETTINGS_FILE"
+
+typeset project_root
+project_root=$(CLAUDE_PROJECT_DIR='/work/session-root' normalize completed '{"hook_event_name":"Stop","session_id":"session-root","cwd":"/work/changed","background_tasks":[]}')
+assert_equals "$project_root" '{"source":"claude-code","kind":"completed","session_id":"session-root","session_dir":"/work/session-root"}'
+assert_equals "$(CLAUDE_PROJECT_DIR='' normalize completed '{"hook_event_name":"Stop","session_id":"session-root","session_dir":"/work/payload","cwd":"/work/changed","background_tasks":[]}')" \
+  '{"source":"claude-code","kind":"completed","session_id":"session-root","session_dir":"/work/payload"}'
+assert_equals "$(CLAUDE_PROJECT_DIR=$'bad\x7froot' normalize completed '{"hook_event_name":"Stop","session_id":"session-root","session_dir":"bad\u0000dir","cwd":"/work/later","background_tasks":[]}')" \
+  '{"source":"claude-code","kind":"completed","session_id":"session-root","session_dir":"/work/later"}'
+typeset oversized_project=${(l:257::x:)${:-x}}
+assert_equals "$(CLAUDE_PROJECT_DIR="$oversized_project" normalize completed '{"hook_event_name":"Stop","session_id":"session-root","session_dir":"/work/payload","background_tasks":[]}')" \
+  '{"source":"claude-code","kind":"completed","session_id":"session-root","session_dir":"/work/payload"}'
+assert_ignored completed '{"hook_event_name":"Stop","session_id":"session-root","session_dir":"","cwd":"bad\u0001dir","directory":"bad\u007fdir","background_tasks":[]}' 'payload with no valid directory candidates'
+
+# All tmux cases use an injected executable; no test contacts a live tmux server.
+typeset tmux_dir="$test_root/tmux executable"
+typeset tmux_fake="$tmux_dir/tmux"
+typeset tmux_calls="$test_root/tmux-calls"
+typeset tmux_terminated="$test_root/tmux-terminated"
+/bin/mkdir -p "$tmux_dir"
+cat > "$tmux_fake" <<'EOF'
+#!/usr/bin/env zsh
+setopt no_unset pipe_fail
+print -r -- "$*" >> "$AGENT_NOTIFY_TMUX_CALLS"
+print -u2 -r -- "${AGENT_NOTIFY_TMUX_STDERR:-}"
+case ${AGENT_NOTIFY_TMUX_MODE:-valid} in
+  valid) print -r -- "${AGENT_NOTIFY_TMUX_VALUE:-session-one}" ;;
+  nonzero) print -r -- rejected-stdout; exit 7 ;;
+  timeout) trap 'print -r -- terminated > "$AGENT_NOTIFY_TMUX_TERMINATED"; exit 0' TERM; while true; do /bin/sleep 1; done ;;
+  overflow) trap 'print -r -- terminated > "$AGENT_NOTIFY_TMUX_TERMINATED"; exit 0' TERM; /usr/bin/yes x | /usr/bin/head -c 1025; while true; do /bin/sleep 1; done ;;
+  output_1024) /usr/bin/yes x | /usr/bin/head -c 1024 || true ;;
+  descendant_holds_stdout) (/bin/sleep 2; print -r -- descendant-stdout-marker) & exit 0 ;;
+  invalid_utf8) print -rn -- $'\xff' ;;
+  closed_stdout) exec 1>&- ;;
+  multiline) print -r -- $'one\ntwo' ;;
+  control) print -r -- $'bad\x01name' ;;
+  signaled) kill -TERM $$ ;;
+esac
+EOF
+/bin/chmod 700 "$tmux_fake"
+
+submit_tmux() {
+  AGENT_NOTIFY_TEST_CALLS="$calls" AGENT_NOTIFY_TMUX_CALLS="$tmux_calls" AGENT_NOTIFY_TMUX_TERMINATED="$tmux_terminated" \
+    PATH="$tmux_dir:$PATH" TMUX='private-socket-marker' TMUX_PANE="${AGENT_NOTIFY_TEST_TMUX_PANE:-%123}" "$adapter" "$1"
+}
+assert_no_tmux_session() {
+  [[ $(<"$calls") != *'"tmux_session"'* ]] || { print -u2 -- "expected '$1' to have no tmux session"; exit 1; }
+}
+
+/bin/rm -f "$calls" "$tmux_calls"
+AGENT_NOTIFY_TMUX_MODE=valid AGENT_NOTIFY_TMUX_VALUE='renamed-session' submit_tmux completed <<'EOF'
+{"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
+EOF
+assert_equals "$(<"$calls")" 'event|{"source":"claude-code","kind":"completed","session_id":"session-tmux","session_dir":"/work/project","tmux_session":"renamed-session"}'
+assert_equals "$(<"$tmux_calls")" 'display-message -p -t %123 #S'
+
+# The lookup is fresh per notification-producing event, not cached from the earlier name.
+/bin/rm -f "$calls" "$tmux_calls"
+AGENT_NOTIFY_TMUX_MODE=valid AGENT_NOTIFY_TMUX_VALUE='renamed-again' submit_tmux attention <<'EOF'
+{"notification_type":"permission_prompt","session_id":"session-tmux","cwd":"/work/project"}
+EOF
+[[ $(<"$calls") == *'"tmux_session":"renamed-again"'* ]] || { print -u2 -- 'tmux name was not refreshed per event'; exit 1; }
+
+typeset pane_255="%${(l:255::7:)${:-7}}"
+typeset pane_256="%${(l:256::7:)${:-7}}"
+/bin/rm -f "$calls" "$tmux_calls"
+AGENT_NOTIFY_TEST_TMUX_PANE="$pane_255" AGENT_NOTIFY_TMUX_MODE=valid AGENT_NOTIFY_TMUX_VALUE='pane-boundary' submit_tmux completed <<'EOF'
+{"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
+EOF
+assert_equals "$(<"$tmux_calls")" "display-message -p -t $pane_255 #S"
+[[ $(<"$calls") == *'"tmux_session":"pane-boundary"'* ]] || { print -u2 -- '255-digit TMUX_PANE did not launch tmux'; exit 1; }
+
+/bin/rm -f "$calls" "$tmux_calls"
+AGENT_NOTIFY_TEST_TMUX_PANE="$pane_256" AGENT_NOTIFY_TMUX_MODE=valid submit_tmux completed <<'EOF'
+{"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
+EOF
+[[ ! -e $tmux_calls ]] || { print -u2 -- '256-digit TMUX_PANE launched tmux'; exit 1; }
+assert_no_tmux_session '256-digit TMUX_PANE'
+
+# began is a lifecycle event but does not produce a notification, so it cannot launch tmux.
+/bin/rm -f "$calls" "$tmux_calls"
+AGENT_NOTIFY_TMUX_MODE=valid submit_tmux began <<'EOF'
+{"session_id":"session-tmux","cwd":"/work/project"}
+EOF
+[[ ! -e $tmux_calls ]] || { print -u2 -- 'began launched tmux'; exit 1; }
+assert_no_tmux_session 'began'
+
+for mode in nonzero invalid_utf8 closed_stdout multiline control signaled; do
+  /bin/rm -f "$calls" "$tmux_calls"
+  AGENT_NOTIFY_TMUX_MODE="$mode" submit_tmux completed <<'EOF'
+{"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
+EOF
+  assert_no_tmux_session "$mode"
+done
+
+# A launch failure remains advisory and must not reveal the unavailable executable path or tmux data.
+typeset launch_failure_output
+launch_failure_output=$(TMUX='private-socket-marker' TMUX_PANE='%123' AGENT_NOTIFY_TMUX_PATH="$tmux_dir/missing-tmux" \
+  /usr/bin/osascript -l JavaScript "$normalizer" completed <<'EOF' 2>&1
+{"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
+EOF
+)
+assert_equals "$launch_failure_output" '{"source":"claude-code","kind":"completed","session_id":"session-tmux","session_dir":"/work/project"}'
+[[ $launch_failure_output != *'private-'* && $launch_failure_output != *'missing-tmux'* ]] || { print -u2 -- 'tmux launch failure leaked raw data'; exit 1; }
+
+/bin/rm -f "$calls" "$tmux_calls" "$tmux_terminated"
+AGENT_NOTIFY_TMUX_MODE=timeout submit_tmux completed <<'EOF'
+{"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
+EOF
+assert_no_tmux_session 'timeout'
+[[ -e $tmux_terminated ]] || { print -u2 -- 'timeout did not request child termination'; exit 1; }
+
+/bin/rm -f "$calls" "$tmux_calls" "$tmux_terminated"
+AGENT_NOTIFY_TMUX_MODE=overflow submit_tmux completed <<'EOF'
+{"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
+EOF
+assert_no_tmux_session 'overflow'
+[[ -e $tmux_terminated ]] || { print -u2 -- 'overflow did not request child termination'; exit 1; }
+
+/bin/rm -f "$calls" "$tmux_calls" "$tmux_terminated"
+AGENT_NOTIFY_TMUX_MODE=output_1024 submit_tmux completed <<'EOF'
+{"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
+EOF
+assert_no_tmux_session '1024-byte tmux output'
+[[ ! -e $tmux_terminated ]] || { print -u2 -- '1024-byte tmux output requested child termination'; exit 1; }
+
+# A direct child can exit successfully while a descendant keeps the stdout pipe open. The hook
+# must treat process exit and stdout EOF as one deadline-bound operation without forwarding output.
+/bin/rm -f "$calls" "$tmux_calls"
+zmodload zsh/datetime
+typeset -F 6 descendant_start=$EPOCHREALTIME
+typeset descendant_output
+descendant_output=$(AGENT_NOTIFY_TMUX_MODE=descendant_holds_stdout submit_tmux completed <<'EOF' 2>&1
+{"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
+EOF
+)
+typeset -F 6 descendant_elapsed=$(( EPOCHREALTIME - descendant_start ))
+(( descendant_elapsed < 1.5 )) || { print -u2 -- "descendant-held stdout exceeded deadline: $descendant_elapsed seconds"; exit 1; }
+assert_equals "$descendant_output" ''
+assert_no_tmux_session 'descendant-held stdout'
+[[ $(<"$calls") != *'descendant-stdout-marker'* ]] || { print -u2 -- 'descendant stdout leaked to submitted event'; exit 1; }
+
+# Invalid gates do not launch the injected executable or leak their raw marker values.
+/bin/rm -f "$calls" "$tmux_calls"
+AGENT_NOTIFY_TEST_CALLS="$calls" AGENT_NOTIFY_TMUX_CALLS="$tmux_calls" PATH="$tmux_dir:$PATH" TMUX='' TMUX_PANE='%123' "$adapter" completed <<'EOF'
+{"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
+EOF
+[[ ! -e $tmux_calls ]] || { print -u2 -- 'empty TMUX launched tmux'; exit 1; }
+assert_no_tmux_session 'empty TMUX'
+
+/bin/rm -f "$calls" "$tmux_calls"
+AGENT_NOTIFY_TEST_CALLS="$calls" AGENT_NOTIFY_TMUX_CALLS="$tmux_calls" PATH="$tmux_dir:$PATH" TMUX='private-socket-marker' TMUX_PANE='private-pane-marker' "$adapter" completed <<'EOF'
+{"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
+EOF
+[[ ! -e $tmux_calls ]] || { print -u2 -- 'invalid TMUX_PANE launched tmux'; exit 1; }
+assert_no_tmux_session 'invalid TMUX_PANE'
+[[ $(<"$calls") != *'private-socket-marker'* && $(<"$calls") != *'private-pane-marker'* ]] || { print -u2 -- 'tmux environment marker leaked to submitted event'; exit 1; }
+
+/bin/rm -f "$calls" "$tmux_calls"
+typeset host_output
+host_output=$(AGENT_NOTIFY_TEST_CALLS="$calls" AGENT_NOTIFY_TMUX_CALLS="$tmux_calls" AGENT_NOTIFY_TMUX_MODE=nonzero AGENT_NOTIFY_TMUX_STDERR='private-stderr-marker' PATH="$tmux_dir:$PATH" TMUX='private-socket-marker' TMUX_PANE='%123' "$adapter" completed <<'EOF' 2>&1
+{"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
+EOF
+)
+assert_equals "$host_output" ''
+[[ $(<"$calls") != *'private-'* && $(<"$calls") != *'rejected-stdout'* && $(<"$calls") != *'tmux executable'* ]] || { print -u2 -- 'raw tmux data leaked to submitted event'; exit 1; }
 
 print -- 'Claude hook adapter tests passed'

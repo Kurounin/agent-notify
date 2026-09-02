@@ -184,7 +184,10 @@ preview() {
   print -- '  Keychain migration requires entering new Pushover credentials after confirmation.'
   print -- "  backups: $backup_root/<unique>/ (0700 directory; 0600 files)"
   print -- "  excerpt settings: $settings_conf_path (created only if absent; never overwritten by a reinstall)"
-  print -- "  Pushover downstream service: api.pushover.net; it receives agent name, project-directory basename, normalized state, timing metadata, and a bounded excerpt of the agent's final message text."
+  print -- "  Pushover and downstream push services receive agent name, a sanitized and bounded tmux-or-project display context, normalized state, and, when enabled and available, a sanitized bounded single-line excerpt."
+  print -- "  When tmux is detected, the adapters automatically perform a bounded lookup for the originating pane; a valid result uses its current innermost session name, otherwise the project basename is used."
+  print -- "  Tmux is optional; its user-chosen innermost session name can be sensitive."
+  print -- "  Claude completion excerpts use final assistant output; Claude failure excerpts use the categorical error identifier, never free-text error detail. OpenCode completion excerpts use relevant root-session assistant text; OpenCode failure excerpts use error message when present or error name otherwise. Excerpts are sanitized and bounded: the selected source is sent in full when it already fits the bound and truncated when longer; model output or OpenCode error messages can repeat sensitive content such as secrets or paths."
   print -- "  Message excerpts are enabled by default; set EXCERPT=0 in $settings_conf_path to stop sending them."
   probe_keychain "$keychain_selector_service" && print -- '  existing v2 credential generation: will be replaced after confirmation' || print -- '  existing v2 credential generation: absent'
   classify_file "$install_bin" "$root/bin/agent-notify" executable

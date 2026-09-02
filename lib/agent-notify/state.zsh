@@ -189,8 +189,19 @@ agent_notify_project_name() {
   project=${directory##*/}
   project=${project//[^[:alnum:].\ _()-]/_}
   project=${project[1,48]}
-  [[ -n $project ]] || project='Unknown project'
+  [[ -n ${project//[[:space:]]/} ]] || project='Unknown project'
   print -r -- "$project"
+}
+
+agent_notify_display_context() {
+  local tmux_session=${1:-} session_dir=${2:-} label
+  label=${tmux_session//[^[:alnum:].\ _()-]/_}
+  label=${label[1,48]}
+  if [[ -n ${label//[[:space:]]/} ]]; then
+    print -r -- "$label"
+  else
+    agent_notify_project_name "$session_dir"
+  fi
 }
 
 agent_notify_transition() {

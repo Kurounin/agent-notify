@@ -132,6 +132,297 @@ fi
 /bin/rm -rf "$busy_lock"
 AGENT_NOTIFY_LOCK_TIMEOUT_ATTEMPTS=100
 
+typeset stale_ownerless_lock="$AGENT_NOTIFY_STATE_DIR/stale-ownerless.lock"
+/bin/mkdir "$stale_ownerless_lock"
+/usr/bin/touch -t 197001010000 "$stale_ownerless_lock"
+AGENT_NOTIFY_NOW=100 agent_notify_try_mkdir_lock "$stale_ownerless_lock" true || { print -u2 -- 'stale ownerless lock was not recovered'; exit 1; }
+[[ ! -e $stale_ownerless_lock ]] || { print -u2 -- 'stale ownerless lock remained'; exit 1; }
+
+typeset fresh_ownerless_lock="$AGENT_NOTIFY_STATE_DIR/fresh-ownerless.lock"
+/bin/mkdir "$fresh_ownerless_lock"
+if AGENT_NOTIFY_NOW=$(/bin/date +%s) agent_notify_try_mkdir_lock "$fresh_ownerless_lock" true; then
+  print -u2 -- 'fresh ownerless lock was recovered'
+  exit 1
+fi
+[[ -d $fresh_ownerless_lock ]] || { print -u2 -- 'fresh ownerless lock was removed'; exit 1; }
+/bin/rm -rf "$fresh_ownerless_lock"
+
+typeset stale_malformed_lock="$AGENT_NOTIFY_STATE_DIR/stale-malformed.lock"
+/bin/mkdir "$stale_malformed_lock"
+print -- 'not an owner record' > "$stale_malformed_lock/owner"
+/usr/bin/touch -t 197001010000 "$stale_malformed_lock/owner" "$stale_malformed_lock"
+AGENT_NOTIFY_NOW=100 agent_notify_try_mkdir_lock "$stale_malformed_lock" true || { print -u2 -- 'stale malformed lock was not recovered'; exit 1; }
+[[ ! -e $stale_malformed_lock ]] || { print -u2 -- 'stale malformed lock remained'; exit 1; }
+
+typeset fresh_malformed_lock="$AGENT_NOTIFY_STATE_DIR/fresh-malformed.lock"
+/bin/mkdir "$fresh_malformed_lock"
+print -- 'not an owner record' > "$fresh_malformed_lock/owner"
+if AGENT_NOTIFY_NOW=$(/bin/date +%s) agent_notify_try_mkdir_lock "$fresh_malformed_lock" true; then
+  print -u2 -- 'fresh malformed lock was recovered'
+  exit 1
+fi
+[[ -d $fresh_malformed_lock ]] || { print -u2 -- 'fresh malformed lock was removed'; exit 1; }
+/bin/rm -rf "$fresh_malformed_lock"
+
+typeset gate_lock="$AGENT_NOTIFY_STATE_DIR/external-gate.lock" gate_path
+/bin/mkdir "$gate_lock"
+print -- '999999 0 stale-owner' > "$gate_lock/owner"
+gate_path=$(agent_notify_external_gate_path "$gate_lock")
+/bin/mkdir "$gate_path"
+print -- "$$ 0 live-gate" > "$gate_path/reaper"
+if AGENT_NOTIFY_NOW=100 agent_notify_recover_stale_lock "$gate_lock"; then
+  print -u2 -- 'live external gate was reaped'
+  exit 1
+fi
+[[ -d $gate_path ]] || { print -u2 -- 'live external gate was removed'; exit 1; }
+/bin/rm -rf "$gate_path"
+AGENT_NOTIFY_NOW=100 agent_notify_recover_stale_lock "$gate_lock" || true
+[[ ! -e $gate_lock ]] || { print -u2 -- 'stale lock did not recover after gate removal'; exit 1; }
+
+typeset publish_race_lock="$AGENT_NOTIFY_STATE_DIR/publish-race.lock" publish_race_gate publish_race_marker="$test_root/publish-race-callback" publish_race_once=0
+publish_race_gate=$(agent_notify_external_gate_path "$publish_race_lock")
+agent_notify_before_lock_owner_publish() {
+  (( publish_race_once++ )) || {
+    /bin/mkdir "$publish_race_gate"
+    print -- '999999 0 stale-gate' > "$publish_race_gate/reaper"
+  }
+}
+agent_notify_publish_race_callback() { print -- ran > "$publish_race_marker"; }
+if AGENT_NOTIFY_NOW=100 agent_notify_try_mkdir_lock "$publish_race_lock" agent_notify_publish_race_callback; then
+  print -u2 -- 'try ran through a post-mkdir fence'
+  exit 1
+fi
+[[ ! -e $publish_race_lock && ! -e $publish_race_marker ]] || { print -u2 -- 'try left an ownerless lock through a fence'; exit 1; }
+AGENT_NOTIFY_NOW=100 agent_notify_with_mkdir_lock "$publish_race_lock" agent_notify_publish_race_callback || { print -u2 -- 'with did not retry after a post-mkdir fence'; exit 1; }
+[[ -e $publish_race_marker && ! -e $publish_race_lock ]] || { print -u2 -- 'with left an ownerless lock through a fence'; exit 1; }
+agent_notify_before_lock_owner_publish() { :; }
+
+typeset stale_gate_lock stale_gate_path gate_callback
+for gate_case in dead ownerless malformed; do
+  stale_gate_lock="$AGENT_NOTIFY_STATE_DIR/stale-gate-$gate_case.lock"
+  gate_callback="$test_root/gate-callback-$gate_case"
+  /bin/mkdir "$stale_gate_lock"
+  print -- '999999 0 stale-owner' > "$stale_gate_lock/owner"
+  stale_gate_path=$(agent_notify_external_gate_path "$stale_gate_lock")
+  /bin/mkdir "$stale_gate_path"
+  case $gate_case in
+    dead) print -- '999998 0 stale-gate' > "$stale_gate_path/reaper" ;;
+    malformed) print -- 'not a reaper token' > "$stale_gate_path/reaper" ;;
+  esac
+  /usr/bin/touch -t 197001010000 "$stale_gate_path" "$stale_gate_path/reaper"(N)
+  agent_notify_gate_callback() { print -- ran > "$gate_callback"; }
+  if AGENT_NOTIFY_NOW=100 agent_notify_try_mkdir_lock "$stale_gate_lock" agent_notify_gate_callback; then
+    print -u2 -- 'try acquired through a stale gate fence'
+    exit 1
+  fi
+  [[ ! -e $stale_gate_path && ! -e $gate_callback ]] || { print -u2 -- 'stale gate cleanup was not one-shot'; exit 1; }
+  AGENT_NOTIFY_NOW=100 agent_notify_try_mkdir_lock "$stale_gate_lock" agent_notify_gate_callback || { print -u2 -- 'later try did not progress after gate cleanup'; exit 1; }
+  [[ -e $gate_callback ]] || { print -u2 -- 'later try did not run callback'; exit 1; }
+done
+
+typeset competing_reaper_lock="$AGENT_NOTIFY_STATE_DIR/competing-reaper.lock" competing_reaper_gate competing_reaper_peer_gq competing_reaper_marker="$test_root/competing-reaper-callback"
+/bin/mkdir "$competing_reaper_lock"
+print -- '999999 0 stale-owner' > "$competing_reaper_lock/owner"
+competing_reaper_gate=$(agent_notify_external_gate_path "$competing_reaper_lock")
+/bin/mkdir "$competing_reaper_gate"
+print -- '999998 0 stale-gate' > "$competing_reaper_gate/reaper"
+competing_reaper_peer_gq="$AGENT_NOTIFY_STATE_DIR/.${competing_reaper_lock:t}.gate-quarantine.peer"
+agent_notify_external_before_gate_move() {
+  /bin/mkdir "$competing_reaper_peer_gq"
+  print -- "$$ 100 peer-gate" > "$competing_reaper_peer_gq/reaper"
+  /bin/mv "$2" "$competing_reaper_peer_gq/object"
+}
+agent_notify_competing_reaper_callback() { print -- ran > "$competing_reaper_marker"; }
+if AGENT_NOTIFY_NOW=100 agent_notify_try_mkdir_lock "$competing_reaper_lock" agent_notify_competing_reaper_callback; then
+  print -u2 -- 'competing gate reaper acquired a fenced lock'
+  exit 1
+fi
+typeset -a competing_reaper_gqs
+competing_reaper_gqs=("$AGENT_NOTIFY_STATE_DIR"/.${competing_reaper_lock:t}.gate-quarantine.*(N))
+assert_equals "${#competing_reaper_gqs}" 1
+[[ $competing_reaper_gqs[1] == "$competing_reaper_peer_gq" && -d "$competing_reaper_peer_gq/object" && -d $competing_reaper_lock ]] || { print -u2 -- 'competing gate reaper did not retain only the peer fence'; exit 1; }
+if AGENT_NOTIFY_NOW=100 agent_notify_try_mkdir_lock "$competing_reaper_lock" agent_notify_competing_reaper_callback; then
+  print -u2 -- 'competing gate fence allowed a later lock attempt'
+  exit 1
+fi
+[[ ! -e $competing_reaper_marker && ! -e "$AGENT_NOTIFY_STATE_DIR"/.${competing_reaper_lock:t}.lock-quarantine.*(N) ]] || { print -u2 -- 'competing gate fence ran a callback or created a lock quarantine'; exit 1; }
+agent_notify_external_before_gate_move() { :; }
+/bin/rm -rf "$competing_reaper_lock" "$competing_reaper_gate" "$competing_reaper_peer_gq"
+
+typeset gate_replacement_lock="$AGENT_NOTIFY_STATE_DIR/gate-replacement.lock" gate_replacement_gate gate_replacement_peer_gq gate_replacement_marker="$test_root/gate-replacement-callback"
+/bin/mkdir "$gate_replacement_lock"
+print -- '999999 0 stale-owner' > "$gate_replacement_lock/owner"
+gate_replacement_gate=$(agent_notify_external_gate_path "$gate_replacement_lock")
+gate_replacement_peer_gq="$AGENT_NOTIFY_STATE_DIR/.${gate_replacement_lock:t}.gate-quarantine.peer"
+agent_notify_recovery_after_final_validation() {
+  /bin/mkdir "$gate_replacement_peer_gq"
+  print -- "$$ 100 peer-gate" > "$gate_replacement_peer_gq/reaper"
+  /bin/mv "$2" "$gate_replacement_peer_gq/object"
+  /bin/mkdir "$2"
+  print -- "$$ 100 replacement-gate" > "$2/reaper"
+}
+agent_notify_gate_replacement_callback() { print -- ran > "$gate_replacement_marker"; }
+if AGENT_NOTIFY_NOW=100 agent_notify_recover_stale_lock "$gate_replacement_lock"; then
+  print -u2 -- 'gate replacement recovery succeeded'
+  exit 1
+fi
+typeset -a gate_replacement_lqs
+gate_replacement_lqs=("$AGENT_NOTIFY_STATE_DIR"/.${gate_replacement_lock:t}.lock-quarantine.*(N))
+assert_equals "${#gate_replacement_lqs}" 1
+[[ -d $gate_replacement_gate && -d "$gate_replacement_peer_gq/object" && -d "$gate_replacement_lqs[1]/object" ]] || { print -u2 -- 'gate replacement did not retain its fences'; exit 1; }
+if AGENT_NOTIFY_NOW=100 agent_notify_try_mkdir_lock "$gate_replacement_lock" agent_notify_gate_replacement_callback || agent_notify_run_owned_lock "$gate_replacement_lock" 'superseded-token' agent_notify_gate_replacement_callback; then
+  print -u2 -- 'gate replacement fence allowed a callback'
+  exit 1
+fi
+[[ ! -e $gate_replacement_marker ]] || { print -u2 -- 'gate replacement callback ran through a fence'; exit 1; }
+agent_notify_recovery_after_final_validation() { :; }
+/bin/rm -rf "$gate_replacement_lock" "$gate_replacement_gate" "$gate_replacement_peer_gq" "${gate_replacement_lqs[@]}"
+
+typeset lock_replacement_lock="$AGENT_NOTIFY_STATE_DIR/lock-replacement.lock" lock_replacement_gate lock_replacement_peer_lq lock_replacement_marker="$test_root/lock-replacement-callback"
+/bin/mkdir "$lock_replacement_lock"
+print -- '999999 0 stale-owner' > "$lock_replacement_lock/owner"
+lock_replacement_gate=$(agent_notify_external_gate_path "$lock_replacement_lock")
+lock_replacement_peer_lq="$AGENT_NOTIFY_STATE_DIR/.${lock_replacement_lock:t}.lock-quarantine.peer"
+agent_notify_recovery_after_final_validation() {
+  /bin/mkdir "$lock_replacement_peer_lq"
+  print -- "$$ 100 peer-lock" > "$lock_replacement_peer_lq/reaper"
+  /bin/mv "$1" "$lock_replacement_peer_lq/object"
+  /bin/mkdir "$1"
+  print -- "$$ 100 replacement-owner" > "$1/owner"
+}
+agent_notify_lock_replacement_callback() { print -- ran > "$lock_replacement_marker"; }
+if AGENT_NOTIFY_NOW=100 agent_notify_recover_stale_lock "$lock_replacement_lock"; then
+  print -u2 -- 'lock replacement recovery succeeded'
+  exit 1
+fi
+typeset -a lock_replacement_lqs
+lock_replacement_lqs=("$AGENT_NOTIFY_STATE_DIR"/.${lock_replacement_lock:t}.lock-quarantine.*(N))
+assert_equals "${#lock_replacement_lqs}" 2
+[[ -d $lock_replacement_gate &&
+  -d "$lock_replacement_peer_lq/object" &&
+  ( $(<"$lock_replacement_lqs[1]/object/owner") == "$$ 100 replacement-owner" ||
+    $(<"$lock_replacement_lqs[2]/object/owner") == "$$ 100 replacement-owner" ) ]] || { print -u2 -- 'lock replacement did not retain both lock quarantines'; exit 1; }
+if AGENT_NOTIFY_NOW=100 agent_notify_try_mkdir_lock "$lock_replacement_lock" agent_notify_lock_replacement_callback || agent_notify_run_owned_lock "$lock_replacement_lock" 'superseded-token' agent_notify_lock_replacement_callback; then
+  print -u2 -- 'lock replacement fence allowed a callback'
+  exit 1
+fi
+[[ ! -e $lock_replacement_marker ]] || { print -u2 -- 'lock replacement callback ran through a fence'; exit 1; }
+agent_notify_recovery_after_final_validation() { :; }
+/bin/rm -rf "$lock_replacement_lock" "$lock_replacement_gate" "$lock_replacement_peer_lq" "${lock_replacement_lqs[@]}"
+
+typeset unreadable_gate_lock="$AGENT_NOTIFY_STATE_DIR/unreadable-gate.lock" unreadable_gate_path unreadable_gate_marker="$test_root/unreadable-gate-callback"
+/bin/mkdir "$unreadable_gate_lock"
+print -- '999999 0 stale-owner' > "$unreadable_gate_lock/owner"
+unreadable_gate_path=$(agent_notify_external_gate_path "$unreadable_gate_lock")
+/bin/mkdir "$unreadable_gate_path"
+print -- '999998 0 stale-gate' > "$unreadable_gate_path/reaper"
+/usr/bin/touch -t 197001010000 "$unreadable_gate_path" "$unreadable_gate_path/reaper"
+/bin/chmod 000 "$unreadable_gate_path/reaper"
+[[ ! -r $unreadable_gate_path/reaper ]] || { print -u2 -- 'mode 000 gate reaper remained readable'; exit 1; }
+agent_notify_unreadable_gate_callback() { print -- ran > "$unreadable_gate_marker"; }
+if AGENT_NOTIFY_NOW=100 agent_notify_try_mkdir_lock "$unreadable_gate_lock" agent_notify_unreadable_gate_callback; then
+  print -u2 -- 'unreadable gate fence allowed an initial lock attempt'
+  exit 1
+fi
+[[ ! -e $unreadable_gate_path && -d $unreadable_gate_lock && ! -e $unreadable_gate_marker ]] || { print -u2 -- 'unreadable gate cleanup was not isolated'; exit 1; }
+AGENT_NOTIFY_NOW=100 agent_notify_try_mkdir_lock "$unreadable_gate_lock" agent_notify_unreadable_gate_callback || { print -u2 -- 'unreadable gate did not allow later recovery'; exit 1; }
+[[ -e $unreadable_gate_marker && ! -e $unreadable_gate_lock ]] || { print -u2 -- 'unreadable gate recovery did not run once'; exit 1; }
+/bin/chmod 600 "$unreadable_gate_path/reaper" 2>/dev/null || true
+/bin/rm -rf "$unreadable_gate_lock" "$unreadable_gate_path"
+
+typeset saved_fence_timeout_attempts=$AGENT_NOTIFY_LOCK_TIMEOUT_ATTEMPTS
+AGENT_NOTIFY_LOCK_TIMEOUT_ATTEMPTS=1
+typeset live_gq_lock="$AGENT_NOTIFY_STATE_DIR/live-gq-fence.lock" live_gq="$AGENT_NOTIFY_STATE_DIR/.live-gq-fence.lock.gate-quarantine.live" live_gq_marker="$test_root/live-gq-callback"
+/bin/mkdir "$live_gq" "$live_gq/object"
+print -- '999998 0 stale-outer' > "$live_gq/reaper"
+print -- "$$ 100 live-gate" > "$live_gq/object/reaper"
+agent_notify_live_gq_callback() { print -- ran >> "$live_gq_marker"; }
+if AGENT_NOTIFY_NOW=100 agent_notify_try_mkdir_lock "$live_gq_lock" agent_notify_live_gq_callback || AGENT_NOTIFY_NOW=100 agent_notify_with_mkdir_lock "$live_gq_lock" agent_notify_live_gq_callback; then
+  print -u2 -- 'live gate quarantine allowed a callback'
+  exit 1
+fi
+[[ -d $live_gq && ! -e $live_gq_lock && ! -e $live_gq_marker ]] || { print -u2 -- 'live gate quarantine was not retained'; exit 1; }
+/bin/rm -rf "$live_gq"
+AGENT_NOTIFY_NOW=100 agent_notify_try_mkdir_lock "$live_gq_lock" agent_notify_live_gq_callback || { print -u2 -- 'removed gate quarantine did not allow progress'; exit 1; }
+assert_equals "$(<"$live_gq_marker")" ran
+[[ ! -e $live_gq_lock ]] || { print -u2 -- 'gate quarantine retry retained its lock'; exit 1; }
+
+typeset live_lq_lock="$AGENT_NOTIFY_STATE_DIR/live-lq-fence.lock" live_lq="$AGENT_NOTIFY_STATE_DIR/.live-lq-fence.lock.lock-quarantine.live" live_lq_marker="$test_root/live-lq-callback"
+/bin/mkdir "$live_lq" "$live_lq/object"
+print -- '999998 0 stale-outer' > "$live_lq/reaper"
+print -- "$$ 0 live-owner" > "$live_lq/object/owner"
+agent_notify_live_lq_callback() { print -- ran >> "$live_lq_marker"; }
+if AGENT_NOTIFY_NOW=100 agent_notify_try_mkdir_lock "$live_lq_lock" agent_notify_live_lq_callback || AGENT_NOTIFY_NOW=100 agent_notify_with_mkdir_lock "$live_lq_lock" agent_notify_live_lq_callback; then
+  print -u2 -- 'live lock quarantine allowed a callback'
+  exit 1
+fi
+[[ -d $live_lq && ! -e $live_lq_lock && ! -e $live_lq_marker ]] || { print -u2 -- 'live lock quarantine was not retained'; exit 1; }
+/bin/rm -rf "$live_lq"
+AGENT_NOTIFY_NOW=100 agent_notify_try_mkdir_lock "$live_lq_lock" agent_notify_live_lq_callback || { print -u2 -- 'removed lock quarantine did not allow progress'; exit 1; }
+assert_equals "$(<"$live_lq_marker")" ran
+[[ ! -e $live_lq_lock ]] || { print -u2 -- 'lock quarantine retry retained its lock'; exit 1; }
+AGENT_NOTIFY_LOCK_TIMEOUT_ATTEMPTS=$saved_fence_timeout_attempts
+agent_notify_external_before_gate_move() { :; }
+agent_notify_recovery_after_final_validation() { :; }
+
+typeset empty_container_lock="$AGENT_NOTIFY_STATE_DIR/empty-container.lock" empty_container
+/bin/mkdir "$empty_container_lock"
+print -- '999999 0 stale-owner' > "$empty_container_lock/owner"
+agent_notify_external_reserve_container "$empty_container_lock" lock || { print -u2 -- 'empty container was not reserved'; exit 1; }
+empty_container=$AGENT_NOTIFY_EXTERNAL_CONTAINER
+agent_notify_external_remove_owned_empty_container "$empty_container" "$AGENT_NOTIFY_EXTERNAL_CONTAINER_TOKEN" "$AGENT_NOTIFY_EXTERNAL_CONTAINER_INODE" || { print -u2 -- 'owned empty container was not removed'; exit 1; }
+[[ ! -e $empty_container ]] || { print -u2 -- 'owned empty container remained'; exit 1; }
+agent_notify_external_reserve_container "$empty_container_lock" gate || { print -u2 -- 'stale empty container was not reserved'; exit 1; }
+empty_container=$AGENT_NOTIFY_EXTERNAL_CONTAINER
+print -- '999998 0 dead-container' > "$empty_container/reaper"
+AGENT_NOTIFY_NOW=100 agent_notify_external_cleanup_one_fence "$empty_container_lock" || { print -u2 -- 'stale empty container was not reclaimed'; exit 1; }
+[[ ! -e $empty_container ]] || { print -u2 -- 'stale empty container remained'; exit 1; }
+/bin/rm -rf "$empty_container_lock"
+
+typeset outside_lock="$test_root/outside.lock" traversal_lock="$AGENT_NOTIFY_STATE_DIR/../${AGENT_NOTIFY_STATE_DIR:t}/traversal.lock" dot_parent_lock="$AGENT_NOTIFY_STATE_DIR/./dot-parent.lock" unsafe_basename_lock="$AGENT_NOTIFY_STATE_DIR/.lock" symlink_lock="$AGENT_NOTIFY_STATE_DIR/symlink.lock"
+/bin/ln -s "$outside_lock" "$symlink_lock"
+for unsafe_lock in "$outside_lock" "$traversal_lock" "$dot_parent_lock" "$unsafe_basename_lock" "$symlink_lock"; do
+  if agent_notify_try_mkdir_lock "$unsafe_lock" true; then
+    print -u2 -- 'unsafe lock path was accepted'
+    exit 1
+  fi
+done
+[[ ! -e $outside_lock && ! -e $dot_parent_lock && ! -e $unsafe_basename_lock && -L $symlink_lock ]] || { print -u2 -- 'unsafe lock path was mutated'; exit 1; }
+/bin/rm -f "$symlink_lock"
+typeset state_source
+state_source=$(<"$root/lib/agent-notify/state.zsh")
+[[ $state_source != *uuidgen* ]] || { print -u2 -- 'state locking still invokes uuidgen'; exit 1; }
+typeset -A state_function_counts
+typeset state_source_line state_function_name
+while IFS= read -r state_source_line; do
+  [[ $state_source_line =~ '^(agent_notify_[[:alnum:]_]+)\(\)' ]] || continue
+  state_function_name=$match[1]
+  (( ++state_function_counts[$state_function_name] == 1 )) || { print -u2 -- "duplicate notifier function: $state_function_name"; exit 1; }
+done <<< "$state_source"
+[[ $state_source != *'/recovery'* ]] || { print -u2 -- 'obsolete nested recovery protocol remains'; exit 1; }
+
+typeset replacement_lock="$AGENT_NOTIFY_STATE_DIR/replacement.lock" replacement_marker="$test_root/replacement-callback"
+agent_notify_replacement_callback() { print -- invoked > "$replacement_marker"; }
+/bin/mkdir "$replacement_lock"
+print -- "$$ 100 original-token" > "$replacement_lock/owner"
+print -- "$$ 100 replacement-token" > "$replacement_lock/owner"
+if agent_notify_run_owned_lock "$replacement_lock" "$$ 100 original-token" agent_notify_replacement_callback; then
+  print -u2 -- 'replacement owner ran a superseded callback'
+  exit 1
+fi
+[[ ! -e $replacement_marker && -d $replacement_lock ]] || { print -u2 -- 'replacement ownership was not protected'; exit 1; }
+/bin/rm -rf "$replacement_lock"
+
+typeset callback_failure_lock="$AGENT_NOTIFY_STATE_DIR/callback-failure.lock" callback_result
+agent_notify_failing_callback() { return 7; }
+if agent_notify_try_mkdir_lock "$callback_failure_lock" agent_notify_failing_callback; then
+  callback_result=0
+else
+  callback_result=$?
+fi
+assert_equals "$callback_result" 7
+[[ ! -e $callback_failure_lock ]] || { print -u2 -- 'nonzero callback left its lock behind'; exit 1; }
+
 typeset retained_state="$AGENT_NOTIFY_STATE_DIR/prune-locked.state"
 STATE_ACTIVE=0 STATE_STARTED_AT=0 STATE_ATTENTIONS='' STATE_LAST_ATTENTION_AT=0 STATE_TERMINAL=completed STATE_UPDATED_AT=0
 agent_notify_save_state "$retained_state"
@@ -142,6 +433,93 @@ AGENT_NOTIFY_NOW=1000000 agent_notify_prune_state
 /bin/rm -rf "$AGENT_NOTIFY_STATE_DIR/prune-locked.lock"
 AGENT_NOTIFY_NOW=1000000 agent_notify_prune_state
 [[ ! -e $retained_state ]] || { print -u2 -- 'stale inactive state was not pruned'; exit 1; }
+
+typeset prune_marker global_prune_lock
+prune_marker=$(agent_notify_prune_marker_path)
+/bin/rm -f "$prune_marker"
+global_prune_lock="$AGENT_NOTIFY_STATE_DIR/.prune.lock"
+/bin/mkdir "$global_prune_lock"
+print -- "$$ 0 global-prune" > "$global_prune_lock/owner"
+AGENT_NOTIFY_NOW=1000000 agent_notify_prune_state_if_due || true
+[[ -d $global_prune_lock && ! -e $prune_marker ]] || { print -u2 -- 'contended global prune lock was not skipped'; exit 1; }
+/bin/rm -rf "$global_prune_lock"
+
+typeset saved_state_dir=$AGENT_NOTIFY_STATE_DIR saved_prune_batch_size=$AGENT_NOTIFY_PRUNE_BATCH_SIZE
+AGENT_NOTIFY_STATE_DIR="$test_root/prune-batch-state"
+AGENT_NOTIFY_PRUNE_BATCH_SIZE=64
+agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+for batch_index in {1..65}; do
+  STATE_ACTIVE=0 STATE_STARTED_AT=0 STATE_ATTENTIONS='' STATE_LAST_ATTENTION_AT=0 STATE_TERMINAL=completed STATE_UPDATED_AT=0
+  agent_notify_save_state "$AGENT_NOTIFY_STATE_DIR/batch-$batch_index.state"
+done
+AGENT_NOTIFY_NOW=1000000 agent_notify_prune_state_if_due || { print -u2 -- 'bounded prune pass failed'; exit 1; }
+typeset -a batch_states
+batch_states=("$AGENT_NOTIFY_STATE_DIR"/*.state(N))
+assert_equals "${#batch_states}" 1
+[[ $(/usr/bin/stat -f '%Lp' "$(agent_notify_prune_marker_path)") == 600 ]] || { print -u2 -- 'prune marker is not user-only'; exit 1; }
+AGENT_NOTIFY_NOW=1000000 agent_notify_prune_state_if_due || { print -u2 -- 'frequency-gated prune failed'; exit 1; }
+batch_states=("$AGENT_NOTIFY_STATE_DIR"/*.state(N))
+assert_equals "${#batch_states}" 1
+AGENT_NOTIFY_STATE_DIR=$saved_state_dir
+AGENT_NOTIFY_PRUNE_BATCH_SIZE=$saved_prune_batch_size
+
+typeset cursor_prune_state_dir="$test_root/cursor-prune-state" cursor_late_state
+AGENT_NOTIFY_STATE_DIR=$cursor_prune_state_dir
+AGENT_NOTIFY_PRUNE_BATCH_SIZE=64
+agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+for cursor_index in {1..64}; do
+  STATE_ACTIVE=0 STATE_STARTED_AT=0 STATE_ATTENTIONS='' STATE_LAST_ATTENTION_AT=0 STATE_TERMINAL=completed STATE_UPDATED_AT=1000000
+  agent_notify_save_state "$AGENT_NOTIFY_STATE_DIR/locked-$cursor_index.state"
+  /usr/bin/touch -t 197001010000 "$AGENT_NOTIFY_STATE_DIR/locked-$cursor_index.state"
+  /bin/mkdir "$AGENT_NOTIFY_STATE_DIR/locked-$cursor_index.lock"
+  print -- "$$ 0 live-cursor-$cursor_index" > "$AGENT_NOTIFY_STATE_DIR/locked-$cursor_index.lock/owner"
+done
+cursor_late_state="$AGENT_NOTIFY_STATE_DIR/late-expired.state"
+STATE_ACTIVE=0 STATE_STARTED_AT=0 STATE_ATTENTIONS='' STATE_LAST_ATTENTION_AT=0 STATE_TERMINAL=completed STATE_UPDATED_AT=0
+agent_notify_save_state "$cursor_late_state"
+/usr/bin/touch -t 197101010000 "$cursor_late_state"
+AGENT_NOTIFY_NOW=1000000 agent_notify_prune_state_if_due || { print -u2 -- 'cursor prune first pass failed'; exit 1; }
+[[ -f $cursor_late_state ]] || { print -u2 -- 'cursor prune skipped the later stale state too early'; exit 1; }
+AGENT_NOTIFY_NOW=1000000 agent_notify_prune_state_forced || { print -u2 -- 'cursor prune second pass failed'; exit 1; }
+[[ ! -e $cursor_late_state ]] || { print -u2 -- 'cursor prune starved the later stale state'; exit 1; }
+[[ $(/usr/bin/stat -f '%Lp' "$(agent_notify_prune_cursor_path)") == 600 && $(/usr/bin/stat -f '%Lp' "$(agent_notify_prune_marker_path)") == 600 ]] || { print -u2 -- 'prune cursor or marker is not user-only'; exit 1; }
+AGENT_NOTIFY_STATE_DIR=$saved_state_dir
+AGENT_NOTIFY_PRUNE_BATCH_SIZE=$saved_prune_batch_size
+
+typeset oldest_prune_state_dir="$test_root/oldest-prune-state" oldest_stale_state
+AGENT_NOTIFY_STATE_DIR=$oldest_prune_state_dir
+AGENT_NOTIFY_PRUNE_BATCH_SIZE=64
+agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+for oldest_index in {1..64}; do
+  STATE_ACTIVE=0 STATE_STARTED_AT=0 STATE_ATTENTIONS='' STATE_LAST_ATTENTION_AT=0 STATE_TERMINAL=completed STATE_UPDATED_AT=1000000
+  agent_notify_save_state "$AGENT_NOTIFY_STATE_DIR/early-retained-$oldest_index.state"
+done
+oldest_stale_state="$AGENT_NOTIFY_STATE_DIR/late-stale.state"
+STATE_ACTIVE=0 STATE_STARTED_AT=0 STATE_ATTENTIONS='' STATE_LAST_ATTENTION_AT=0 STATE_TERMINAL=completed STATE_UPDATED_AT=0
+agent_notify_save_state "$oldest_stale_state"
+/usr/bin/touch -t 197001010000 "$oldest_stale_state"
+AGENT_NOTIFY_NOW=1000000 agent_notify_prune_state_forced || { print -u2 -- 'oldest-first prune pass failed'; exit 1; }
+[[ ! -e $oldest_stale_state && -f $AGENT_NOTIFY_STATE_DIR/early-retained-1.state ]] || { print -u2 -- 'retained early states starved the oldest stale state'; exit 1; }
+AGENT_NOTIFY_STATE_DIR=$saved_state_dir
+AGENT_NOTIFY_PRUNE_BATCH_SIZE=$saved_prune_batch_size
+
+typeset event_before_prune_dir="$test_root/event-before-prune-state" event_before_prune_key event_before_prune_marker
+AGENT_NOTIFY_STATE_DIR=$event_before_prune_dir
+event_before_prune_key=$(agent_notify_session_key claude-code event-before-prune)
+event_before_prune_marker="$test_root/event-before-prune-marker"
+agent_notify_prune_state_if_due() {
+  if [[ -f $AGENT_NOTIFY_STATE_DIR/$event_before_prune_key.state ]]; then
+    print -- after-event > "$event_before_prune_marker"
+  else
+    print -- before-event > "$event_before_prune_marker"
+  fi
+}
+AGENT_NOTIFY_NOW=1000000 agent_notify_event <<'EOF'
+{"source":"claude-code","kind":"began","session_id":"event-before-prune","session_dir":"/tmp/event-before-prune"}
+EOF
+assert_equals "$(<"$event_before_prune_marker")" after-event
+source "$root/lib/agent-notify/state.zsh"
+AGENT_NOTIFY_STATE_DIR=$saved_state_dir
 
 AGENT_NOTIFY_NOW=500 agent_notify_event <<'EOF'
 {"source":"opencode","kind":"attention","session_id":"concurrent-clears","session_dir":"/tmp/lock-test","request_id":"clear-one"}
@@ -158,6 +536,7 @@ EOF
 )&
 typeset clear_one_pid=$!
 (
+  /bin/sleep 1
 AGENT_NOTIFY_NOW=510 agent_notify_event <<'EOF'
 {"source":"opencode","kind":"attention-cleared","session_id":"concurrent-clears","session_dir":"/tmp/lock-test","request_id":"clear-two"}
 EOF
@@ -173,6 +552,7 @@ EOF
 typeset terminal_key
 terminal_key=$(agent_notify_session_key opencode terminal-race)
 (
+  /bin/sleep 1
 AGENT_NOTIFY_NOW=631 agent_notify_event <<'EOF'
 {"source":"opencode","kind":"completed","session_id":"terminal-race","session_dir":"/tmp/terminal-race"}
 EOF
@@ -188,6 +568,38 @@ wait "$completed_pid"
 wait "$failed_pid"
 agent_notify_load_state "$AGENT_NOTIFY_STATE_DIR/$terminal_key.state"
 [[ $STATE_ACTIVE == 0 && ( $STATE_TERMINAL == completed || $STATE_TERMINAL == failed ) ]] || { print -u2 -- 'terminal race was not serialized'; exit 1; }
+
+typeset blocking_state_dir="$test_root/blocking-delivery-state" blocking_key blocking_started="$test_root/blocking-delivery-started" blocking_calls="$test_root/blocking-delivery-calls"
+AGENT_NOTIFY_STATE_DIR=$blocking_state_dir
+agent_notify_deliver() {
+  print -- call >> "$blocking_calls"
+  : > "$blocking_started"
+  /bin/sleep 2
+}
+AGENT_NOTIFY_NOW=2000 agent_notify_event <<'EOF'
+{"source":"claude-code","kind":"began","session_id":"blocking-delivery","session_dir":"/tmp/blocking-delivery"}
+EOF
+blocking_key=$(agent_notify_session_key claude-code blocking-delivery)
+(
+  AGENT_NOTIFY_NOW=2031 agent_notify_event <<'EOF'
+{"source":"claude-code","kind":"completed","session_id":"blocking-delivery","session_dir":"/tmp/blocking-delivery"}
+EOF
+) &
+typeset blocking_pid=$!
+for _ in {1..40}; do
+  [[ -e $blocking_started ]] && break
+  /bin/sleep 0.05
+done
+[[ -e $blocking_started ]] || { print -u2 -- 'blocking delivery did not start'; exit 1; }
+[[ ! -e $AGENT_NOTIFY_STATE_DIR/$blocking_key.lock ]] || { print -u2 -- 'session lock remained held during delivery'; exit 1; }
+AGENT_NOTIFY_NOW=2031 agent_notify_event <<'EOF'
+{"source":"claude-code","kind":"completed","session_id":"blocking-delivery","session_dir":"/tmp/blocking-delivery"}
+EOF
+wait "$blocking_pid"
+typeset -a blocking_call_lines
+blocking_call_lines=("${(f)$(<"$blocking_calls")}")
+assert_equals "${#blocking_call_lines}" 1
+AGENT_NOTIFY_STATE_DIR=$saved_state_dir
 
 source "$root/lib/agent-notify/delivery.zsh"
 typeset keychain_jxa="$test_root/keychain-jxa" keychain_legacy_marker="$test_root/keychain-legacy-used"

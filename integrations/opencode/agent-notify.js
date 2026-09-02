@@ -9,6 +9,7 @@ const MAX_PAYLOAD_BYTES = 2048;
 const MESSAGE_FETCH_LIMIT = 12;
 const MESSAGE_FETCH_TIMEOUT_MS = 1_000;
 const SUBPROCESS_OUTER_TIMEOUT_MS = 10_000;
+const ROOT_QUIESCENCE_MS = 50;
 const EXCERPT_TRUNCATION_MARKER = "…";
 const EXCERPT_CODE_MARKER = "[code]";
 const SETTINGS_RELATIVE_PATH = "/Library/Application Support/agent-notify/settings.conf";
@@ -260,12 +261,19 @@ function createBinarySubmitter({
   };
 }
 
-function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
+function createOpenCodeAdapter({
+  client,
+  submit = createBinarySubmitter(),
+  schedule = globalThis.setTimeout,
+  clear = globalThis.clearTimeout,
+}) {
   const activeTurns = new Set();
   const terminatedTurns = new Set();
   const attention = new Map();
   const sessionTrees = new Map();
   const sessionRoots = new Map();
+  const completionCandidates = new Map();
+  let nextCompletionToken = 1;
 
   async function lookup(sessionID) {
     try {
@@ -341,6 +349,7 @@ function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
     const tree = sessionTrees.get(rootID);
     if (!tree) return;
 
+    cancelCompletionCandidate(rootID);
     for (const sessionID of tree.keys()) sessionRoots.delete(sessionID);
     sessionTrees.delete(rootID);
   }
@@ -351,6 +360,8 @@ function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
     const fromTree = sessionTrees.get(fromRootID);
     if (!fromTree) return;
 
+    cancelCompletionCandidate(fromRootID);
+    cancelCompletionCandidate(toRootID);
     const toTree = sessionTrees.get(toRootID) ?? new Map();
     for (const [sessionID, session] of fromTree) {
       if (!toTree.has(sessionID)) toTree.set(sessionID, session);
@@ -382,6 +393,7 @@ function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
     });
     sessionTrees.set(rootID, tree);
     sessionRoots.set(sessionID, rootID);
+    if (status === "busy" || status === "retry" || status === "terminal") cancelCompletionCandidate(rootID);
     return rootID;
   }
 
@@ -389,18 +401,52 @@ function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
     return sessionTrees.get(sessionID)?.get(sessionID)?.pending === true;
   }
 
-  async function completePendingRoot(rootID) {
+  function pendingRoot(rootID) {
     const tree = sessionTrees.get(rootID);
     const root = tree?.get(rootID);
-    if (!root?.pending || root.status !== "idle") return;
+    if (!root?.pending || root.status !== "idle") return undefined;
 
     for (const [sessionID, session] of tree) {
-      if (sessionID !== rootID && (session.status === "busy" || session.status === "retry")) return;
+      if (sessionID !== rootID && (session.status === "busy" || session.status === "retry")) return undefined;
     }
+    return { tree, root };
+  }
 
-    root.pending = false;
+  function cancelCompletionCandidate(rootID) {
+    const candidate = completionCandidates.get(rootID);
+    if (!candidate) return;
+
+    completionCandidates.delete(rootID);
+    clear(candidate.timer);
+  }
+
+  async function completeCandidate(rootID, token) {
+    const candidate = completionCandidates.get(rootID);
+    if (!candidate || candidate.token !== token || !pendingRoot(rootID)) return;
+
+    const excerpt = await sessionExcerpt(rootID);
+    const pending = pendingRoot(rootID);
+    if (completionCandidates.get(rootID) !== candidate || candidate.token !== token || !pending) return;
+
+    completionCandidates.delete(rootID);
+    pending.root.pending = false;
     removeTree(rootID);
-    await notifyCompleted(rootID, root.directory);
+    await notify("completed", rootID, pending.root.directory, "", excerpt);
+  }
+
+  function completePendingRoot(rootID) {
+    if (!pendingRoot(rootID) || completionCandidates.has(rootID)) return;
+
+    const candidate = { token: nextCompletionToken, timer: undefined };
+    nextCompletionToken += 1;
+    candidate.timer = schedule(async () => {
+      try {
+        await completeCandidate(rootID, candidate.token);
+      } catch {
+        // Notifications are advisory and timer failures must not escape OpenCode's event loop.
+      }
+    }, ROOT_QUIESCENCE_MS);
+    completionCandidates.set(rootID, candidate);
   }
 
   function pruneSettledTree(rootID) {
@@ -423,7 +469,10 @@ function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
       if (directory) session.directory = directory;
 
       if (status === "busy" || status === "retry") {
+        const resumesPendingTurn = session.pending;
         session.status = status;
+        session.pending = false;
+        cancelCompletionCandidate(rootID);
         if (status !== "busy" || activeTurns.has(sessionID)) return;
 
         terminatedTurns.delete(sessionID);
@@ -432,21 +481,23 @@ function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
           activeTurns.delete(sessionID);
           return;
         }
-        if (sessionID === rootID && !session.pending) await notify("began", sessionID, directory);
+        if (sessionID === rootID && !resumesPendingTurn) await notify("began", sessionID, directory);
         return;
       }
 
       if (status === "idle") {
+        const previousStatus = session.status;
         session.status = "idle";
         const wasActive = activeTurns.delete(sessionID);
         if (wasActive) attention.delete(sessionID);
         if (sessionID === rootID) {
           if (!wasActive && session.pending) return;
-          removeTree(rootID);
-          if (wasActive && directory) await notifyCompleted(sessionID, directory);
+          if (wasActive || previousStatus === "busy" || previousStatus === "retry") session.pending = true;
+          completePendingRoot(rootID);
+          pruneSettledTree(rootID);
           return;
         }
-        await completePendingRoot(rootID);
+        completePendingRoot(rootID);
         pruneSettledTree(rootID);
       }
       return;
@@ -483,8 +534,6 @@ function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
     await submit(event);
   }
 
-  // The message fetch is issued only once every state mutation for the event has been applied, so
-  // its await cannot interleave with another event's view of the tracked lifecycle state.
   async function notifyCompleted(rootID, sessionDir) {
     await notify("completed", rootID, sessionDir, "", await sessionExcerpt(rootID));
   }
@@ -516,6 +565,10 @@ function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
         const status = event.type === "session.status"
           ? event.properties?.status?.type
           : event.type === "session.idle" ? "idle" : "busy";
+        const knownRootID = status === "busy" || status === "retry"
+          ? sessionRoots.get(sessionID)
+          : undefined;
+        if (knownRootID) cancelCompletionCandidate(knownRootID);
         const details = await lookup(sessionID);
         if (!details.treeMetadata) {
           await fallBackToSessionLifecycle(sessionID, details, status);
@@ -554,7 +607,7 @@ function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
             const session = sessionTrees.get(rootID)?.get(sessionID);
             if (wasActive) session.pending = true;
           }
-          await completePendingRoot(rootID);
+          completePendingRoot(rootID);
           pruneSettledTree(rootID);
         }
         return;
@@ -563,6 +616,8 @@ function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
       if (event.type === "session.error") {
         if (!terminalError(event) || terminatedTurns.has(sessionID)) return;
 
+        const knownRootID = sessionRoots.get(sessionID);
+        if (knownRootID) cancelCompletionCandidate(knownRootID);
         terminatedTurns.add(sessionID);
         activeTurns.delete(sessionID);
         attention.delete(sessionID);
@@ -576,7 +631,7 @@ function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
           if (details.directory) await notify("failed", sessionID, details.directory, "", excerpt);
           if (sessionID === trackedRootID) removeTree(trackedRootID);
           else {
-            await completePendingRoot(trackedRootID);
+            completePendingRoot(trackedRootID);
             pruneSettledTree(trackedRootID);
           }
           return;
@@ -587,7 +642,7 @@ function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
           if (directory) await notify("failed", sessionID, directory, "", excerpt);
           if (sessionID === rootID) removeTree(rootID);
           else {
-            await completePendingRoot(rootID);
+            completePendingRoot(rootID);
             pruneSettledTree(rootID);
           }
           return;
@@ -623,6 +678,6 @@ function createOpenCodeAdapter({ client, submit = createBinarySubmitter() }) {
   };
 }
 
-export default async function agentNotifyPlugin({ client, submit }) {
-  return createOpenCodeAdapter({ client, submit });
+export default async function agentNotifyPlugin({ client, submit, schedule, clear }) {
+  return createOpenCodeAdapter({ client, submit, schedule, clear });
 }

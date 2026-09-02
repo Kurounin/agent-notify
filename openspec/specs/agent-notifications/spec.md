@@ -38,6 +38,51 @@ The system SHALL maintain short-lived local state keyed by a non-reversible deri
 - **WHEN** a session has already processed a terminal `failed` event for its active turn
 - **THEN** the system SHALL NOT deliver a later completion notification for that turn
 
+### Requirement: Keep notifier event processing live under abandoned housekeeping locks
+The notifier SHALL process the current event before retention cleanup and SHALL treat cleanup as best-effort work that does not wait for a global prune lock or a locked session record. It SHALL rate-limit and batch full retention scans, SHALL rotate bounded passes so persistently locked records cannot permanently starve later records, and SHALL preserve the existing retention and maximum-active-age rules. Every lock mutation SHALL be restricted to a validated non-symlink lock directly under the canonical state directory.
+
+Each acquired lock SHALL carry a unique ownership token. Stale-lock recovery SHALL derive a canonical recovery gate directly in that state directory, acquire a unique reaper token for that gate before the stale-lock snapshot, and use unique gate- or lock-quarantine containers as hard fences. Before and after moving a canonical gate or lock, recovery SHALL verify owned-container and moved-object identity, including the applicable inode and owner/reaper snapshot. A process SHALL NOT remove a replacement gate, quarantine, or lock with mismatched identity. Normal acquisition, callback execution, and owned-lock cleanup SHALL honor canonical gates and quarantine fences.
+
+Recovery cleanup SHALL handle no more than one stale gate or quarantine per attempt. It SHALL preserve a valid live gate or quarantine reaper regardless of its age. A dead, ownerless, malformed, unreadable, or empty gate or quarantine container SHALL be recoverable only when its newest relevant filesystem metadata is older than the configured stale-lock interval. A valid lock owner remains authoritative while its process is live; absent or malformed lock ownership uses the same conservative age rule. These guarantees apply to cooperative `agent-notify` processes that treat owned unique quarantines as immutable.
+
+The notifier SHALL serialize the current session's read, eligibility decision, delivery reservation, and state write, then SHALL release that session lock before Keychain access or Pushover transport.
+
+#### Scenario: Retention encounters an ownerless stale lock
+- **WHEN** best-effort retention cleanup encounters a lock with no valid owner metadata whose directory age exceeds the stale-lock interval
+- **THEN** the notifier SHALL recover or skip that lock without delaying processing of the current event beyond the current-session lock bound
+
+#### Scenario: Retention encounters a live session lock
+- **WHEN** another notifier process holds valid live ownership of a session record during retention cleanup
+- **THEN** cleanup SHALL skip that record without removing its lock or waiting for it, and current event processing SHALL continue
+
+#### Scenario: Delivery is slow after reservation
+- **WHEN** a notification delivery decision has been reserved and persisted for a session and Keychain or Pushover processing is slow
+- **THEN** the notifier SHALL no longer hold that session's state lock and concurrent events SHALL still observe the persisted reservation
+
+#### Scenario: A newly-created lock has not published its owner
+- **WHEN** a lock directory has no readable valid owner metadata but is younger than the configured stale-lock interval
+- **THEN** the notifier SHALL NOT remove it
+
+#### Scenario: A live recovery gate is present
+- **WHEN** a stale lock has a canonical recovery gate with a valid reaper whose process is live
+- **THEN** recovery SHALL preserve the gate and SHALL NOT acquire the lock or invoke its callback
+
+#### Scenario: A live quarantine is present
+- **WHEN** a gate- or lock-quarantine has a stale or dead outer reaper but its contained gate or lock has valid live ownership
+- **THEN** cleanup SHALL preserve that quarantine and normal lock acquisition SHALL remain fenced
+
+#### Scenario: Canonical identity changes during recovery
+- **WHEN** a canonical gate or lock is replaced after recovery validates it and before or during quarantine
+- **THEN** recovery SHALL fail conservatively, preserve the replacement and relevant quarantine containers, and SHALL NOT invoke the lock callback
+
+#### Scenario: A stale recovery fence is cleaned
+- **WHEN** a dead, ownerless, malformed, unreadable, or empty recovery gate or quarantine has exceeded the stale-lock interval
+- **THEN** one cleanup attempt SHALL remove only that stale fence, and a later attempt MAY recover the stale lock
+
+#### Scenario: A contended prune prefix persists
+- **WHEN** one bounded prune pass skips a full batch of persistently locked records
+- **THEN** a later pass SHALL advance beyond that batch and inspect eligible later records
+
 ### Requirement: Deliver privacy-minimized Pushover messages
 The system SHALL retrieve the Pushover user key and application token from the logged-in user's macOS Keychain and deliver messages only to Pushover's fixed HTTPS endpoint with TLS verification, redirects disabled, a five-second total timeout, and no retries. It SHALL send only the agent name, a sanitized and length-bounded basename of the session directory, a normalized state message, and — when excerpts are enabled and an excerpt is available — a sanitized, single-line, length-bounded excerpt of the agent's final message text. It SHALL use normal priority for completion, attention, and agent-error notifications. Adapter values SHALL be treated as untrusted data and SHALL NOT alter transport options, destination, or request structure.
 
@@ -185,6 +230,29 @@ The system SHALL map Claude Code main-agent attention, completion, and failure h
 #### Scenario: OpenCode reports a terminal session error
 - **WHEN** OpenCode reports a session-associated non-aborted terminal error
 - **THEN** the adapter SHALL submit one `failed` event and SHALL NOT submit a later completion for the same turn
+
+### Requirement: Confirm OpenCode root quiescence before completion
+The OpenCode adapter SHALL require a short bounded quiescence interval after a root is idle and all known descendants are settled before it submits that root's `completed` event. It SHALL maintain at most one tokenized completion candidate per root and SHALL synchronously invalidate a known candidate as soon as it receives a root or descendant busy, retry, or terminal event, before awaiting metadata lookup. It SHALL also invalidate candidates when their tree is merged or removed and SHALL re-evaluate the tracked root and descendants after the interval and again after asynchronous excerpt retrieval. A root that resumes while its deferred turn is pending SHALL keep its existing turn start and SHALL NOT submit another `began` event. If the same candidate remains valid and the root and all known descendants remain settled, the adapter SHALL submit one completion without requiring another root idle event.
+
+#### Scenario: A descendant settles immediately before its root resumes
+- **WHEN** the final active descendant reports idle and the deferred root reports busy during the root-quiescence interval
+- **THEN** the adapter SHALL cancel that completion candidate, SHALL NOT submit `completed` or another `began`, and SHALL keep tracking the same active root turn
+
+#### Scenario: A deferred root remains settled
+- **WHEN** the root is idle, every known descendant remains settled throughout the root-quiescence interval, and no root resume is observed
+- **THEN** the adapter SHALL submit one `completed` event for the root without requiring another idle signal
+
+#### Scenario: Duplicate idle signals arrive during quiescence
+- **WHEN** compatibility and status idle signals create repeated settlement checks for the same root during its quiescence interval
+- **THEN** the adapter SHALL retain one completion candidate and SHALL submit at most one `completed` event
+
+#### Scenario: A root resumes during excerpt retrieval
+- **WHEN** a completion candidate begins retrieving the root excerpt and the root reports busy before retrieval finishes
+- **THEN** the adapter SHALL invalidate that candidate and SHALL NOT submit its stale completion
+
+#### Scenario: Metadata lookup stalls after activation arrives
+- **WHEN** the adapter receives a root or known descendant activation or terminal event while that event's metadata lookup remains pending
+- **THEN** it SHALL invalidate the known root completion candidate before the lookup completes
 
 ### Requirement: Declare supported integration compatibility
 The repository SHALL declare the tested macOS, Claude Code, and OpenCode version ranges and the exact OpenCode permission/question event family used. Before collecting credentials or performing any mutation, the installer SHALL verify the installed clients satisfy that policy and abort without changes for unsupported or unparseable versions.

@@ -9,7 +9,6 @@ typeset -gr AGENT_NOTIFY_KEYCHAIN_TOKEN_SERVICE_PREFIX='agent-notify.pushover.v2
 typeset -gr AGENT_NOTIFY_PUSHOVER_ENDPOINT='https://api.pushover.net/1/messages.json'
 typeset -gr AGENT_NOTIFY_SECURITY_BIN='/usr/bin/security'
 typeset -gr AGENT_NOTIFY_JXA_BIN='/usr/bin/osascript'
-typeset -gr AGENT_NOTIFY_FLOCK_BIN='/usr/bin/flock'
 typeset -gr AGENT_NOTIFY_OPEN_CODE_ATTENTION_FAMILY='permission.asked/replied and question.asked/replied/rejected'
 
 # Adapters read this file from the application-support directory themselves; the notifier declares
@@ -24,5 +23,7 @@ typeset -gr AGENT_NOTIFY_EXCERPT_DEFAULT=1
 : ${AGENT_NOTIFY_ATTENTION_DEBOUNCE_SECONDS:=60}
 : ${AGENT_NOTIFY_RETENTION_SECONDS:=604800}
 : ${AGENT_NOTIFY_MAX_ACTIVE_SECONDS:=86400}
-: ${AGENT_NOTIFY_LOCK_TIMEOUT_ATTEMPTS:=100}
+: ${AGENT_NOTIFY_LOCK_TIMEOUT_ATTEMPTS:=20}
 : ${AGENT_NOTIFY_LOCK_STALE_SECONDS:=60}
+: ${AGENT_NOTIFY_PRUNE_INTERVAL_SECONDS:=3600}
+: ${AGENT_NOTIFY_PRUNE_BATCH_SIZE:=64}

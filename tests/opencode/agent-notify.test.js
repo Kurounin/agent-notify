@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import agentNotifyPlugin, * as pluginModule from "../../integrations/opencode/agent-notify.js";
+import agentNotifyPluginFactory, * as pluginModule from "../../integrations/opencode/agent-notify.js";
 
 // Excerpt settings are read from an injected path so the suite never touches the live home.
 const settingsDirectory = await mkdtemp(join(tmpdir(), "agent-notify-settings-"));
@@ -58,6 +58,48 @@ function assistantMessage(...parts) {
 
 function textPart(text, extra = {}) {
   return { type: "text", text, ...extra };
+}
+
+class FakeScheduler {
+  #time = 0;
+  timers = [];
+
+  schedule = (callback, delay) => {
+    const timer = { callback, due: this.#time + delay, cancelled: false, fired: false };
+    this.timers.push(timer);
+    return timer;
+  };
+
+  clear = (timer) => {
+    timer.cancelled = true;
+  };
+
+  async advanceBy(delay) {
+    this.#time += delay;
+    for (const timer of this.timers.filter((entry) => !entry.fired && entry.due <= this.#time)) {
+      timer.fired = true;
+      if (!timer.cancelled) await timer.callback();
+    }
+  }
+
+  async fireStale(timer) {
+    await timer.callback();
+  }
+}
+
+async function createAdapter(options) {
+  const scheduler = new FakeScheduler();
+  const adapter = await agentNotifyPluginFactory({ ...options, schedule: scheduler.schedule, clear: scheduler.clear });
+  return {
+    async event(input) {
+      await adapter.event(input);
+      await scheduler.advanceBy(50);
+    },
+  };
+}
+
+async function agentNotifyPlugin(options) {
+  return createAdapter(options);
 }
 
 test("exports only a callable default plugin factory for the OpenCode loader", () => {
@@ -311,7 +353,7 @@ test("retains a known active child when a metadata lookup fails", async () => {
   ]);
 });
 
-test("falls back to immediate root completion when a lookup failure hides the session tree", async () => {
+test("retains a tracked root when a lookup failure hides the session tree", async () => {
   let rootLookupFails = false;
   const sessions = {
     root: { directory: "/work/root" },
@@ -333,7 +375,6 @@ test("falls back to immediate root completion when a lookup failure hides the se
 
   assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
     { kind: "began", session_id: "root" },
-    { kind: "completed", session_id: "root" },
   ]);
 });
 
@@ -888,10 +929,17 @@ test("times out a stalled message fetch and submits an excerpt-free completion",
     },
   });
   const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
+  const scheduler = new FakeScheduler();
+  const adapter = await agentNotifyPluginFactory({
+    client,
+    submit: async (event) => submitted.push(event),
+    schedule: scheduler.schedule,
+    clear: scheduler.clear,
+  });
 
   await adapter.event({ event: status("session-a", "busy") });
-  const completion = adapter.event({ event: status("session-a", "idle") });
+  await adapter.event({ event: status("session-a", "idle") });
+  const completion = scheduler.advanceBy(50);
   await messagesRequested;
   assert.deepEqual(scheduled.map(({ delay }) => delay), [1_000]);
   scheduled[0].callback();
@@ -1027,4 +1075,272 @@ test("runs adapter events through the canonical notifier subprocess contract", a
       stdin: { source: "opencode", event: "attention", session_id: "session-a", session_dir: "/work/session-a", request_id: "request-a" },
     },
   ]);
+});
+
+test("debounces a plain root completion and reuses its candidate for compatibility idle", async () => {
+  const { client } = createClient();
+  const submitted = [];
+  const scheduler = new FakeScheduler();
+  const adapter = await agentNotifyPluginFactory({
+    client,
+    submit: async (event) => submitted.push(event),
+    schedule: scheduler.schedule,
+    clear: scheduler.clear,
+  });
+
+  await adapter.event({ event: status("root", "busy") });
+  await adapter.event({ event: status("root", "idle") });
+  await adapter.event({ event: { type: "session.idle", properties: { sessionID: "root" } } });
+  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
+  assert.equal(scheduler.timers.filter((timer) => !timer.cancelled).length, 1);
+
+  await scheduler.advanceBy(49);
+  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
+  await scheduler.advanceBy(1);
+  assert.deepEqual(submitted.map((event) => event.kind), ["began", "completed"]);
+});
+
+test("cancels a stale descendant-settlement candidate when the root resumes", async () => {
+  const { client } = createClient({
+    sessions: {
+      root: { directory: "/work/root" },
+      child: { directory: "/work/child", parentID: "root" },
+    },
+  });
+  const submitted = [];
+  const scheduler = new FakeScheduler();
+  const adapter = await agentNotifyPluginFactory({
+    client,
+    submit: async (event) => submitted.push(event),
+    schedule: scheduler.schedule,
+    clear: scheduler.clear,
+  });
+
+  await adapter.event({ event: status("root", "busy") });
+  await adapter.event({ event: status("child", "busy") });
+  await adapter.event({ event: status("root", "idle") });
+  await adapter.event({ event: status("child", "idle") });
+  const stale = scheduler.timers.at(-1);
+  await adapter.event({ event: status("root", "busy") });
+  await scheduler.fireStale(stale);
+  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
+
+  await adapter.event({ event: status("root", "idle") });
+  await scheduler.advanceBy(50);
+  assert.deepEqual(submitted.map((event) => event.kind), ["began", "completed"]);
+});
+
+test("does not complete when the root becomes busy during deferred excerpt retrieval", async () => {
+  let resolveMessages;
+  const messagesRequested = new Promise((resolve) => {
+    resolveMessages = resolve;
+  });
+  const { client } = createClient({
+    getMessages() {
+      return messagesRequested;
+    },
+  });
+  const submitted = [];
+  const scheduler = new FakeScheduler();
+  const adapter = await agentNotifyPluginFactory({
+    client,
+    submit: async (event) => submitted.push(event),
+    schedule: scheduler.schedule,
+    clear: scheduler.clear,
+  });
+
+  await adapter.event({ event: status("root", "busy") });
+  await adapter.event({ event: status("root", "idle") });
+  const completion = scheduler.advanceBy(50);
+  await Promise.resolve();
+  await adapter.event({ event: status("root", "busy") });
+  resolveMessages({ data: [] });
+  await completion;
+
+  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
+});
+
+test("cancels a root completion candidate when the root terminates", async () => {
+  const { client } = createClient();
+  const submitted = [];
+  const scheduler = new FakeScheduler();
+  const adapter = await agentNotifyPluginFactory({
+    client,
+    submit: async (event) => submitted.push(event),
+    schedule: scheduler.schedule,
+    clear: scheduler.clear,
+  });
+
+  await adapter.event({ event: status("root", "busy") });
+  await adapter.event({ event: status("root", "idle") });
+  const stale = scheduler.timers.at(-1);
+  await adapter.event({ event: { type: "session.error", properties: { sessionID: "root", error: { name: "UnknownError" } } } });
+  await scheduler.fireStale(stale);
+
+  assert.deepEqual(submitted.map((event) => event.kind), ["began", "failed"]);
+});
+
+test("uses tracked-tree fallback after lookup failure before releasing the root", async () => {
+  let rootLookupFails = false;
+  const sessions = {
+    root: { directory: "/work/root" },
+    child: { directory: "/work/child", parentID: "root" },
+  };
+  const { client } = createClient({
+    getSession(sessionID) {
+      if (sessionID === "root" && rootLookupFails) throw new Error("unavailable");
+      return { data: sessions[sessionID] };
+    },
+  });
+  const submitted = [];
+  const scheduler = new FakeScheduler();
+  const adapter = await agentNotifyPluginFactory({
+    client,
+    submit: async (event) => submitted.push(event),
+    schedule: scheduler.schedule,
+    clear: scheduler.clear,
+  });
+
+  await adapter.event({ event: status("root", "busy") });
+  await adapter.event({ event: status("child", "busy") });
+  rootLookupFails = true;
+  await adapter.event({ event: status("root", "idle") });
+  rootLookupFails = false;
+  await adapter.event({ event: status("child", "idle") });
+
+  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
+  assert.equal(scheduler.timers.filter((timer) => !timer.cancelled && !timer.fired).length, 1);
+  await scheduler.advanceBy(50);
+
+  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
+    { kind: "began", session_id: "root" },
+    { kind: "completed", session_id: "root" },
+  ]);
+});
+
+test("cancels a known root candidate before a deferred busy lookup resolves", async () => {
+  let deferLookup = false;
+  let resolveLookup;
+  const lookup = new Promise((resolve) => {
+    resolveLookup = resolve;
+  });
+  const sessions = { root: { directory: "/work/root" } };
+  const { client } = createClient({
+    getSession(sessionID) {
+      return deferLookup ? lookup : { data: sessions[sessionID] };
+    },
+  });
+  const submitted = [];
+  const scheduler = new FakeScheduler();
+  const adapter = await agentNotifyPluginFactory({
+    client,
+    submit: async (event) => submitted.push(event),
+    schedule: scheduler.schedule,
+    clear: scheduler.clear,
+  });
+
+  await adapter.event({ event: status("root", "busy") });
+  await adapter.event({ event: status("root", "idle") });
+  const stale = scheduler.timers.at(-1);
+  deferLookup = true;
+  const resumed = adapter.event({ event: status("root", "busy") });
+
+  assert.equal(stale.cancelled, true);
+  await scheduler.fireStale(stale);
+  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
+  resolveLookup({ data: sessions.root });
+  await resumed;
+  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
+
+  deferLookup = false;
+  await adapter.event({ event: status("root", "idle") });
+  await scheduler.advanceBy(50);
+  assert.deepEqual(submitted.map((event) => event.kind), ["began", "completed"]);
+});
+
+test("cancels a known descendant retry candidate before its deferred lookup resolves", async () => {
+  let deferLookup = false;
+  let resolveLookup;
+  const lookup = new Promise((resolve) => {
+    resolveLookup = resolve;
+  });
+  const sessions = {
+    root: { directory: "/work/root" },
+    child: { directory: "/work/child", parentID: "root" },
+  };
+  const { client } = createClient({
+    getSession(sessionID) {
+      return deferLookup ? lookup : { data: sessions[sessionID] };
+    },
+  });
+  const submitted = [];
+  const scheduler = new FakeScheduler();
+  const adapter = await agentNotifyPluginFactory({
+    client,
+    submit: async (event) => submitted.push(event),
+    schedule: scheduler.schedule,
+    clear: scheduler.clear,
+  });
+
+  await adapter.event({ event: status("root", "busy") });
+  await adapter.event({ event: status("child", "busy") });
+  await adapter.event({ event: status("root", "idle") });
+  await adapter.event({ event: status("child", "idle") });
+  const stale = scheduler.timers.at(-1);
+  deferLookup = true;
+  const retried = adapter.event({ event: retryStatus("child", 1) });
+
+  assert.equal(stale.cancelled, true);
+  await scheduler.fireStale(stale);
+  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
+  resolveLookup({ data: sessions.child });
+  await retried;
+
+  deferLookup = false;
+  await adapter.event({ event: status("child", "idle") });
+  await scheduler.advanceBy(50);
+  assert.deepEqual(submitted.map((event) => event.kind), ["began", "completed"]);
+});
+
+test("cancels a known descendant candidate before its deferred terminal lookup resolves", async () => {
+  let deferLookup = false;
+  let resolveLookup;
+  const lookup = new Promise((resolve) => {
+    resolveLookup = resolve;
+  });
+  const sessions = {
+    root: { directory: "/work/root" },
+    child: { directory: "/work/child", parentID: "root" },
+  };
+  const { client } = createClient({
+    getSession(sessionID) {
+      return deferLookup ? lookup : { data: sessions[sessionID] };
+    },
+  });
+  const submitted = [];
+  const scheduler = new FakeScheduler();
+  const adapter = await agentNotifyPluginFactory({
+    client,
+    submit: async (event) => submitted.push(event),
+    schedule: scheduler.schedule,
+    clear: scheduler.clear,
+  });
+
+  await adapter.event({ event: status("root", "busy") });
+  await adapter.event({ event: status("child", "busy") });
+  await adapter.event({ event: status("root", "idle") });
+  await adapter.event({ event: status("child", "idle") });
+  const stale = scheduler.timers.at(-1);
+  deferLookup = true;
+  const failed = adapter.event({ event: { type: "session.error", properties: { sessionID: "child", error: { name: "UnknownError" } } } });
+
+  assert.equal(stale.cancelled, true);
+  await scheduler.fireStale(stale);
+  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
+  resolveLookup({ data: sessions.child });
+  await failed;
+  assert.deepEqual(submitted.map((event) => event.kind), ["began", "failed"]);
+
+  await scheduler.advanceBy(50);
+  assert.deepEqual(submitted.map((event) => event.kind), ["began", "failed", "completed"]);
 });

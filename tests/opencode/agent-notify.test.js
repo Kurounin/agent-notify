@@ -15,6 +15,16 @@ const settingsFile = join(settingsDirectory, "settings.conf");
 process.env.AGENT_NOTIFY_SETTINGS_FILE = settingsFile;
 process.on("exit", () => rmSync(settingsDirectory, { force: true, recursive: true }));
 
+const inheritedTmux = { TMUX: process.env.TMUX, TMUX_PANE: process.env.TMUX_PANE };
+delete process.env.TMUX;
+delete process.env.TMUX_PANE;
+process.on("exit", () => {
+  for (const [key, value] of Object.entries(inheritedTmux)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+
 const corpus = JSON.parse(readFileSync(new URL("../fixtures/excerpt-corpus.json", import.meta.url), "utf8"));
 
 function createClient({ sessions = {}, getSession, messages, getMessages } = {}) {
@@ -100,6 +110,60 @@ async function createAdapter(options) {
 
 async function agentNotifyPlugin(options) {
   return createAdapter(options);
+}
+
+function tmuxChild({ chunks = [new TextEncoder().encode("session\n")], exit = 0 } = {}) {
+  let killed = false;
+  return {
+    child: {
+      stdout: (async function* () {
+        for (const chunk of await chunks) yield chunk;
+      })(),
+      exited: Promise.resolve(exit),
+      kill() { killed = true; },
+    },
+    get killed() { return killed; },
+  };
+}
+
+function deferredTmuxChild() {
+  let release;
+  const chunks = new Promise((resolve) => { release = resolve; });
+  const fixture = tmuxChild({ chunks });
+  return {
+    child: fixture.child,
+    get killed() { return fixture.killed; },
+    release(text) { release([new TextEncoder().encode(text)]); },
+  };
+}
+
+function controlledTmuxChild({ chunks = [], stalled = false, exit = 0 } = {}) {
+  let index = 0;
+  let returnCalls = 0;
+  let killed = false;
+  const stdout = {
+    [Symbol.asyncIterator]() { return this; },
+    next() {
+      if (stalled) return new Promise(() => {});
+      if (index >= chunks.length) return Promise.resolve({ done: true });
+      const value = chunks[index];
+      index += 1;
+      return Promise.resolve({ done: false, value });
+    },
+    return() {
+      returnCalls += 1;
+      return Promise.resolve({ done: true });
+    },
+  };
+  return {
+    child: {
+      stdout,
+      exited: Promise.resolve(exit),
+      kill() { killed = true; },
+    },
+    get killed() { return killed; },
+    get returnCalls() { return returnCalls; },
+  };
 }
 
 test("exports only a callable default plugin factory for the OpenCode loader", () => {
@@ -1343,4 +1407,455 @@ test("cancels a known descendant candidate before its deferred terminal lookup r
 
   await scheduler.advanceBy(50);
   assert.deepEqual(submitted.map((event) => event.kind), ["began", "failed", "completed"]);
+});
+
+test("discovers one absolute tmux executable and gates pane-targeted lookups to notification kinds", async () => {
+  const { client } = createClient();
+  const submitted = [];
+  const environment = { TMUX: "tmux-environment-marker", TMUX_PANE: "%42" };
+  const calls = [];
+  let discoveries = 0;
+  const child = tmuxChild({ chunks: [new TextEncoder().encode("team/api\n")] });
+  const adapter = await agentNotifyPlugin({
+    client,
+    submit: async (event) => submitted.push(event),
+    environment,
+    which(command) {
+      discoveries += 1;
+      assert.equal(command, "tmux");
+      return "/private path/tmux executable";
+    },
+    tmuxSpawn(command, options) {
+      calls.push({ command, options });
+      return child.child;
+    },
+  });
+
+  assert.equal(discoveries, 1);
+  await adapter.event({ event: status("session-a", "busy") });
+  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session-a", id: "request-a" } } });
+  await adapter.event({ event: { type: "permission.replied", properties: { sessionID: "session-a", requestID: "request-a" } } });
+  environment.TMUX_PANE = "not-a-pane";
+  await adapter.event({ event: { type: "question.asked", properties: { sessionID: "session-a", id: "request-b" } } });
+
+  assert.deepEqual(calls, [{
+    command: ["/private path/tmux executable", "display-message", "-p", "-t", "%42", "#S"],
+    options: { stdout: "pipe", stderr: "ignore" },
+  }]);
+  assert.deepEqual(submitted.map(({ kind, tmux_session }) => ({ kind, tmux_session })), [
+    { kind: "began", tmux_session: undefined },
+    { kind: "attention", tmux_session: "team/api" },
+    { kind: "attention-cleared", tmux_session: undefined },
+    { kind: "attention", tmux_session: undefined },
+  ]);
+
+  const relativeSubmitted = [];
+  const relativeAdapter = await agentNotifyPlugin({
+    client: createClient().client,
+    submit: async (event) => relativeSubmitted.push(event),
+    environment: { TMUX: "present", TMUX_PANE: "%1" },
+    which: () => "tmux",
+    tmuxSpawn() { throw new Error("relative executable must not run"); },
+  });
+  await relativeAdapter.event({ event: { type: "permission.asked", properties: { sessionID: "relative", id: "request" } } });
+  assert.equal(relativeSubmitted[0].tmux_session, undefined);
+});
+
+test("fails open without leaking rejected tmux inputs or process failures", async () => {
+  const rejected = [
+    { name: "nonzero", chunks: [new TextEncoder().encode("stdout-marker\n")], exit: 1 },
+    { name: "malformed UTF-8", chunks: [new Uint8Array([0xc3, 0x28])] },
+    { name: "multiline", chunks: [new TextEncoder().encode("stdout-marker\nnext")] },
+    { name: "C0", chunks: [new TextEncoder().encode("stdout-marker\u0001")] },
+    { name: "DEL", chunks: [new TextEncoder().encode("stdout-marker\u007f")] },
+    { name: "empty", chunks: [] },
+  ];
+
+  for (const entry of rejected) {
+    const { client } = createClient();
+    const submitted = [];
+    const adapter = await agentNotifyPlugin({
+      client,
+      submit: async (event) => submitted.push(event),
+      environment: { TMUX: "tmux-environment-marker", TMUX_PANE: "%999" },
+      which: () => "/private executable-marker/tmux path",
+      tmuxSpawn: () => {
+        const child = tmuxChild(entry).child;
+        child.stderr = new TextEncoder().encode("stderr-marker");
+        return child;
+      },
+    });
+    await adapter.event({ event: { type: "permission.asked", properties: { sessionID: entry.name, id: "request" } } });
+
+    assert.equal(submitted[0].tmux_session, undefined, entry.name);
+    assert.doesNotMatch(JSON.stringify(submitted), /tmux-environment-marker|999|executable-marker|stdout-marker|stderr-marker/);
+  }
+
+  const { client } = createClient();
+  const submitted = [];
+  const adapter = await agentNotifyPlugin({
+    client,
+    submit: async (event) => submitted.push(event),
+    environment: { TMUX: "tmux-environment-marker", TMUX_PANE: "%999" },
+    which: () => "/private executable-marker/tmux path",
+    tmuxSpawn() { throw new Error("command-error-marker"); },
+  });
+  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session", id: "request" } } });
+  assert.equal(submitted[0].tmux_session, undefined);
+  assert.doesNotMatch(JSON.stringify(submitted), /tmux-environment-marker|999|executable-marker|command-error-marker/);
+});
+
+test("suppresses pane lookup for an empty TMUX marker and a pane longer than 255 digits", async () => {
+  const cases = [
+    { name: "empty TMUX", environment: { TMUX: "", TMUX_PANE: "%1" }, expectedCalls: 0 },
+    { name: "255 pane digits", environment: { TMUX: "present", TMUX_PANE: `%${"9".repeat(255)}` }, expectedCalls: 1 },
+    { name: "256 pane digits", environment: { TMUX: "present", TMUX_PANE: `%${"9".repeat(256)}` }, expectedCalls: 0 },
+  ];
+
+  for (const entry of cases) {
+    const { client } = createClient();
+    const submitted = [];
+    const calls = [];
+    const adapter = await agentNotifyPlugin({
+      client,
+      submit: async (event) => submitted.push(event),
+      environment: entry.environment,
+      which: () => "/tmp/tmux",
+      tmuxSpawn(command) {
+        calls.push(command);
+        return tmuxChild({ chunks: [new TextEncoder().encode("session-name\n")] }).child;
+      },
+    });
+
+    await adapter.event({ event: { type: "permission.asked", properties: { sessionID: entry.name, id: "request" } } });
+
+    assert.equal(calls.length, entry.expectedCalls, entry.name);
+    assert.equal(submitted[0].tmux_session, entry.expectedCalls ? "session-name" : undefined, entry.name);
+  }
+});
+
+test("omits whitespace-only and overlong tmux stdout without treating it as context", async () => {
+  const cases = [
+    { name: "whitespace", output: "  \n" },
+    { name: "257 UTF-16 units", output: "a".repeat(257) },
+  ];
+
+  for (const entry of cases) {
+    const submitted = [];
+    const adapter = await agentNotifyPlugin({
+      client: createClient().client,
+      submit: async (event) => submitted.push(event),
+      environment: { TMUX: "present", TMUX_PANE: "%1" },
+      which: () => "/tmp/tmux",
+      tmuxSpawn: () => tmuxChild({ chunks: [new TextEncoder().encode(entry.output)] }).child,
+    });
+
+    await adapter.event({ event: { type: "permission.asked", properties: { sessionID: entry.name, id: "request" } } });
+
+    assert.equal(submitted[0].tmux_session, undefined, entry.name);
+    assert.doesNotMatch(JSON.stringify(submitted), /session-name|a{257}/, entry.name);
+  }
+});
+
+test("allows exactly 1,024 tmux stdout bytes to finish normally but rejects 1,025 bytes", async () => {
+  const exact = controlledTmuxChild({ chunks: [new Uint8Array(1_024).fill(0x61)] });
+  const overflow = controlledTmuxChild({
+    chunks: [new Uint8Array(1_025).fill(0x61), new TextEncoder().encode("overflow-late-marker\n")],
+  });
+  const results = [];
+
+  for (const [name, fixture] of [["exact", exact], ["overflow", overflow]]) {
+    const submitted = [];
+    const adapter = await agentNotifyPlugin({
+      client: createClient().client,
+      submit: async (event) => submitted.push(event),
+      environment: { TMUX: "present", TMUX_PANE: "%1" },
+      which: () => "/tmp/tmux",
+      tmuxSpawn: () => fixture.child,
+    });
+    await adapter.event({ event: { type: "permission.asked", properties: { sessionID: name, id: "request" } } });
+    results.push({ submitted, fixture });
+  }
+
+  assert.equal(results[0].fixture.killed, false);
+  assert.equal(results[0].fixture.returnCalls, 0);
+  assert.equal(results[0].submitted[0].tmux_session, undefined);
+  assert.equal(results[1].fixture.killed, true);
+  assert.equal(results[1].fixture.returnCalls, 1);
+  assert.equal(results[1].submitted[0].tmux_session, undefined);
+  assert.doesNotMatch(JSON.stringify(results[1].submitted), /overflow-late-marker/);
+});
+
+test("cannot accept or leak tmux output delivered after its deadline", async () => {
+  const submitted = [];
+  const late = deferredTmuxChild();
+  let deadline;
+  const adapter = await agentNotifyPlugin({
+    client: createClient().client,
+    submit: async (event) => submitted.push(event),
+    environment: { TMUX: "present", TMUX_PANE: "%1" },
+    which: () => "/tmp/tmux",
+    tmuxSpawn: () => late.child,
+    tmuxSetTimeout(callback, delay) {
+      assert.equal(delay, 500);
+      deadline = callback;
+      return {};
+    },
+    tmuxClearTimeout() {},
+  });
+
+  const pending = adapter.event({ event: { type: "permission.asked", properties: { sessionID: "deadline", id: "request" } } });
+  await Promise.resolve();
+  await Promise.resolve();
+  deadline();
+  await pending;
+  late.release("deadline-late-marker\n");
+  await Promise.resolve();
+  await Promise.resolve();
+
+  assert.equal(late.killed, true);
+  assert.equal(submitted[0].tmux_session, undefined);
+  assert.doesNotMatch(JSON.stringify(submitted), /deadline-late-marker/);
+});
+
+test("terminates tmux lookups on the 500 ms deadline and 1,024-byte overflow", async () => {
+  const { client } = createClient();
+  const submitted = [];
+  const hanging = controlledTmuxChild({ stalled: true });
+  let deadline;
+  const adapter = await agentNotifyPluginFactory({
+    client,
+    submit: async (event) => submitted.push(event),
+    environment: { TMUX: "present", TMUX_PANE: "%1" },
+    which: () => "/tmp/tmux",
+    tmuxSpawn: () => hanging.child,
+    tmuxSetTimeout(callback, delay) {
+      assert.equal(delay, 500);
+      deadline = callback;
+      return { delay };
+    },
+    tmuxClearTimeout() {},
+  });
+  const pending = adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session", id: "request" } } });
+  await Promise.resolve();
+  await Promise.resolve();
+  deadline();
+  await pending;
+
+  assert.equal(hanging.killed, true);
+  assert.equal(hanging.returnCalls, 1);
+  assert.equal(submitted[0].tmux_session, undefined);
+
+  const overflow = controlledTmuxChild({ chunks: [new Uint8Array(1_025)] });
+  const overflowSubmitted = [];
+  const overflowAdapter = await agentNotifyPlugin({
+    client: createClient().client,
+    submit: async (event) => overflowSubmitted.push(event),
+    environment: { TMUX: "present", TMUX_PANE: "%1" },
+    which: () => "/tmp/tmux",
+    tmuxSpawn: () => overflow.child,
+  });
+  await overflowAdapter.event({ event: { type: "permission.asked", properties: { sessionID: "overflow", id: "request" } } });
+
+  assert.equal(overflow.killed, true);
+  assert.equal(overflow.returnCalls, 1);
+  assert.equal(overflowSubmitted[0].tmux_session, undefined);
+});
+
+test("keeps same-session attention submissions FIFO while tmux lookup is pending", async () => {
+  const { client } = createClient();
+  const submitted = [];
+  const tmux = deferredTmuxChild();
+  let started;
+  const lookupStarted = new Promise((resolve) => { started = resolve; });
+  const adapter = await agentNotifyPluginFactory({
+    client,
+    submit: async (event) => submitted.push(event),
+    environment: { TMUX: "present", TMUX_PANE: "%1" },
+    which: () => "/tmp/tmux",
+    tmuxSpawn() {
+      started();
+      return tmux.child;
+    },
+  });
+
+  const asked = adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session", id: "request" } } });
+  await lookupStarted;
+  const replied = adapter.event({ event: { type: "permission.replied", properties: { sessionID: "session", requestID: "request" } } });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(submitted, []);
+
+  tmux.release("ordered-name\n");
+  await Promise.all([asked, replied]);
+  assert.deepEqual(submitted.map(({ kind, tmux_session }) => ({ kind, tmux_session })), [
+    { kind: "attention", tmux_session: "ordered-name" },
+    { kind: "attention-cleared", tmux_session: undefined },
+  ]);
+});
+
+test("finishes failed-tree bookkeeping before a pending tmux notification", async () => {
+  const { client } = createClient();
+  const submitted = [];
+  const scheduler = new FakeScheduler();
+  const tmux = deferredTmuxChild();
+  let spawnCount = 0;
+  let started;
+  const lookupStarted = new Promise((resolve) => { started = resolve; });
+  const adapter = await agentNotifyPluginFactory({
+    client,
+    submit: async (event) => submitted.push(event),
+    schedule: scheduler.schedule,
+    clear: scheduler.clear,
+    environment: { TMUX: "present", TMUX_PANE: "%1" },
+    which: () => "/tmp/tmux",
+    tmuxSpawn() {
+      spawnCount += 1;
+      if (spawnCount === 1) {
+        started();
+        return tmux.child;
+      }
+      return tmuxChild().child;
+    },
+  });
+
+  await adapter.event({ event: status("root", "busy") });
+  const failed = adapter.event({ event: { type: "session.error", properties: { sessionID: "root", error: { name: "UnknownError" } } } });
+  await lookupStarted;
+  const restarted = adapter.event({ event: status("root", "busy") });
+  await Promise.resolve();
+  await Promise.resolve();
+  const settled = adapter.event({ event: status("root", "idle") });
+  await settled;
+
+  tmux.release("failed-name\n");
+  await Promise.all([failed, restarted]);
+  await scheduler.advanceBy(50);
+  assert.deepEqual(submitted.map((event) => event.kind), ["began", "failed", "began", "completed"]);
+});
+
+test("uses fresh emission-local tmux results for concurrent and renamed panes", async () => {
+  const { client } = createClient();
+  const submitted = [];
+  const environment = { TMUX: "present", TMUX_PANE: "%1" };
+  const first = deferredTmuxChild();
+  const second = deferredTmuxChild();
+  const calls = [];
+  let announceFirst;
+  let announceSecond;
+  const firstStarted = new Promise((resolve) => { announceFirst = resolve; });
+  const secondStarted = new Promise((resolve) => { announceSecond = resolve; });
+  const adapter = await agentNotifyPluginFactory({
+    client,
+    submit: async (event) => submitted.push(event),
+    environment,
+    which: () => "/tmp/tmux",
+    tmuxSpawn(command) {
+      calls.push(command);
+      if (calls.length === 1) {
+        announceFirst();
+        return first.child;
+      }
+      announceSecond();
+      return second.child;
+    },
+  });
+
+  const firstEvent = adapter.event({ event: { type: "permission.asked", properties: { sessionID: "first", id: "first" } } });
+  await firstStarted;
+  environment.TMUX_PANE = "%2";
+  const secondEvent = adapter.event({ event: { type: "permission.asked", properties: { sessionID: "second", id: "second" } } });
+  await secondStarted;
+  second.release("second-name\n");
+  await secondEvent;
+  first.release("first-name\n");
+  await firstEvent;
+
+  assert.deepEqual(calls, [
+    ["/tmp/tmux", "display-message", "-p", "-t", "%1", "#S"],
+    ["/tmp/tmux", "display-message", "-p", "-t", "%2", "#S"],
+  ]);
+  assert.deepEqual(submitted.map(({ session_id, tmux_session }) => ({ session_id, tmux_session })), [
+    { session_id: "second", tmux_session: "second-name" },
+    { session_id: "first", tmux_session: "first-name" },
+  ]);
+
+  const renamed = [];
+  const renameAdapter = await agentNotifyPlugin({
+    client: createClient().client,
+    submit: async (event) => renamed.push(event),
+    environment: { TMUX: "present", TMUX_PANE: "%3" },
+    which: () => "/tmp/tmux",
+    tmuxSpawn: (() => {
+      const names = ["before-rename\n", "after-rename\n"];
+      return () => tmuxChild({ chunks: [new TextEncoder().encode(names.shift())] }).child;
+    })(),
+  });
+  await renameAdapter.event({ event: { type: "permission.asked", properties: { sessionID: "rename", id: "one" } } });
+  await renameAdapter.event({ event: { type: "question.asked", properties: { sessionID: "rename", id: "two" } } });
+  assert.deepEqual(renamed.map((event) => event.tmux_session), ["before-rename", "after-rename"]);
+});
+
+test("drops tmux context before excerpts at the OpenCode payload bound", async (t) => {
+  const calls = [];
+  const bunDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Bun");
+  Object.defineProperty(globalThis, "Bun", {
+    configurable: true,
+    value: {
+      spawn(command, options) {
+        calls.push({ command, options });
+        return { exited: Promise.resolve(), kill() {} };
+      },
+    },
+  });
+  t.after(() => {
+    if (bunDescriptor) Object.defineProperty(globalThis, "Bun", bunDescriptor);
+    else delete globalThis.Bun;
+  });
+
+  const wide = "実".repeat(256);
+  const directory = `/${"実".repeat(255)}`;
+  const tmuxSpawn = () => tmuxChild({ chunks: [new TextEncoder().encode("t".repeat(256))] }).child;
+  const environment = { TMUX: "present", TMUX_PANE: "%1" };
+
+  const excerptFits = createClient({
+    sessions: { [wide]: { directory } },
+    messages: { [wide]: [assistantMessage(textPart("x".repeat(199)))] },
+  });
+  const adapter = await agentNotifyPlugin({
+    client: excerptFits.client,
+    environment,
+    which: () => "/tmp/tmux",
+    tmuxSpawn,
+  });
+  await adapter.event({ event: status(wide, "busy") });
+  await adapter.event({ event: status(wide, "idle") });
+  const retainedExcerpt = JSON.parse(new TextDecoder().decode(calls.at(-1).options.stdin));
+  assert.equal(retainedExcerpt.tmux_session, undefined);
+  assert.equal(retainedExcerpt.excerpt, "x".repeat(199));
+
+  calls.length = 0;
+  const excerptTooLarge = createClient({
+    sessions: { [wide]: { directory } },
+    messages: { [wide]: [assistantMessage(textPart("😀".repeat(120)))] },
+  });
+  const oversizedExcerptAdapter = await agentNotifyPlugin({
+    client: excerptTooLarge.client,
+    environment,
+    which: () => "/tmp/tmux",
+    tmuxSpawn,
+  });
+  await oversizedExcerptAdapter.event({ event: status(wide, "busy") });
+  await oversizedExcerptAdapter.event({ event: status(wide, "idle") });
+  const baseOnly = JSON.parse(new TextDecoder().decode(calls.at(-1).options.stdin));
+  assert.equal(baseOnly.tmux_session, undefined);
+  assert.equal(baseOnly.excerpt, undefined);
+
+  calls.length = 0;
+  const baseOversized = createClient({ sessions: { [wide]: { directory } } });
+  const baseOversizedAdapter = await agentNotifyPlugin({ client: baseOversized.client });
+  await baseOversizedAdapter.event({
+    event: { type: "permission.asked", properties: { sessionID: wide, id: wide } },
+  });
+  assert.deepEqual(calls, []);
 });

@@ -19,6 +19,11 @@ const CONTROL = /[\x00-\x1f\x7f-\x9f]/g;
 const INVISIBLE = new RegExp('[\\u061c\\u200b\\u200c\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069\\ufeff]', 'g');
 const CODE_FENCE = /```[\s\S]*?```/g;
 const BACKTICKS = /`+/g;
+const MAX_CONTEXT_LENGTH = 256;
+const MAX_TMUX_OUTPUT_BYTES = 1024;
+const TMUX_TIMEOUT_SECONDS = 0.5;
+const C0_OR_DEL = /[\x00-\x1f\x7f]/;
+const TMUX_PANE = /^%[0-9]{1,255}$/;
 
 const processArguments = $.NSProcessInfo.processInfo.arguments;
 const args = [];
@@ -36,6 +41,108 @@ function value(object, names) {
     if (typeof object[name] === 'string' && object[name].length > 0) return object[name];
   }
   return undefined;
+}
+
+function validContext(value) {
+  return typeof value === 'string' && value.length > 0 && value.length <= MAX_CONTEXT_LENGTH && !C0_OR_DEL.test(value);
+}
+
+function firstValidContext(values) {
+  for (const candidate of values) {
+    if (validContext(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+function environmentValue(name) {
+  const candidate = ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey(name));
+  return typeof candidate === 'string' ? candidate : undefined;
+}
+
+let tmuxLookup;
+ObjC.registerSubclass({
+  name: 'AgentNotifyTmuxOutputObserver',
+  methods: {
+    'handleOutput:': {
+      types: ['void', ['id']],
+      implementation(notification) {
+        if (!tmuxLookup || tmuxLookup.finished) return;
+        const data = notification.userInfo.objectForKey($.NSFileHandleNotificationDataItem);
+        const length = Number(data.length);
+        if (length === 0) {
+          tmuxLookup.eof = true;
+          return;
+        }
+
+        if (tmuxLookup.bytes + length > MAX_TMUX_OUTPUT_BYTES) {
+          tmuxLookup.overflow = true;
+          tmuxLookup.finished = true;
+          if (tmuxLookup.task.isRunning) tmuxLookup.task.terminate();
+          return;
+        }
+
+        tmuxLookup.output.appendData(data);
+        tmuxLookup.bytes += length;
+        notification.object.readInBackgroundAndNotify;
+      },
+    },
+  },
+});
+
+function tmuxSessionForEvent() {
+  if (!['attention', 'completed', 'failed'].includes(event)) return undefined;
+
+  const tmux = environmentValue('TMUX');
+  const pane = environmentValue('TMUX_PANE');
+  const executable = environmentValue('AGENT_NOTIFY_TMUX_PATH');
+  if (!tmux || !TMUX_PANE.test(pane) || typeof executable !== 'string' || !executable.startsWith('/')) return undefined;
+
+  let task;
+  let handle;
+  let observer;
+  try {
+    const pipe = $.NSPipe.pipe;
+    handle = pipe.fileHandleForReading;
+    task = $.NSTask.alloc.init;
+    task.setLaunchPath(executable);
+    task.setArguments(['display-message', '-p', '-t', pane, '#S']);
+    task.setStandardOutput(pipe);
+    task.setStandardError($.NSFileHandle.fileHandleWithNullDevice);
+
+    tmuxLookup = { task, output: $.NSMutableData.data, bytes: 0, eof: false, overflow: false, finished: false };
+    observer = $.AgentNotifyTmuxOutputObserver.alloc.init;
+    $.NSNotificationCenter.defaultCenter.addObserverSelectorNameObject(observer, 'handleOutput:', $.NSFileHandleReadCompletionNotification, handle);
+    handle.readInBackgroundAndNotify;
+    task.launch;
+
+    const deadline = $.NSDate.dateWithTimeIntervalSinceNow(TMUX_TIMEOUT_SECONDS);
+    while ((task.isRunning || !tmuxLookup.eof) && !tmuxLookup.finished && deadline.timeIntervalSinceNow > 0) {
+      $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.01));
+    }
+
+    if (tmuxLookup.overflow) {
+      while (task.isRunning && deadline.timeIntervalSinceNow > 0) {
+        $.NSRunLoop.currentRunLoop.runUntilDate($.NSDate.dateWithTimeIntervalSinceNow(0.01));
+      }
+      return undefined;
+    }
+    if (!tmuxLookup.finished && (task.isRunning || !tmuxLookup.eof)) {
+      tmuxLookup.finished = true;
+      if (task.isRunning) task.terminate();
+      return undefined;
+    }
+    if (tmuxLookup.overflow || task.terminationStatus !== 0) return undefined;
+
+    const text = ObjC.unwrap($.NSString.alloc.initWithDataEncoding(tmuxLookup.output, $.NSUTF8StringEncoding));
+    const session = typeof text === 'string' && text.endsWith('\n') ? text.slice(0, -1) : text;
+    return validContext(session) ? session : undefined;
+  } catch (_) {
+    if (task && task.isRunning) task.terminate();
+    return undefined;
+  } finally {
+    if (observer) $.NSNotificationCenter.defaultCenter.removeObserver(observer);
+    tmuxLookup = undefined;
+  }
 }
 
 function settingsPath() {
@@ -130,7 +237,7 @@ try {
   if (payload.is_background === true || payload.is_subagent === true || payload.agent?.is_background === true || payload.agent?.is_subagent === true || payload.parent_tool_use_id || ['subagent', 'background', 'background_agent'].includes(agentType)) throw new Error('ignored non-main agent');
   if (agentType && !['main', 'main_agent'].includes(agentType)) throw new Error('ignored agent type');
   const sessionID = value(payload, ['session_id', 'sessionId']);
-  const sessionDir = value(payload, ['session_dir', 'cwd', 'directory']);
+  const sessionDir = firstValidContext([environmentValue('CLAUDE_PROJECT_DIR'), payload.session_dir, payload.cwd, payload.directory]);
   if (!sessionID || !sessionDir) throw new Error('ignored incomplete payload');
   if (event === 'attention' && !['permission_prompt', 'elicitation_dialog', 'elicitation_url_dialog'].includes(payload.notification_type)) throw new Error('ignored notification type');
   // Claude stops the turn while background work stays registered, then wakes the session when it
@@ -141,6 +248,8 @@ try {
   if (requestID) normalized.request_id = requestID;
   const excerpt = excerptFrom(payload);
   if (excerpt) normalized.excerpt = excerpt;
+  const tmuxSession = tmuxSessionForEvent();
+  if (tmuxSession) normalized.tmux_session = tmuxSession;
   output(JSON.stringify(normalized));
 } catch (_) {
   // Hooks are advisory: malformed payloads must not change Claude execution.

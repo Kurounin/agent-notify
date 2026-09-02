@@ -27,7 +27,8 @@ source "$root/lib/agent-notify/event.zsh"
 
 typeset -gi deliveries=0
 agent_notify_diag() { :; }
-agent_notify_deliver() { (( deliveries++ )); return 0; }
+typeset last_delivery_context=''
+agent_notify_deliver() { (( deliveries++ )); last_delivery_context=$3; return 0; }
 
 assert_equals() {
   [[ $1 == "$2" ]] || { print -u2 -- "expected '$2', got '$1'"; exit 1; }
@@ -43,12 +44,78 @@ send_event() {
 agent_notify_validate_json_document "$(/bin/cat "$fixture_dir/claude-settings/existing.json")"
 ! agent_notify_validate_json_document '{invalid json}'
 
+typeset normalized_tmux_event normalized_legacy_event valid_tmux_session oversized_tmux_session state_contents
+normalized_tmux_event=$(agent_notify_normalize_json '{"source":"claude-code","kind":"began","session_id":"tmux-normalized","session_dir":"/tmp/project","tmux_session":"team/api"}')
+agent_notify_event_fields "$normalized_tmux_event"
+assert_equals "${#AGENT_NOTIFY_EVENT_FIELDS}" 7
+assert_equals "${AGENT_NOTIFY_EVENT_FIELDS[7]:-}" 'team/api'
+normalized_legacy_event=$(agent_notify_normalize_json '{"source":"claude-code","kind":"began","session_id":"legacy-normalized","session_dir":"/tmp/project"}')
+agent_notify_event_fields "$normalized_legacy_event"
+assert_equals "${#AGENT_NOTIFY_EVENT_FIELDS}" 7
+assert_equals "${AGENT_NOTIFY_EVENT_FIELDS[7]:-}" ''
+agent_notify_event_fields "$(agent_notify_normalize_json '{"source":"claude-code","kind":"began","session_id":"tmux-invalid","session_dir":"/tmp/project","tmux_session":"bad\nvalue"}')"
+assert_equals "${AGENT_NOTIFY_EVENT_FIELDS[7]:-}" ''
+
+valid_tmux_session=$(/usr/bin/printf '\\ud83d\\ude00%.0s' {1..128})
+oversized_tmux_session=$(/usr/bin/printf '\\ud83d\\ude00%.0s' {1..129})
+for tmux_session in '' "$oversized_tmux_session" 'c0-marker\u0001' 'del-marker\u007f'; do
+  agent_notify_event_fields "$(agent_notify_normalize_json "{\"source\":\"claude-code\",\"kind\":\"began\",\"session_id\":\"tmux-dropped-normalized\",\"session_dir\":\"/tmp/project\",\"tmux_session\":\"$tmux_session\"}")"
+  assert_equals "${AGENT_NOTIFY_EVENT_FIELDS[7]:-}" ''
+done
+agent_notify_event_fields "$(agent_notify_normalize_json "{\"source\":\"claude-code\",\"kind\":\"began\",\"session_id\":\"tmux-boundary-normalized\",\"session_dir\":\"/tmp/project\",\"tmux_session\":\"$valid_tmux_session\"}")"
+[[ -n ${AGENT_NOTIFY_EVENT_FIELDS[7]:-} ]] || { print -u2 -- 'a 256-unit tmux session was dropped'; exit 1; }
+
+assert_equals "$(agent_notify_display_context 'team/api' '/tmp/project')" 'team_api'
+assert_equals "$(agent_notify_display_context '   ' '/tmp/project')" 'project'
+assert_equals "$(agent_notify_display_context '' '/tmp/project')" 'project'
+typeset long_tmux_label expected_long_tmux_label
+long_tmux_label=$(/usr/bin/printf 'x%.0s' {1..60})
+expected_long_tmux_label=$(/usr/bin/printf 'x%.0s' {1..48})
+assert_equals "$(agent_notify_display_context "$long_tmux_label" '/tmp/project')" "$expected_long_tmux_label"
+assert_equals "$(agent_notify_display_context '   ' '/')" 'Unknown project'
+assert_equals "$(agent_notify_display_context '' '/tmp/   ')" 'Unknown project'
+
+typeset deliveries_before_dropped_tmux=$deliveries
+integer dropped_tmux_index=0
+for tmux_session in '' "$oversized_tmux_session" 'c0-marker\u0001' 'del-marker\u007f'; do
+  (( dropped_tmux_index++ ))
+  print -rn -- "{\"source\":\"claude-code\",\"kind\":\"began\",\"session_id\":\"tmux-dropped-$dropped_tmux_index\",\"session_dir\":\"/tmp/project\"}" | AGENT_NOTIFY_NOW=$(( 1000 + dropped_tmux_index * 100 )) agent_notify_event
+  print -rn -- "{\"source\":\"claude-code\",\"kind\":\"completed\",\"session_id\":\"tmux-dropped-$dropped_tmux_index\",\"session_dir\":\"/tmp/project\",\"tmux_session\":\"$tmux_session\"}" | AGENT_NOTIFY_NOW=$(( 1030 + dropped_tmux_index * 100 )) agent_notify_event
+  assert_equals "$last_delivery_context" 'project'
+  state_contents=$(<"$AGENT_NOTIFY_STATE_DIR/$(agent_notify_session_key claude-code "tmux-dropped-$dropped_tmux_index").state")
+  [[ $state_contents != *tmux* ]] || { print -u2 -- 'a tmux session reached the session state file'; exit 1; }
+done
+assert_equals "$deliveries" "$(( deliveries_before_dropped_tmux + 4 ))"
+[[ ! -e $AGENT_NOTIFY_DIAGNOSTIC_DIR ]] || { print -u2 -- 'a dropped tmux session wrote diagnostics'; exit 1; }
+
+print -rn -- '{"source":"claude-code","kind":"began","session_id":"tmux-boundary-title","session_dir":"/tmp/project"}' | AGENT_NOTIFY_NOW=1500 agent_notify_event
+print -rn -- "{\"source\":\"claude-code\",\"kind\":\"completed\",\"session_id\":\"tmux-boundary-title\",\"session_dir\":\"/tmp/project\",\"tmux_session\":\"$valid_tmux_session\"}" | AGENT_NOTIFY_NOW=1530 agent_notify_event
+assert_equals "${#last_delivery_context}" 48
+deliveries=$deliveries_before_dropped_tmux
+
 send_event 100 began.json
 send_event 129 completed.json
 assert_equals "$deliveries" 0
 send_event 200 began.json
 send_event 231 completed.json
 assert_equals "$deliveries" 1
+
+typeset deliveries_before_tmux_titles=$deliveries
+AGENT_NOTIFY_NOW=250 agent_notify_event <<'EOF'
+{"source":"claude-code","kind":"began","session_id":"tmux-title","session_dir":"/tmp/project"}
+EOF
+AGENT_NOTIFY_NOW=290 agent_notify_event <<'EOF'
+{"source":"claude-code","kind":"completed","session_id":"tmux-title","session_dir":"/tmp/project","tmux_session":"team/api"}
+EOF
+assert_equals "$last_delivery_context" 'team_api'
+AGENT_NOTIFY_NOW=300 agent_notify_event <<'EOF'
+{"source":"claude-code","kind":"began","session_id":"tmux-invalid-title","session_dir":"/tmp/project"}
+EOF
+AGENT_NOTIFY_NOW=340 agent_notify_event <<'EOF'
+{"source":"claude-code","kind":"completed","session_id":"tmux-invalid-title","session_dir":"/tmp/project","tmux_session":"bad\nvalue"}
+EOF
+assert_equals "$last_delivery_context" 'project'
+deliveries=$deliveries_before_tmux_titles
 
 AGENT_NOTIFY_NOW=240 agent_notify_event <<'EOF'
 {"source":"claude-code","kind":"began","session_id":"session-isolation-a","session_dir":"/tmp/a"}
@@ -725,7 +792,7 @@ excerpt_state_key=$(agent_notify_session_key claude-code excerpt-present)
 excerpt_state_contents=$(<"$AGENT_NOTIFY_STATE_DIR/$excerpt_state_key.state")
 [[ $excerpt_state_contents != *Reticulated* ]] || { print -u2 -- 'an excerpt reached the session state file'; exit 1; }
 
-# Delivery failure must record no excerpt text, in state or diagnostics.
+# Delivery failure must record no excerpt or tmux-session text, in state or diagnostics.
 agent_notify_curl_request() {
   while IFS= read -r _; do :; done
   print -rn -- $'{"status":0,"request":"excerpt-failure"}\nAGENT_NOTIFY_META:503:{}'
@@ -734,14 +801,21 @@ AGENT_NOTIFY_NOW=900 agent_notify_event <<'EOF'
 {"source":"claude-code","kind":"began","session_id":"excerpt-failed-delivery","session_dir":"/tmp/excerpt-project"}
 EOF
 AGENT_NOTIFY_NOW=940 agent_notify_event <<'EOF'
-{"source":"claude-code","kind":"completed","session_id":"excerpt-failed-delivery","session_dir":"/tmp/excerpt-project","excerpt":"Diagnosticmarker excerpt text"}
+{"source":"claude-code","kind":"completed","session_id":"excerpt-failed-delivery","session_dir":"/tmp/excerpt-project","excerpt":"Diagnosticmarker excerpt text","tmux_session":"Acceptedtmuxmarker"}
+EOF
+AGENT_NOTIFY_NOW=950 agent_notify_event <<'EOF'
+{"source":"claude-code","kind":"failed","session_id":"rejected-tmux-failed-delivery","session_dir":"/tmp/excerpt-project","tmux_session":"Rejectedtmuxmarker\u0001"}
 EOF
 typeset excerpt_diagnostics
 excerpt_diagnostics=$(/bin/cat "$AGENT_NOTIFY_DIAGNOSTIC_DIR"/*.log(N))
 [[ $excerpt_diagnostics != *Diagnosticmarker* ]] || { print -u2 -- 'a failed delivery recorded excerpt text in diagnostics'; exit 1; }
+[[ $excerpt_diagnostics != *Acceptedtmuxmarker* && $excerpt_diagnostics != *Rejectedtmuxmarker* ]] || { print -u2 -- 'a failed delivery recorded tmux context in diagnostics'; exit 1; }
 typeset failed_delivery_state
 failed_delivery_state=$(<"$AGENT_NOTIFY_STATE_DIR/$(agent_notify_session_key claude-code excerpt-failed-delivery).state")
 [[ $failed_delivery_state != *Diagnosticmarker* ]] || { print -u2 -- 'a failed delivery recorded excerpt text in session state'; exit 1; }
+[[ $failed_delivery_state != *Acceptedtmuxmarker* ]] || { print -u2 -- 'a failed delivery recorded tmux context in session state'; exit 1; }
+failed_delivery_state=$(<"$AGENT_NOTIFY_STATE_DIR/$(agent_notify_session_key claude-code rejected-tmux-failed-delivery).state")
+[[ $failed_delivery_state != *Rejectedtmuxmarker* ]] || { print -u2 -- 'a failed delivery recorded rejected tmux context in session state'; exit 1; }
 
 typeset curl_config hostile_home="$test_root/hostile-home"
 curl_config=$(agent_notify_curl_config userkey012345678901234567890123 apptoken01234567890123456789012 'Claude Code — project' 'Attention required' 0)

@@ -25,7 +25,8 @@ if ((kind === "attention" || kind === "attention-cleared") && !validString(reque
 // rejected set is wider than validString because C1, NEL, LS, and PS are line breaks curl refuses.
 const excerptControl = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]");
 const excerpt = validString(value.excerpt, true) && !excerptControl.test(value.excerpt) ? value.excerpt : "";
-JSON.stringify({source:value.source,kind:kind,session_id:value.session_id,session_dir:sessionDir,request_id:requestId,excerpt:excerpt});
+const tmuxSession = validString(value.tmux_session, true) ? value.tmux_session : "";
+JSON.stringify({source:value.source,kind:kind,session_id:value.session_id,session_dir:sessionDir,request_id:requestId,excerpt:excerpt,tmux_session:tmuxSession});
 ' 2>/dev/null
 }
 
@@ -47,16 +48,17 @@ const text = $.NSString.alloc.initWithDataEncoding($.NSFileHandle.fileHandleWith
 let value; try { value = JSON.parse(text); } catch (_) { $.exit(1); }
 const b64 = (s) => $.NSString.alloc.initWithString(s).dataUsingEncoding($.NSUTF8StringEncoding).base64EncodedStringWithOptions(0).js;
 const excerpt = typeof value.excerpt === "string" ? value.excerpt : "";
-[value.source, value.kind, value.session_id, value.session_dir, value.request_id, excerpt].map(b64).join(":");
+const tmuxSession = typeof value.tmux_session === "string" ? value.tmux_session : "";
+[value.source, value.kind, value.session_id, value.session_dir, value.request_id, excerpt, tmuxSession].map(b64).join(":");
 ' 2>/dev/null) || return 1
-  local field_one field_two field_three field_four field_five field_six
+  local field_one field_two field_three field_four field_five field_six field_seven
   local -a fields
   # base64 emits neither a colon nor IFS whitespace, so the delimiter count is the field count and
   # an empty field such as an absent request_id keeps its own position instead of collapsing.
   delimiters=${encoded//[^:]/}
-  (( ${#delimiters} == 5 )) || return 1
-  IFS=':' read -r field_one field_two field_three field_four field_five field_six <<< "$encoded" || return 1
-  fields=("$field_one" "$field_two" "$field_three" "$field_four" "$field_five" "$field_six")
+  (( ${#delimiters} == 6 )) || return 1
+  IFS=':' read -r field_one field_two field_three field_four field_five field_six field_seven <<< "$encoded" || return 1
+  fields=("$field_one" "$field_two" "$field_three" "$field_four" "$field_five" "$field_six" "$field_seven")
   AGENT_NOTIFY_EVENT_FIELDS=()
   for line in "${fields[@]}"; do
     AGENT_NOTIFY_EVENT_FIELDS+=("$(print -rn -- "$line" | /usr/bin/base64 -D)") || return 1

@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { isAbsolute } from "node:path";
 
 const SOURCE = "opencode";
 const MAX_IDENTIFIER_LENGTH = 256;
@@ -9,6 +10,8 @@ const MAX_PAYLOAD_BYTES = 2048;
 const MESSAGE_FETCH_LIMIT = 12;
 const MESSAGE_FETCH_TIMEOUT_MS = 1_000;
 const SUBPROCESS_OUTER_TIMEOUT_MS = 10_000;
+const TMUX_LOOKUP_TIMEOUT_MS = 500;
+const TMUX_STDOUT_MAX_BYTES = 1_024;
 const ROOT_QUIESCENCE_MS = 50;
 const EXCERPT_TRUNCATION_MARKER = "…";
 const EXCERPT_CODE_MARKER = "[code]";
@@ -78,6 +81,134 @@ function boundedExcerpt(value) {
   }
 
   return value;
+}
+
+function discoverTmuxExecutable(which) {
+  try {
+    const executable = typeof which === "function" ? which("tmux") : undefined;
+    return typeof executable === "string" && isAbsolute(executable) ? executable : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function collectStdout(stdout, setCancel) {
+  if (!stdout || typeof stdout[Symbol.asyncIterator] !== "function") return undefined;
+
+  const iterator = stdout[Symbol.asyncIterator]();
+  if (!iterator || typeof iterator.next !== "function") return undefined;
+  const cancelled = Symbol("cancelled");
+  let cancelRead;
+  const cancelledRead = new Promise((resolve) => {
+    cancelRead = () => {
+      resolve(cancelled);
+      try {
+        const returned = iterator.return?.();
+        if (returned && typeof returned.then === "function") returned.catch(() => {});
+      } catch {
+        // Tmux context is advisory.
+      }
+    };
+  });
+  setCancel(cancelRead);
+
+  const chunks = [];
+  let length = 0;
+  try {
+    while (true) {
+      const next = await Promise.race([iterator.next(), cancelledRead]);
+      if (next === cancelled) return undefined;
+      if (next.done) break;
+      const chunk = next.value;
+      if (!(chunk instanceof Uint8Array)) return undefined;
+      length += chunk.byteLength;
+      if (length > TMUX_STDOUT_MAX_BYTES) {
+        cancelRead();
+        return { overflow: true };
+      }
+      chunks.push(chunk);
+    }
+  } catch {
+    return undefined;
+  } finally {
+    setCancel(undefined);
+  }
+
+  const output = new Uint8Array(length);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return { output };
+}
+
+function validTmuxSession(output) {
+  try {
+    const value = new TextDecoder("utf-8", { fatal: true }).decode(output);
+    const session = value.endsWith("\n") ? value.slice(0, -1) : value;
+    return session.trim().length === 0 ? undefined : boundedIdentifier(session);
+  } catch {
+    return undefined;
+  }
+}
+
+async function lookupTmuxSession({ executable, environment, spawn, setTimeout: schedule, clearTimeout: clear }) {
+  const pane = environment?.TMUX_PANE;
+  if (
+    !executable ||
+    typeof spawn !== "function" ||
+    typeof environment?.TMUX !== "string" ||
+    environment.TMUX.length === 0 ||
+    typeof pane !== "string" ||
+    !/^%[0-9]{1,255}$/.test(pane)
+  ) return undefined;
+
+  let child;
+  try {
+    child = spawn([executable, "display-message", "-p", "-t", pane, "#S"], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+  } catch {
+    return undefined;
+  }
+  if (!child || !child.exited) return undefined;
+
+  let terminated = false;
+  let cancelStdout;
+  const terminate = () => {
+    if (terminated) return;
+    terminated = true;
+    cancelStdout?.();
+    try {
+      child.kill();
+    } catch {
+      // Tmux context is advisory.
+    }
+  };
+  const capture = (async () => {
+    const captured = await collectStdout(child.stdout, (cancel) => { cancelStdout = cancel; });
+    if (!captured || captured.overflow) {
+      terminate();
+      return undefined;
+    }
+    if (await child.exited !== 0 || terminated) return undefined;
+    return validTmuxSession(captured.output);
+  })().catch(() => undefined);
+
+  let timer;
+  const deadline = new Promise((resolve) => {
+    timer = schedule(() => {
+      terminate();
+      resolve(undefined);
+    }, TMUX_LOOKUP_TIMEOUT_MS);
+  });
+  try {
+    return await Promise.race([capture, deadline]);
+  } finally {
+    clear(timer);
+  }
 }
 
 function settingsPath() {
@@ -215,6 +346,7 @@ function encodeEvent(event) {
   if ((event.kind === "attention" || event.kind === "attention-cleared") && !requestID) return undefined;
 
   const excerpt = boundedExcerpt(event.excerpt);
+  const tmuxSession = boundedIdentifier(event.tmux_session);
   const normalized = {
     source: SOURCE,
     event: event.kind,
@@ -222,9 +354,14 @@ function encodeEvent(event) {
     session_dir: sessionDir,
     request_id: requestID,
   };
+  if (tmuxSession) normalized.tmux_session = tmuxSession;
   if (excerpt) normalized.excerpt = excerpt;
 
   let encoded = JSON.stringify(normalized);
+  if (tmuxSession && new TextEncoder().encode(encoded).byteLength > MAX_PAYLOAD_BYTES) {
+    delete normalized.tmux_session;
+    encoded = JSON.stringify(normalized);
+  }
   // An oversized payload must cost the excerpt, never the event.
   if (excerpt && new TextEncoder().encode(encoded).byteLength > MAX_PAYLOAD_BYTES) {
     delete normalized.excerpt;
@@ -266,10 +403,17 @@ function createOpenCodeAdapter({
   submit = createBinarySubmitter(),
   schedule = globalThis.setTimeout,
   clear = globalThis.clearTimeout,
+  environment = globalThis.process?.env ?? {},
+  which = globalThis.Bun?.which,
+  tmuxSpawn = globalThis.Bun?.spawn,
+  tmuxSetTimeout = globalThis.setTimeout,
+  tmuxClearTimeout = globalThis.clearTimeout,
 }) {
+  const tmuxExecutable = discoverTmuxExecutable(which);
   const activeTurns = new Set();
   const terminatedTurns = new Set();
   const attention = new Map();
+  const notificationTails = new Map();
   const sessionTrees = new Map();
   const sessionRoots = new Map();
   const completionCandidates = new Map();
@@ -522,6 +666,17 @@ function createOpenCodeAdapter({
     }
   }
 
+  function queueNotification(sessionID, operation) {
+    const previous = notificationTails.get(sessionID) ?? Promise.resolve();
+    const queued = previous.catch(() => undefined).then(operation);
+    const tail = queued.catch(() => undefined);
+    notificationTails.set(sessionID, tail);
+    tail.finally(() => {
+      if (notificationTails.get(sessionID) === tail) notificationTails.delete(sessionID);
+    });
+    return queued;
+  }
+
   async function notify(kind, sessionID, sessionDir, requestID = "", excerpt = undefined) {
     const event = {
       source: SOURCE,
@@ -531,7 +686,20 @@ function createOpenCodeAdapter({
       request_id: requestID,
     };
     if (excerpt) event.excerpt = excerpt;
-    await submit(event);
+    const tmuxSession = kind === "attention" || kind === "completed" || kind === "failed"
+      ? lookupTmuxSession({
+        executable: tmuxExecutable,
+        environment,
+        spawn: tmuxSpawn,
+        setTimeout: tmuxSetTimeout,
+        clearTimeout: tmuxClearTimeout,
+      })
+      : undefined;
+    return queueNotification(sessionID, async () => {
+      const resolvedTmuxSession = await tmuxSession;
+      if (resolvedTmuxSession) event.tmux_session = resolvedTmuxSession;
+      await submit(event);
+    });
   }
 
   async function notifyCompleted(rootID, sessionDir) {
@@ -628,23 +796,25 @@ function createOpenCodeAdapter({
         const directory = details.directory ?? session?.directory;
         if (details.treeMetadata) {
           const trackedRootID = recordSession(sessionID, details, "terminal");
-          if (details.directory) await notify("failed", sessionID, details.directory, "", excerpt);
+          const notification = details.directory ? [sessionID, details.directory, excerpt] : undefined;
           if (sessionID === trackedRootID) removeTree(trackedRootID);
           else {
             completePendingRoot(trackedRootID);
             pruneSettledTree(trackedRootID);
           }
+          if (notification) await notify("failed", notification[0], notification[1], "", notification[2]);
           return;
         }
 
         if (session) {
           session.status = "terminal";
-          if (directory) await notify("failed", sessionID, directory, "", excerpt);
+          const notification = directory ? [sessionID, directory, excerpt] : undefined;
           if (sessionID === rootID) removeTree(rootID);
           else {
             completePendingRoot(rootID);
             pruneSettledTree(rootID);
           }
+          if (notification) await notify("failed", notification[0], notification[1], "", notification[2]);
           return;
         }
 
@@ -678,6 +848,6 @@ function createOpenCodeAdapter({
   };
 }
 
-export default async function agentNotifyPlugin({ client, submit, schedule, clear }) {
-  return createOpenCodeAdapter({ client, submit, schedule, clear });
+export default async function agentNotifyPlugin(options) {
+  return createOpenCodeAdapter(options);
 }

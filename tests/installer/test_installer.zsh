@@ -24,7 +24,7 @@ trap '/bin/rm -rf "$test_root"' EXIT
 make_client() { { print -- '#!/bin/zsh'; print -- "print -- '$2'"; } > "$1"; /bin/chmod 700 "$1"; }
 make_helper() { print -r -- '#!/bin/zsh
 if [[ $3 == *manifest.jxa ]]; then value=$(/usr/bin/plutil -extract "$5" raw "$4") || exit $?; [[ $value == 1 ]] && value=true; [[ $value == 0 ]] && value=false; print -- "$value"; exit 0; fi
-if [[ $3 == *plugin-jxa ]]; then { print -- "// >>> agent-notify managed plugin >>>"; print -- 'export default {}'; } > "$5"; exit 0; fi
+if [[ $3 == *plugin-jxa ]]; then /usr/bin/osascript -l JavaScript "'"$2"'" "$4" "$5" "$6"; exit $?; fi
 if [[ $3 == *failing-helper ]]; then exit 7; fi
 if [[ $3 == *keychain-jxa ]]; then "$3" "${@:4}"; exit $?; fi
 case $4 in inspect) print -- valid;; merge|remove-managed) /bin/cp "$5" "$6" 2>/dev/null || print -- "{}" > "$6";; store|rollback|remove) /bin/cat >/dev/null;; esac' > "$1"; /bin/chmod 700 "$1"; }
@@ -40,7 +40,7 @@ make_security() { print -r -- '#!/bin/zsh
 exit 0' > "$1"; /bin/chmod 700 "$1"; }
 typeset fake="$test_root/fake"; /bin/mkdir -p "$fake"
 typeset keychain_state="$test_root/keychain-state"; /bin/mkdir "$keychain_state"; print -- old-generation > "$keychain_state/selector"
-make_client "$fake/claude" 'claude 1.2.3'; make_client "$fake/opencode" 'opencode 1.2.3'; make_helper "$fake/jxa"; make_keychain_helper "$fake/keychain-jxa" "$keychain_state"; make_security "$fake/security"
+make_client "$fake/claude" 'claude 1.2.3'; make_client "$fake/opencode" 'opencode 1.2.3'; make_helper "$fake/jxa" "$root/installer/opencode-plugin.jxa"; make_keychain_helper "$fake/keychain-jxa" "$keychain_state"; make_security "$fake/security"
 /usr/bin/touch "$fake/plugin-jxa"; /bin/chmod 600 "$fake/plugin-jxa"
 typeset -a env=(AGENT_NOTIFY_INSTALL_HOME="$test_root/home" AGENT_NOTIFY_INSTALL_SKIP_PLATFORM_CHECK=1 AGENT_NOTIFY_INSTALL_MACOS_VERSION=14.5 AGENT_NOTIFY_INSTALL_CLAUDE_BIN="$fake/claude" AGENT_NOTIFY_INSTALL_OPENCODE_BIN="$fake/opencode" AGENT_NOTIFY_INSTALL_SECURITY_BIN="$fake/security" AGENT_NOTIFY_INSTALL_JXA_BIN="$fake/jxa" AGENT_NOTIFY_INSTALL_KEYCHAIN_HELPER="$fake/keychain-jxa" AGENT_NOTIFY_INSTALL_SETTINGS_HELPER="$fake/jxa" AGENT_NOTIFY_INSTALL_PLUGIN_HELPER="$fake/plugin-jxa")
 
@@ -95,7 +95,10 @@ env $env AGENT_NOTIFY_INSTALL_JXA_BIN=/usr/bin/osascript AGENT_NOTIFY_INSTALL_SE
 typeset plan=$(env $env "$root/bin/agent-notify-install" --dry-run)
 [[ $plan == *'existing v2 credential generation: will be replaced'* ]] || { print -u2 -- 'existing v2 credentials were not disclosed'; exit 1; }
 [[ $plan == *'Keychain migration: creates independent v2 credentials; legacy v1 items are not read, changed, or removed.'* && $plan == *'Keychain migration requires entering new Pushover credentials after confirmation.'* ]] || { print -u2 -- 'v2 Keychain migration was not disclosed'; exit 1; }
-[[ $plan == *"normalized state, timing metadata, and a bounded excerpt of the agent's final message text."* ]] || { print -u2 -- 'the transmitted message excerpt was not disclosed'; exit 1; }
+[[ $plan == *'Pushover and downstream push services receive agent name, a sanitized and bounded tmux-or-project display context, normalized state, and, when enabled and available, a sanitized bounded single-line excerpt.'* ]] || { print -u2 -- 'the complete transmitted notification data was not accurately disclosed'; exit 1; }
+[[ $plan == *'When tmux is detected, the adapters automatically perform a bounded lookup for the originating pane; a valid result uses its current innermost session name, otherwise the project basename is used.'* && $plan == *'Tmux is optional; its user-chosen innermost session name can be sensitive.'* ]] || { print -u2 -- 'the tmux privacy behavior was not disclosed'; exit 1; }
+[[ $plan != *'tmux prerequisite'* && $plan != *'requires tmux'* ]] || { print -u2 -- 'the installer introduced a tmux prerequisite'; exit 1; }
+[[ $plan == *'Claude completion excerpts use final assistant output; Claude failure excerpts use the categorical error identifier, never free-text error detail. OpenCode completion excerpts use relevant root-session assistant text; OpenCode failure excerpts use error message when present or error name otherwise. Excerpts are sanitized and bounded: the selected source is sent in full when it already fits the bound and truncated when longer; model output or OpenCode error messages can repeat sensitive content such as secrets or paths.'* ]] || { print -u2 -- 'the complete excerpt sources, bounds, and residual sensitivity were not disclosed'; exit 1; }
 [[ $plan == *'Message excerpts are enabled by default; set EXCERPT=0 in '*'/settings.conf to stop sending them.'* ]] || { print -u2 -- 'the excerpt default and opt-out setting were not disclosed'; exit 1; }
 [[ ! -e "$test_root/home/.local/bin/agent-notify" ]] || { print -u2 -- 'dry run wrote files'; exit 1; }
 env $env AGENT_NOTIFY_INSTALL_TEST_CONFIRM=no "$root/bin/agent-notify-install" >/dev/null 2>&1
@@ -127,12 +130,31 @@ typeset success_output=$(print -- $'hiddenUser42\nhiddenToken42' | env $env AGEN
 [[ $success_output != *hiddenUser42* && $success_output != *hiddenToken42* ]] || { print -u2 -- 'credentials were emitted in installer output'; exit 1; }
 [[ -x "$test_root/home/.local/bin/agent-notify" && -e "$test_root/home/.config/opencode/plugins/agent-notify.js" ]] || { print -u2 -- 'confirmed install missing artifact'; exit 1; }
 [[ -r "$test_root/home/.local/lib/agent-notify/config.zsh" ]] || { print -u2 -- 'notifier library tree was not installed'; exit 1; }
+typeset installed_hook="$test_root/home/.local/bin/agent-notify-claude-hook" installed_hook_jxa="$test_root/home/.local/bin/agent-notify-claude-hook.jxa" installed_plugin="$test_root/home/.config/opencode/plugins/agent-notify.js" installed_manifest="$test_root/home/Library/Application Support/agent-notify/install-manifest.json"
+[[ $(/usr/bin/shasum -a 256 "$installed_hook" | /usr/bin/cut -d ' ' -f1) == $(/usr/bin/shasum -a 256 "$root/integrations/claude/agent-notify-hook.zsh" | /usr/bin/cut -d ' ' -f1) && $(/usr/bin/shasum -a 256 "$installed_hook_jxa" | /usr/bin/cut -d ' ' -f1) == $(/usr/bin/shasum -a 256 "$root/integrations/claude/agent-notify-hook.jxa" | /usr/bin/cut -d ' ' -f1) ]] || { print -u2 -- 'updated Claude adapter pair was not staged verbatim'; exit 1; }
+[[ $(<$installed_plugin) == *'// >>> agent-notify managed plugin >>>'* && $(<$installed_plugin) == *tmux_session* ]] || { print -u2 -- 'generated OpenCode plugin omitted tmux context support'; exit 1; }
+[[ $(/usr/bin/plutil -extract files.hook.path raw "$installed_manifest") == "$installed_hook" && $(/usr/bin/plutil -extract files.hook_jxa.path raw "$installed_manifest") == "$installed_hook_jxa" && $(/usr/bin/plutil -extract files.plugin.path raw "$installed_manifest") == "$installed_plugin" ]] || { print -u2 -- 'managed adapter paths were not recorded in the manifest'; exit 1; }
+[[ $(/usr/bin/plutil -extract files.hook.post_hash raw "$installed_manifest") == $(/usr/bin/shasum -a 256 "$installed_hook" | /usr/bin/cut -d ' ' -f1) && $(/usr/bin/plutil -extract files.hook_jxa.post_hash raw "$installed_manifest") == $(/usr/bin/shasum -a 256 "$installed_hook_jxa" | /usr/bin/cut -d ' ' -f1) && $(/usr/bin/plutil -extract files.plugin.post_hash raw "$installed_manifest") == $(/usr/bin/shasum -a 256 "$installed_plugin" | /usr/bin/cut -d ' ' -f1) ]] || { print -u2 -- 'managed adapter hashes were not recorded in the manifest'; exit 1; }
+[[ $(/usr/bin/plutil -extract files raw "$installed_manifest") != *tmux* ]] || { print -u2 -- 'tmux introduced an installed artifact'; exit 1; }
 typeset installed_settings="$test_root/home/Library/Application Support/agent-notify/settings.conf"
 [[ -r $installed_settings && $(<"$installed_settings") == *'EXCERPT=1'* ]] || { print -u2 -- 'the excerpt settings file was not created with the documented default'; exit 1; }
 [[ $(/usr/bin/stat -f '%Lp' "$installed_settings") == 600 ]] || { print -u2 -- 'the excerpt settings file is not user-only'; exit 1; }
-print -rn -- '{"agent_type":"main","session_id":"installed","cwd":"/tmp/project","notification_type":"permission_prompt"}' | HOME="$test_root/home" "$test_root/home/.local/bin/agent-notify-claude-hook" attention
-[[ -z $(print -rn -- '{"agent":{"type":"subagent"},"session_id":"installed","cwd":"/tmp/project","notification_type":"permission_prompt"}' | /usr/bin/osascript -l JavaScript "$test_root/home/.local/bin/agent-notify-claude-hook.jxa" attention) ]] || { print -u2 -- 'installed nested subagent adapter was not filtered'; exit 1; }
-[[ -z $(print -rn -- '{"agentType":"background","session_id":"installed","cwd":"/tmp/project","notification_type":"permission_prompt"}' | /usr/bin/osascript -l JavaScript "$test_root/home/.local/bin/agent-notify-claude-hook.jxa" attention) ]] || { print -u2 -- 'installed agentType adapter was not filtered'; exit 1; }
+typeset staged_plugin_event=$(env -u TMUX -u TMUX_PANE node --input-type=module --eval '
+import { readFileSync } from "node:fs";
+const source = readFileSync(process.argv[1], "utf8");
+const { default: createPlugin } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+const submitted = [];
+const plugin = await createPlugin({
+  client: { session: { async get() { return { data: { directory: "/tmp/generated-plugin" } }; } } },
+  submit: async (event) => submitted.push(event),
+});
+await plugin.event({ event: { type: "permission.asked", properties: { sessionID: "generated-plugin", id: "generated-request" } } });
+console.log(JSON.stringify(submitted));
+' "$installed_plugin")
+[[ $staged_plugin_event == *'"source":"opencode","kind":"attention","session_id":"generated-plugin","session_dir":"/tmp/generated-plugin","request_id":"generated-request"'* && $staged_plugin_event != *tmux_session* ]] || { print -u2 -- 'generated OpenCode plugin did not execute without ambient tmux context'; exit 1; }
+print -rn -- '{"agent_type":"main","session_id":"installed","cwd":"/tmp/project","notification_type":"permission_prompt"}' | env -u TMUX -u TMUX_PANE HOME="$test_root/home" "$test_root/home/.local/bin/agent-notify-claude-hook" attention
+[[ -z $(print -rn -- '{"agent":{"type":"subagent"},"session_id":"installed","cwd":"/tmp/project","notification_type":"permission_prompt"}' | env -u TMUX -u TMUX_PANE /usr/bin/osascript -l JavaScript "$test_root/home/.local/bin/agent-notify-claude-hook.jxa" attention) ]] || { print -u2 -- 'installed nested subagent adapter was not filtered'; exit 1; }
+[[ -z $(print -rn -- '{"agentType":"background","session_id":"installed","cwd":"/tmp/project","notification_type":"permission_prompt"}' | env -u TMUX -u TMUX_PANE /usr/bin/osascript -l JavaScript "$test_root/home/.local/bin/agent-notify-claude-hook.jxa" attention) ]] || { print -u2 -- 'installed agentType adapter was not filtered'; exit 1; }
 typeset -a settings_backups; settings_backups=("$test_root/home/Library/Application Support/agent-notify/install-backups"/*/settings.json(N))
 (( $#settings_backups > 0 )) || { print -u2 -- 'settings backup missing'; exit 1; }
 /bin/cp "$root/lib/agent-notify/config.zsh" "$test_root/home/.local/lib/agent-notify/config.zsh"; print -- '# external library change' >> "$test_root/home/.local/lib/agent-notify/config.zsh"
@@ -148,7 +170,7 @@ print -- $'user\ntoken' | env $env AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=ye
 print -- '// >>> agent-notify managed plugin >>>' > "$test_root/home/.config/opencode/plugins/agent-notify.js"
 print -- '{"changed":true}' > "$test_root/home/.claude/settings.json"
 env $env AGENT_NOTIFY_INSTALL_CLAUDE_BIN=/missing/claude AGENT_NOTIFY_INSTALL_OPENCODE_BIN=/missing/opencode AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=no "$root/bin/agent-notify-install" --rollback >/dev/null
-[[ -x "$test_root/home/.local/bin/agent-notify" && -x "$test_root/home/.local/bin/agent-notify-claude-hook" ]] || { print -u2 -- 'selective rollback did not restore prior managed artifacts'; exit 1; }
+[[ -x "$test_root/home/.local/bin/agent-notify" && -x "$test_root/home/.local/bin/agent-notify-claude-hook" && -r "$test_root/home/.local/bin/agent-notify-claude-hook.jxa" && $(/usr/bin/stat -f '%Lp' "$test_root/home/.local/bin/agent-notify-claude-hook.jxa") == 600 ]] || { print -u2 -- 'selective rollback did not restore prior managed artifacts'; exit 1; }
 [[ $(<"$test_root/home/.config/opencode/plugins/agent-notify.js") == '// >>> agent-notify managed plugin >>>' ]] || { print -u2 -- 'selective rollback clobbered changed plugin'; exit 1; }
 [[ $(<"$test_root/home/.claude/settings.json") == '{"changed":true}' ]] || { print -u2 -- 'selective rollback clobbered changed settings'; exit 1; }
 env $env AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes:no "$root/bin/agent-notify-install" >/dev/null 2>&1 && { print -u2 -- 'plugin conflict was overwritten'; exit 1; }

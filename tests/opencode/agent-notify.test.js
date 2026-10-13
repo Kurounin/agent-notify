@@ -6,795 +6,906 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import plugin, * as pluginModule from "../../integrations/opencode/agent-notify.js";
+import { assistant, createHarness, deferred, execution, flush, inbox, LocationRouter, native, session, status, text } from "./native-harness.js";
 
-import agentNotifyPluginFactory, * as pluginModule from "../../integrations/opencode/agent-notify.js";
-
-// Excerpt settings are read from an injected path so the suite never touches the live home.
-const settingsDirectory = await mkdtemp(join(tmpdir(), "agent-notify-settings-"));
-const settingsFile = join(settingsDirectory, "settings.conf");
+const directory = await mkdtemp(join(tmpdir(), "agent-notify-native-"));
+const settingsFile = join(directory, "settings.conf");
 process.env.AGENT_NOTIFY_SETTINGS_FILE = settingsFile;
-process.on("exit", () => rmSync(settingsDirectory, { force: true, recursive: true }));
+process.on("exit", () => rmSync(directory, { force: true, recursive: true }));
+const corpus = JSON.parse(readFileSync(new URL("../fixtures/excerpt-corpus.json", import.meta.url), "utf8"));
+const tree = { root: session("root"), child: session("child", "root"), grandchild: session("grandchild", "child") };
+const permission = (id, action, request = "request") => native(`permission.${action}`, id,
+  action === "asked" ? { id: request, resource: "private-permission-sentinel" } : { requestID: request, reply: "once" });
+const form = (id, action, request = "request") => action === "created"
+  ? native("form.created", undefined, { form: { id: request, sessionID: id, title: "private-form-sentinel",
+    fields: [{ label: "private-field-sentinel" }] } })
+  : native(`form.${action}`, id, { id: request, answers: { secret: "private-answer-sentinel" } });
+const failure = (id, error = { type: "provider.invalid-request", message: "test failure", response: { body: "private-response-sentinel" } }) =>
+  execution(id, "failed", { error });
 
-const inheritedTmux = { TMUX: process.env.TMUX, TMUX_PANE: process.env.TMUX_PANE };
-delete process.env.TMUX;
-delete process.env.TMUX_PANE;
-process.on("exit", () => {
-  for (const [key, value] of Object.entries(inheritedTmux)) {
-    if (value === undefined) delete process.env[key];
-    else process.env[key] = value;
+test("exports one native definition; detached setup owns an abortable subscription", async (t) => {
+  assert.deepEqual(Object.keys(pluginModule), ["default"]);
+  assert.deepEqual(Object.keys(plugin), ["id", "setup"]);
+  assert.equal(plugin.id, "agent-notify");
+  const h = createHarness(t);
+  assert.equal(h.stream.subscribeCalls, 1);
+  assert.equal(h.stream.signal.aborted, false);
+  assert.equal(h.stream.waiters.length, 1);
+  h.cleanup();
+  assert.equal(h.stream.signal.aborted, true);
+  await flush();
+  assert.deepEqual(h.events, []);
+});
+
+test("requires observed activation, native success, idle and 50 ms quiescence", async (t) => {
+  const h = createHarness(t);
+  await h.emit(status("unobserved", "idle"), execution("unobserved", "succeeded"), status("unobserved", "idle"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.events, []);
+  await h.emit(execution("root", "started"), status("root", "busy"), execution("root", "started"));
+  await h.emit(status("root", "idle"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  await h.emit(execution("root", "succeeded"));
+  await h.scheduler.advanceBy(49);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  await h.scheduler.advanceBy(1);
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+  await h.emit(status("root", "idle"), execution("root", "succeeded"));
+  await h.scheduler.advanceBy(50);
+  assert.equal(h.events.length, 2);
+  assert.deepEqual(h.getRequests[0], { sessionID: "unobserved" });
+});
+
+test("busy is an activation fallback; native success projects idle without a separate status event", async (t) => {
+  const h = createHarness(t);
+  await h.emit(status("root", "busy"), status("root", "busy"), execution("root", "succeeded"));
+  await h.scheduler.advanceBy(49);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  await h.scheduler.advanceBy(1);
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+  await h.emit(status("root", "idle"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+  await h.complete("root");
+  assert.deepEqual(h.kinds, ["began:root", "completed:root", "began:root", "completed:root"]);
+});
+
+test("duplicate success/idle signals retain one candidate and its original quiescence deadline", async (t) => {
+  const h = createHarness(t);
+  await h.emit(execution("root", "started"));
+  await h.settle("root");
+  const candidate = h.scheduler.pending.find((timer) => timer.delay === 50);
+  await h.scheduler.advanceBy(25);
+  await h.emit(status("root", "idle"), execution("root", "succeeded"));
+  assert.deepEqual(h.scheduler.pending.filter((timer) => timer.delay === 50), [candidate]);
+  await h.scheduler.advanceBy(25);
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+});
+
+test("a bounded pending attention lookup cannot strand an expired candidate", async (t) => {
+  const lookup = deferred();
+  let delayed = false;
+  const h = createHarness(t, { getSession() { return delayed ? lookup.promise : session("root"); } });
+  await h.emit(execution("root", "started"));
+  await h.settle("root");
+  delayed = true;
+  await h.emit(permission("root", "asked"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  lookup.resolve(session("root"));
+  await flush();
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "attention:root", "completed:root"]);
+});
+
+test("metadata lookups expire after one second and late results cannot replace tracked relationships", async (t) => {
+  const lookup = deferred();
+  let delayed = false;
+  const h = createHarness(t, { getSession(id) { return delayed ? lookup.promise : tree[id]; } });
+  await h.emit(execution("root", "started"), execution("child", "started"));
+  await h.settle("root");
+  delayed = true;
+  await h.emit(execution("child", "succeeded"), status("child", "idle"));
+  await h.scheduler.advanceBy(1000);
+  await h.scheduler.advanceBy(1000);
+  lookup.resolve(session("child", undefined, "/work/late-unrelated"));
+  await flush();
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:child", "completed:root"]);
+  assert.equal(h.events.at(-1).session_dir, "/work/root");
+});
+
+for (const profile of ["build", "explore", "custom-reviewer", "same-mode-all"]) {
+  test(`relationship, not agent profile, controls root/child lifecycle (${profile})`, async (t) => {
+    const h = createHarness(t, { sessions: Object.fromEntries(Object.entries(tree).map(([id, info]) => [id, { ...info, agent: profile }])) });
+    await h.emit(execution("root", "started"), execution("child", "started"), status("child", "busy"));
+    await h.settle("root");
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root", "reset:child"]);
+    await h.settle("child");
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root", "reset:child", "completed:root"]);
+  });
+}
+
+test("foreground/background/nested out-of-order trees settle without restarting a pending root", async (t) => {
+  const h = createHarness(t, { sessions: tree });
+  await h.emit(execution("grandchild", "started"), execution("child", "started"), execution("root", "started"));
+  await h.settle("root");
+  await h.settle("child");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["reset:grandchild", "reset:child", "began:root"]);
+  await h.settle("grandchild");
+  const stale = h.scheduler.pending.find((timer) => timer.delay === 50);
+  await h.emit(execution("root", "started"), status("root", "busy"));
+  stale.callback();
+  await h.scheduler.advanceBy(50);
+  assert.equal(h.events.filter((event) => event.event === "completed").length, 0);
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["reset:grandchild", "reset:child", "began:root", "completed:root"]);
+});
+
+test("root/child success and idle ordering never substitutes status for an execution outcome", async (t) => {
+  function permutations(values) {
+    if (values.length === 0) return [[]];
+    return values.flatMap((value, index) => permutations(values.filter((_, other) => other !== index))
+      .map((rest) => [value, ...rest]));
+  }
+  const signals = [execution("root", "succeeded"), status("root", "idle"),
+    execution("child", "succeeded"), status("child", "idle")];
+  for (const ordering of permutations(signals)) {
+    const h = createHarness(t, { sessions: tree });
+    await h.emit(execution("root", "started"), execution("child", "started"));
+    for (const [index, signal] of ordering.entries()) {
+      await h.emit(signal);
+      await h.scheduler.advanceBy(50);
+      const outcomes = ordering.slice(0, index + 1).filter((entry) => entry.type === "session.execution.succeeded");
+      assert.equal(h.events.filter((event) => event.event === "completed").length, outcomes.length === 2 ? 1 : 0);
+    }
+    assert.deepEqual(h.kinds, ["began:root", "reset:child", "completed:root"]);
   }
 });
 
-const corpus = JSON.parse(readFileSync(new URL("../fixtures/excerpt-corpus.json", import.meta.url), "utf8"));
+test("native creation records relationships/location but does not activate", async (t) => {
+  const h = createHarness(t, { getSession() { throw new Error("lookup unavailable"); } });
+  await h.emit(native("session.created", "child", { parentID: "root", location: { directory: "/work/child" } }),
+    native("session.created", "root", { location: { directory: "/work/root" } }));
+  assert.deepEqual(h.events, []);
+  await h.emit(execution("root", "started"), execution("child", "started"));
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:child"]);
+  await h.settle("child");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:child", "completed:root"]);
+});
 
-function createClient({ sessions = {}, getSession, messages, getMessages } = {}) {
-  const requests = [];
-  const messageRequests = [];
-  return {
-    requests,
-    messageRequests,
-    client: {
-      session: {
-        async get(request) {
-          requests.push(request);
-          if (getSession) return getSession(request.path.id);
-          // OpenCode omits parentID entirely for root sessions.
-          return { data: sessions[request.path.id] ?? { directory: `/work/${request.path.id}` } };
-        },
-        async messages(request) {
-          messageRequests.push(request);
-          if (getMessages) return getMessages(request.path.id);
-          if (!messages) throw new Error("session messages unavailable");
-          return { data: messages[request.path.id] ?? [] };
-        },
-      },
-    },
-  };
+for (const [label, parentID] of [["malformed", {}], ["self-parent", "child"], ["cyclic", "grandchild"]]) {
+  test(`valid native creation relationship survives ${label} lookup metadata`, async (t) => {
+    const h = createHarness(t, { getSession(id) {
+      return id === "child" ? session(id, parentID, "/work/resolved-child") : tree[id];
+    } });
+    await h.emit(execution("root", "started"),
+      native("session.created", "grandchild", { parentID: "child", location: { directory: "/work/grandchild" } }),
+      native("session.created", "child", { parentID: "root", location: { directory: "/work/event-child" } }));
+    assert.deepEqual(h.kinds, ["began:root"]);
+    await h.emit(execution("child", "started"), status("child", "busy"), permission("child", "asked"));
+    await h.settle("root");
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root", "reset:child", "attention:child"]);
+    assert.ok(h.events.filter((event) => event.session_id === "child")
+      .every((event) => event.session_dir === "/work/resolved-child"));
+    await h.settle("child");
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root", "reset:child", "attention:child", "completed:root"]);
+  });
 }
 
-function status(sessionID, type) {
-  return { type: "session.status", properties: { sessionID, status: { type } } };
-}
+test("lookup failure preserves tracked relationships and successful pending root", async (t) => {
+  let fail = false;
+  const h = createHarness(t, { getSession(id) { if (fail) throw new Error("unavailable"); return tree[id]; } });
+  await h.emit(execution("root", "started"), execution("child", "started"));
+  fail = true;
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:child"]);
+  await h.settle("child");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:child", "completed:root"]);
+});
 
-function retryStatus(sessionID, attempt, action = undefined) {
-  const status = { type: "retry", attempt };
-  if (action !== undefined) status.action = action;
-  return { type: "session.status", properties: { sessionID, status } };
-}
+test("malformed native lookup objects cannot erase a known child relationship", async (t) => {
+  let malformed = false;
+  const h = createHarness(t, { getSession(id) { return malformed ? { id } : tree[id]; } });
+  await h.emit(execution("root", "started"), execution("child", "started"));
+  malformed = true;
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:child"]);
+  await h.settle("child");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:child", "completed:root"]);
+});
 
-function assistantMessage(...parts) {
-  return { info: { role: "assistant" }, parts };
-}
+test("invalid/self-parent/cyclic lookups retain known state or bounded per-session fallback", async (t) => {
+  const sessions = { root: session("root"), child: session("child", "root"), self: session("self", "self"),
+    invalid: session("invalid", {}), a: session("a", "b"), b: session("b", "a") };
+  const h = createHarness(t, { sessions });
+  await h.emit(execution("root", "started"), execution("child", "started"));
+  sessions.child = session("child", "child");
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:child"]);
+  await h.settle("child");
+  await h.scheduler.advanceBy(50);
+  for (const id of ["self", "invalid"]) await h.complete(id);
+  await h.emit(native("session.created", "a", { parentID: "b", location: { directory: "/work/a" } }),
+    native("session.created", "b", { parentID: "a", location: { directory: "/work/b" } }));
+  await h.complete("b");
+  assert.equal(h.events.filter((event) => event.event === "completed" && event.session_id === "root").length, 1);
+  assert.ok(h.kinds.includes("completed:self") && h.kinds.includes("completed:invalid"));
+});
 
-function textPart(text, extra = {}) {
-  return { type: "text", text, ...extra };
-}
+test("unresolved directory never falls back to ctx.location; native event location permits fallback", async (t) => {
+  const h = createHarness(t, { getSession() { throw new Error("private lookup error"); } });
+  await h.complete("missing");
+  assert.deepEqual(h.events, []);
+  await h.emit(native("session.execution.started", "fallback", {}, { location: { directory: "/work/actual" } }));
+  await h.settle("fallback");
+  await h.scheduler.advanceBy(50);
+  assert.equal(h.events[0].session_dir, "/work/actual");
+  assert.equal(h.events[1].event, "completed");
+});
 
-class FakeScheduler {
-  #time = 0;
-  timers = [];
+test("permission/form attention uses exact native IDs, matching family and child scope", async (t) => {
+  const h = createHarness(t, { sessions: tree });
+  await h.emit(execution("root", "started"), execution("child", "started"), permission("child", "asked"),
+    permission("child", "asked"), form("child", "created"), form("child", "created"),
+    permission("child", "replied", "unmatched"), form("root", "replied"), permission("child", "replied"),
+    permission("child", "replied"), form("child", "cancelled"), form("child", "replied"));
+  assert.deepEqual(h.kinds, ["began:root", "reset:child", "attention:child", "attention:child",
+    "attention-cleared:child", "attention-cleared:child"]);
+  assert.deepEqual(h.events.slice(2).map((event) => event.request_id), ["request", "request", "request", "request"]);
+  assert.equal(JSON.stringify(h.events).includes("private-"), false);
+});
 
-  schedule = (callback, delay) => {
-    const timer = { callback, due: this.#time + delay, cancelled: false, fired: false };
-    this.timers.push(timer);
-    return timer;
-  };
+test("global forms and malformed nesting/IDs are ignored without ending observation", async (t) => {
+  const h = createHarness(t);
+  await h.emit(form("global", "created"), form("global", "replied"), form("global", "cancelled"),
+    native("form.created", "root", { id: "wrong-nesting" }), native("permission.asked", "root", { requestID: "wrong-field" }),
+    native("permission.replied", "root", { id: "wrong-field" }), native("permission.asked", "x".repeat(257), { id: "request" }),
+    native("permission.asked", "root", { id: "control\nrequest" }), { type: "session.status", data: [] },
+    { type: "session.execution.started", data: { sessionID: {} } }, null);
+  assert.deepEqual(h.events, []);
+  await h.emit(permission("root", "asked"));
+  assert.deepEqual(h.kinds, ["attention:root"]);
+});
 
-  clear = (timer) => {
-    timer.cancelled = true;
-  };
-
-  async advanceBy(delay) {
-    this.#time += delay;
-    for (const timer of this.timers.filter((entry) => !entry.fired && entry.due <= this.#time)) {
-      timer.fired = true;
-      if (!timer.cancelled) await timer.callback();
+test("ignores V1 properties, deprecated/alias events and step/tool failures", async (t) => {
+  const h = createHarness(t);
+  for (const type of ["session.status", "session.execution.started", "session.idle", "session.error", "session.next.prompted",
+    "session.next.prompt.admitted", "question.asked", "question.replied", "question.rejected", "permission.v2.asked", "permission.v2.replied",
+    "question.v2.asked", "question.v2.replied", "form.v2.created", "session.step.failed", "session.tool.failed"]) {
+    await h.emit({ type, properties: { sessionID: "root", id: "request", status: { type: "busy" } } });
+    if (type !== "session.status" && type !== "session.execution.started") {
+      await h.emit(native(type, "root", { id: "request", requestID: "request", status: { type: "busy" }, error: { type: "failure" } }));
     }
   }
+  assert.deepEqual(h.events, []);
+  assert.deepEqual(h.getRequests, []);
+});
 
-  async fireStale(timer) {
-    await timer.callback();
+test("actionable retries are deduplicated attention, ordinary retries are not failure", async (t) => {
+  const h = createHarness(t, { sessions: tree });
+  await h.emit(execution("root", "started"), status("child", "retry", { attempt: 2, action: { title: "private-retry-sentinel" } }),
+    status("child", "retry", { attempt: 2, action: { title: "private-retry-sentinel" } }));
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:child", "attention:child"]);
+  assert.equal(h.events.at(-1).request_id, "retry:2");
+  await h.emit(status("child", "retry", { attempt: 3 }));
+  await h.settle("child");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:child", "attention:child", "completed:root"]);
+});
+
+for (const terminal of ["failed", "interrupted"]) {
+  test(`busy-only activation after ${terminal} starts a new execution without explicit idle`, async (t) => {
+    const h = createHarness(t, { sessions: tree });
+    await h.emit(status("root", "busy"), status("child", "busy"));
+    const end = (id) => terminal === "failed" ? failure(id) : execution(id, "interrupted", { reason: "user" });
+    await h.emit(end("root"), end("child"), status("root", "busy"), status("child", "busy"), status("child", "busy"));
+    await h.emit(end("child"), execution("root", "succeeded"));
+    await h.scheduler.advanceBy(50);
+    const kind = terminal === "failed" ? "failed" : "reset";
+    assert.deepEqual(h.kinds, ["began:root", "reset:child", `${kind}:root`, `${kind}:child`,
+      "began:root", "reset:child", `${kind}:child`, "completed:root"]);
+  });
+
+  test(`intervening retry cannot hide busy-only root activation after ${terminal}`, async (t) => {
+    const h = createHarness(t);
+    await h.emit(execution("root", "started"),
+      terminal === "failed" ? failure("root") : execution("root", "interrupted", { reason: "user" }),
+      status("root", "retry", { attempt: 1 }), status("root", "busy"),
+      permission("root", "asked"), status("root", "busy"), permission("root", "replied"));
+    await h.settle("root");
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root", `${terminal === "failed" ? "failed" : "reset"}:root`,
+      "began:root", "attention:root", "attention-cleared:root", "completed:root"]);
+  });
+
+  test(`child ${terminal} settles without a root failure; reused executions reset once`, async (t) => {
+    const h = createHarness(t, { sessions: tree });
+    await h.emit(execution("root", "started"));
+    for (let index = 0; index < 2; index += 1) {
+      await h.emit(execution("child", "started"), status("child", "busy"), execution("child", "started"),
+        permission("child", "asked", `request-${index}`), status("child", "busy"));
+      await h.emit(terminal === "failed" ? failure("child") : execution("child", "interrupted", { reason: "user" }));
+      await h.emit(terminal === "failed" ? failure("child") : execution("child", "interrupted", { reason: "user" }),
+        status("child", "idle"), permission("child", "replied", `request-${index}`));
+    }
+    await h.settle("root");
+    await h.scheduler.advanceBy(50);
+    const kind = terminal === "failed" ? "failed" : "reset";
+    assert.deepEqual(h.kinds, ["began:root", "reset:child", "attention:child", `${kind}:child`,
+      "reset:child", "attention:child", `${kind}:child`, "completed:root"]);
+  });
+  test(`root ${terminal} prevents later success/idle completion and clears attention`, async (t) => {
+    const h = createHarness(t);
+    await h.emit(execution("root", "started"), permission("root", "asked"));
+    await h.emit(terminal === "failed" ? failure("root") : execution("root", "interrupted", { reason: "user" }));
+    await h.emit(status("root", "idle"), execution("root", "succeeded"), permission("root", "replied"));
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root", "attention:root", `${terminal === "failed" ? "failed" : "reset"}:root`]);
+    await h.complete("root");
+    assert.deepEqual(h.kinds.slice(-2), ["began:root", "completed:root"]);
+  });
+}
+
+test("session-associated failure without observed start is reported once, sessionless errors ignored", async (t) => {
+  const h = createHarness(t);
+  await h.emit(failure("root"), failure("root"), native("session.execution.failed", undefined, { error: { type: "failure" } }));
+  assert.deepEqual(h.kinds, ["failed:root"]);
+});
+
+for (const id of ["root", "child"]) {
+  test(`outstanding ${id} inbox blocks successful idle roots; duplicates/unmatched do not corrupt settlement`, async (t) => {
+    const h = createHarness(t, { sessions: tree });
+    await h.emit(native("session.created", "child", { parentID: "root", location: { directory: "/work/child" } }), execution("root", "started"));
+    await h.settle("root");
+    await h.emit(inbox(id, "enqueued", "msg_one"), inbox(id, "enqueued", "msg_one"), inbox(id, "enqueued", "msg_two"),
+      inbox(id, "cancelled", "msg_unmatched"), inbox(id, "cancelled", "msg_one"), inbox(id, "cancelled", "msg_one"));
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root"]);
+    await h.emit(inbox(id, "cancelled", "msg_two"));
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+    assert.equal(JSON.stringify(h.events).includes("private-item-sentinel"), false);
+  });
+}
+
+for (const childOutcome of ["succeeded", "failed", "interrupted"]) {
+  test(`delivered child inbox requires a later native outcome (${childOutcome}), not prior idle/success`, async (t) => {
+    const h = createHarness(t, { sessions: tree });
+    await h.emit(execution("root", "started"), execution("child", "started"));
+    await h.settle("child");
+    await h.settle("root");
+    await h.emit(inbox("child", "enqueued", "msg_one"), inbox("child", "delivered", "msg_one"),
+      inbox("child", "delivered", "msg_one"), inbox("child", "cancelled", "msg_one"), status("child", "idle"));
+    await h.scheduler.advanceBy(50);
+    assert.equal(h.kinds.includes("completed:root"), false);
+    await h.emit(execution("child", "started"));
+    await h.emit(childOutcome === "failed" ? failure("child") : execution("child", childOutcome));
+    await h.emit(status("child", "idle"));
+    await h.scheduler.advanceBy(50);
+    assert.equal(h.events.filter((event) => event.event === "completed").length, 1);
+    assert.equal(h.events.at(-1).session_id, "root");
+  });
+}
+
+test("background result inbox delivery invalidates root success until parent consumes and succeeds", async (t) => {
+  const h = createHarness(t, { sessions: tree });
+  await h.emit(execution("root", "started"), execution("child", "started"));
+  await h.settle("root");
+  await h.settle("child");
+  await h.emit(inbox("root", "enqueued", "msg_result"), inbox("root", "delivered", "msg_result"), status("root", "idle"));
+  await h.scheduler.advanceBy(50);
+  assert.equal(h.kinds.includes("completed:root"), false);
+  await h.emit(execution("root", "started"));
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:child", "completed:root"]);
+});
+
+test("delivered observed work can settle on the next native outcome even when start was not observed", async (t) => {
+  const h = createHarness(t, { sessions: tree });
+  await h.emit(execution("root", "started"), execution("child", "started"));
+  await h.settle("root");
+  await h.settle("child");
+  await h.emit(inbox("root", "enqueued", "msg_one"), inbox("root", "delivered", "msg_one"),
+    inbox("child", "enqueued", "msg_child"), inbox("child", "delivered", "msg_child"));
+  await h.scheduler.advanceBy(50);
+  assert.equal(h.kinds.includes("completed:root"), false);
+  await h.emit(execution("root", "succeeded"), failure("child"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:child", "failed:child", "completed:root"]);
+});
+
+test("cancelling queued inbox cannot reuse success after root has resumed", async (t) => {
+  const h = createHarness(t);
+  await h.emit(execution("root", "started"));
+  await h.settle("root");
+  await h.emit(inbox("root", "enqueued", "msg_one"), execution("root", "started"), inbox("root", "cancelled", "msg_one"), status("root", "idle"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  await h.emit(execution("root", "succeeded"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+});
+
+test("root or nested activation invalidates a known candidate before stalled lookup completes", async (t) => {
+  for (const id of ["root", "grandchild"]) {
+    const lookup = deferred();
+    let stalled = false;
+    const h = createHarness(t, { getSession(name) { return stalled && name === id ? lookup.promise : tree[name]; } });
+    await h.emit(native("session.created", "grandchild", { parentID: "child", location: { directory: "/work/grandchild" } }),
+      native("session.created", "child", { parentID: "root", location: { directory: "/work/child" } }), execution("root", "started"));
+    await h.settle("root");
+    const stale = h.scheduler.pending.find((timer) => timer.delay === 50);
+    stalled = true;
+    await h.emit(execution(id, "started"));
+    stale.callback();
+    await h.scheduler.advanceBy(50);
+    assert.equal(h.kinds.includes("completed:root"), false);
+    lookup.resolve(tree[id]);
+    await flush();
+    await h.settle(id);
+    await h.scheduler.advanceBy(50);
+    assert.equal(h.events.filter((event) => event.event === "began").length, 1);
+    assert.equal(h.events.filter((event) => event.event === "completed").length, 1);
   }
+});
+
+test("root resumption during delayed excerpt cancels late text and preserves original turn", async (t) => {
+  const context = deferred();
+  let delayed = true;
+  const h = createHarness(t, { getContext() { return delayed ? context.promise : [assistant(text("fresh"))]; } });
+  await h.emit(execution("root", "started"));
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.equal(h.contextRequests.length, 1);
+  await h.emit(execution("root", "started"));
+  context.resolve([assistant(text("stale"))]);
+  await flush();
+  assert.deepEqual(h.kinds, ["began:root"]);
+  delayed = false;
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+  assert.equal(h.events.at(-1).excerpt, "fresh");
+});
+
+test("stalled attention delivery does not block intake; queued completion is cancellable at FIFO front", async (t) => {
+  const delivery = deferred();
+  const h = createHarness(t, { delivery(event) { return event.event === "attention" ? delivery.promise : Promise.resolve(0); } });
+  await h.emit(execution("root", "started"), permission("root", "asked"));
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "attention:root"]);
+  await h.emit(execution("root", "started"));
+  delivery.resolve(0);
+  await flush();
+  assert.deepEqual(h.kinds, ["began:root", "attention:root"]);
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "attention:root", "completed:root"]);
+});
+
+test("nested activation also cancels a completion waiting behind a root attention subprocess", async (t) => {
+  const delivery = deferred();
+  const h = createHarness(t, { sessions: tree, delivery(event) { return event.event === "attention" ? delivery.promise : Promise.resolve(0); } });
+  await h.emit(execution("root", "started"), native("session.created", "child", { parentID: "root", location: { directory: "/work/child" } }),
+    permission("root", "asked"));
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  await h.emit(execution("grandchild", "started"));
+  delivery.resolve(0);
+  await flush();
+  assert.equal(h.kinds.includes("completed:root"), false);
+  await h.settle("grandchild");
+  await h.scheduler.advanceBy(50);
+  assert.equal(h.events.filter((event) => event.event === "completed").length, 1);
+});
+
+test("completion consumes the turn at submission, not slow subprocess exit", async (t) => {
+  const delivery = deferred();
+  const h = createHarness(t, { delivery(event) { return event.event === "completed" ? delivery.promise : Promise.resolve(0); } });
+  await h.complete("root");
+  await h.emit(execution("root", "started"));
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+  delivery.resolve(0);
+  await flush();
+  assert.deepEqual(h.kinds, ["began:root", "completed:root", "began:root"]);
+});
+
+test("same-owner movement preserves a new turn's queued begin behind submitted completion", async (t) => {
+  const delivery = deferred();
+  let completions = 0;
+  const location = { directory: "/work/root" };
+  const h = createHarness(t, { location, delivery(event) {
+    return event.event === "completed" && ++completions === 1 ? delivery.promise : Promise.resolve(0);
+  } });
+  await h.complete("root");
+  await h.emit(execution("root", "started"), native("session.moved", "root", { location, projectID: "project" }),
+    execution("root", "succeeded"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+  delivery.resolve(0);
+  await flush();
+  assert.deepEqual(h.kinds, ["began:root", "completed:root", "began:root", "completed:root"]);
+});
+
+test("same-owner child movement preserves the queued reset needed after a stalled prior failure", async (t) => {
+  const delivery = deferred();
+  let failures = 0;
+  const location = { directory: "/work/child" };
+  const h = createHarness(t, { sessions: tree, location, delivery(event) {
+    return event.event === "failed" && ++failures === 1 ? delivery.promise : Promise.resolve(0);
+  } });
+  await h.emit(execution("root", "started"), execution("child", "started"), failure("child"),
+    execution("child", "started"), native("session.moved", "child", { location, projectID: "project" }), failure("child"));
+  assert.deepEqual(h.kinds, ["began:root", "reset:child", "failed:child"]);
+  delivery.resolve(0);
+  await flush();
+  assert.deepEqual(h.kinds, ["began:root", "reset:child", "failed:child", "reset:child", "failed:child"]);
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.equal(h.kinds.at(-1), "completed:root");
+});
+
+test("a same-owner move invalidates old candidates and queued events, resolving display from session metadata", async (t) => {
+  const sessions = { root: session("root") };
+  const delivery = deferred();
+  const h = createHarness(t, { sessions, location: { directory: "/work/moved-project" },
+    delivery(event) { return event.event === "attention" ? delivery.promise : Promise.resolve(0); } });
+  await h.emit(execution("root", "started"), permission("root", "asked"), permission("root", "asked", "queued"));
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  sessions.root = session("root", undefined, "/work/moved-project");
+  await h.emit(native("session.moved", "root", { location: { directory: "/work/moved-project" }, projectID: "project" }));
+  delivery.resolve(0);
+  await flush();
+  assert.deepEqual(h.kinds, ["began:root", "attention:root"]);
+  await h.scheduler.advanceBy(50);
+  assert.equal(h.events.at(-1).event, "completed");
+  assert.equal(h.events.at(-1).session_dir, "/work/moved-project");
+  assert.equal(h.events.some((event) => event.request_id === "queued"), false);
+});
+
+test("same-owner movement preserves a pending resumption and discards its obsolete lookup result", async (t) => {
+  const lookup = deferred();
+  let delayed = false;
+  let unavailable = false;
+  const location = { directory: "/work/project" };
+  const h = createHarness(t, { location, getSession() {
+    if (delayed) return lookup.promise;
+    if (unavailable) throw new Error("fresh lookup unavailable");
+    return session("root", undefined, location.directory);
+  } });
+  await h.emit(execution("root", "started"), execution("root", "succeeded"));
+  delayed = true;
+  await h.emit(execution("root", "started"));
+  delayed = false;
+  unavailable = true;
+  await h.emit(native("session.moved", "root", { location, projectID: "project" }));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root"], "discarded activation must not revive prior success");
+  lookup.resolve(session("root", undefined, "/work/obsolete"));
+  await flush();
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  unavailable = false;
+  await h.emit(execution("root", "succeeded"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+  assert.equal(h.events.at(-1).session_dir, location.directory);
+});
+
+for (const sameDirectory of [false, true]) {
+  test(`outgoing ownership cannot re-arm a root after a location-routed move (same directory: ${sameDirectory})`, async (t) => {
+    const oldLocation = { directory: "/work/old", workspaceID: "wrk_old" };
+    const newLocation = { directory: sameDirectory ? "/work/old" : "/work/new", workspaceID: "wrk_new" };
+    const sessions = { root: { id: "root", location: oldLocation } };
+    const delivery = deferred();
+    const outgoing = createHarness(t, { sessions, location: oldLocation,
+      delivery(event) { return event.event === "attention" ? delivery.promise : Promise.resolve(0); } });
+    const incoming = createHarness(t, { sessions, location: newLocation });
+    const router = new LocationRouter();
+    router.attach(oldLocation, outgoing.stream);
+    router.attach(newLocation, incoming.stream);
+    await router.emit(native("session.created", "root", { location: oldLocation }), execution("root", "started"),
+      permission("root", "asked"), permission("root", "asked", "queued"), execution("root", "succeeded"));
+    await outgoing.scheduler.advanceBy(50);
+    assert.deepEqual(outgoing.kinds, ["began:root", "attention:root"]);
+    sessions.root = { id: "root", location: newLocation };
+    await router.emit(native("session.moved", "root", { location: newLocation, projectID: "project" }, { location: oldLocation }));
+    assert.deepEqual(incoming.events, [], "arrival must not invent or replay a turn");
+    await router.emit(execution("root", "started"));
+    delivery.resolve(0);
+    await flush();
+    await outgoing.scheduler.advanceBy(1000);
+    assert.deepEqual(outgoing.kinds, ["began:root", "attention:root"], "old owner cannot clear the destination's active notifier state");
+    await router.emit(execution("root", "succeeded"));
+    await incoming.scheduler.advanceBy(50);
+    assert.deepEqual(incoming.kinds, ["began:root", "completed:root"]);
+    assert.ok(incoming.events.every((event) => event.session_dir === newLocation.directory));
+    await outgoing.scheduler.advanceBy(1000);
+    assert.equal(outgoing.events.length, 2);
+  });
 }
 
-async function createAdapter(options) {
-  const scheduler = new FakeScheduler();
-  const adapter = await agentNotifyPluginFactory({ ...options, schedule: scheduler.schedule, clear: scheduler.clear });
-  return {
-    async event(input) {
-      await adapter.event(input);
-      await scheduler.advanceBy(50);
-    },
-  };
-}
-
-async function agentNotifyPlugin(options) {
-  return createAdapter(options);
-}
-
-function tmuxChild({ chunks = [new TextEncoder().encode("session\n")], exit = 0 } = {}) {
-  let killed = false;
-  return {
-    child: {
-      stdout: (async function* () {
-        for (const chunk of await chunks) yield chunk;
-      })(),
-      exited: Promise.resolve(exit),
-      kill() { killed = true; },
-    },
-    get killed() { return killed; },
-  };
-}
-
-function deferredTmuxChild() {
-  let release;
-  const chunks = new Promise((resolve) => { release = resolve; });
-  const fixture = tmuxChild({ chunks });
-  return {
-    child: fixture.child,
-    get killed() { return fixture.killed; },
-    release(text) { release([new TextEncoder().encode(text)]); },
-  };
-}
-
-function controlledTmuxChild({ chunks = [], stalled = false, exit = 0 } = {}) {
-  let index = 0;
-  let returnCalls = 0;
-  let killed = false;
-  const stdout = {
-    [Symbol.asyncIterator]() { return this; },
-    next() {
-      if (stalled) return new Promise(() => {});
-      if (index >= chunks.length) return Promise.resolve({ done: true });
-      const value = chunks[index];
-      index += 1;
-      return Promise.resolve({ done: false, value });
-    },
-    return() {
-      returnCalls += 1;
-      return Promise.resolve({ done: true });
-    },
-  };
-  return {
-    child: {
-      stdout,
-      exited: Promise.resolve(exit),
-      kill() { killed = true; },
-    },
-    get killed() { return killed; },
-    get returnCalls() { return returnCalls; },
-  };
-}
-
-test("exports only a callable default plugin factory for the OpenCode loader", () => {
-  assert.deepEqual(Object.keys(pluginModule), ["default"]);
-  assert.ok(Object.values(pluginModule).every((value) => typeof value === "function"));
+test("late lookup after movement cannot revive obsolete location or queued events", async (t) => {
+  const lookup = deferred();
+  let delayed = false;
+  const h = createHarness(t, { getSession() { return delayed ? lookup.promise : session("root"); } });
+  await h.emit(execution("root", "started"));
+  delayed = true;
+  await h.emit(permission("root", "asked"));
+  await h.emit(native("session.moved", "root", { location: { directory: "/work/new" }, projectID: "project" }));
+  delayed = false;
+  lookup.resolve(session("root", undefined, "/work/obsolete"));
+  await flush();
+  assert.deepEqual(h.kinds, ["began:root"]);
 });
 
-test("submits one busy-to-idle lifecycle when deprecated session.idle and status idle both arrive", async () => {
-  const { client, requests } = createClient();
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("session-a", "busy") });
-  await adapter.event({ event: { type: "session.idle", properties: { sessionID: "session-a" } } });
-  await adapter.event({ event: status("session-a", "idle") });
-
-  assert.deepEqual(submitted, [
-    { source: "opencode", kind: "began", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
-    { source: "opencode", kind: "completed", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
-  ]);
-  assert.equal(requests.length, 3);
+test("deletion silently resets, invalidates pending lookup and never revives old observation", async (t) => {
+  const lookup = deferred();
+  let delayed = false;
+  const h = createHarness(t, { getSession() { return delayed ? lookup.promise : session("root"); } });
+  await h.emit(execution("root", "started"));
+  await h.settle("root");
+  delayed = true;
+  await h.emit(permission("root", "asked"));
+  await h.emit(native("session.deleted", "root"));
+  lookup.resolve(session("root"));
+  await flush();
+  await h.emit(status("root", "idle"), execution("root", "succeeded"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:root"]);
 });
 
-test("deduplicates prompted and admitted busy signals with session.status busy", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: { type: "session.next.prompted", properties: { sessionID: "session-a", prompt: "private prompt text" } } });
-  await adapter.event({ event: { type: "session.next.prompt.admitted", properties: { sessionID: "session-a", prompt: "more private prompt text" } } });
-  await adapter.event({ event: status("session-a", "busy") });
-  await adapter.event({ event: status("session-a", "idle") });
-
-  assert.deepEqual(submitted, [
-    { source: "opencode", kind: "began", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
-    { source: "opencode", kind: "completed", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
-  ]);
+test("independent roots and plugin instances do not share turn/tree state", async (t) => {
+  const a = createHarness(t);
+  const b = createHarness(t);
+  await a.emit(execution("one", "started"), execution("two", "started"));
+  await b.complete("one");
+  assert.deepEqual(a.kinds, ["began:one", "began:two"]);
+  assert.deepEqual(b.kinds, ["began:one", "completed:one"]);
+  await a.settle("two");
+  await a.scheduler.advanceBy(50);
+  assert.deepEqual(a.kinds, ["began:one", "began:two", "completed:two"]);
 });
 
-test("does not complete an idle session without a prior busy status", async () => {
-  const { client, requests } = createClient();
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("session-a", "idle") });
-
-  assert.deepEqual(submitted, []);
-  assert.equal(requests.length, 1);
+test("a known independent tree's sustained lookup stalls do not starve completion or lifecycle reduction", async (t) => {
+  const lookups = [];
+  let delayed = false;
+  const h = createHarness(t, { getSession(id) {
+    if (delayed && id === "other") { const lookup = deferred(); lookups.push(lookup); return lookup.promise; }
+    return session(id);
+  } });
+  await h.emit(execution("root", "started"), execution("other", "started"));
+  await h.settle("root");
+  const candidate = h.scheduler.pending.find((timer) => timer.delay === 50);
+  delayed = true;
+  for (let index = 0; index < 5; index += 1) await h.emit(permission("other", "asked", `request-${index}`));
+  await h.scheduler.advanceBy(50);
+  assert.equal(candidate.cancelled, true, "a committed completion consumes its candidate");
+  assert.deepEqual(h.kinds, ["began:root", "began:other", "completed:root"]);
+  await h.emit(execution("root", "started"), execution("root", "succeeded"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "began:other", "completed:root", "began:root", "completed:root"]);
+  assert.equal(lookups.length, 5);
+  for (const lookup of [...lookups].reverse()) { lookup.resolve(session("other")); await flush(); }
+  assert.deepEqual(h.events.filter((event) => event.session_id === "other").map((event) => event.request_id),
+    ["", "request-0", "request-1", "request-2", "request-3", "request-4"]);
 });
 
-test("alerts once for a retry action while preserving deferred root completion", async () => {
-  const { client } = createClient({
-    sessions: {
-      root: { directory: "/work/root" },
-      child: { directory: "/work/child", parentID: "root" },
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-  const action = {
-    reason: "quota",
-    provider: "openai",
-    title: "Plan limit reached",
-    message: "Upgrade your plan",
-    label: "Manage plan",
-    link: "https://example.test/billing",
-  };
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: retryStatus("child", 2, action) });
-  await adapter.event({ event: retryStatus("child", 2, action) });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: status("child", "idle") });
-
-  assert.deepEqual(submitted, [
-    { source: "opencode", kind: "began", session_id: "root", session_dir: "/work/root", request_id: "" },
-    { source: "opencode", kind: "attention", session_id: "child", session_dir: "/work/child", request_id: "retry:2" },
-    { source: "opencode", kind: "completed", session_id: "root", session_dir: "/work/root", request_id: "" },
-  ]);
+test("unknown relationships conservatively block completion until lookup resolves into the affected tree", async (t) => {
+  const lookup = deferred();
+  const h = createHarness(t, { getSession(id) { return id === "new-child" ? lookup.promise : session(id); } });
+  await h.emit(execution("root", "started"));
+  await h.settle("root");
+  await h.emit(execution("new-child", "started"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  lookup.resolve(session("new-child", "root"));
+  await flush();
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:new-child"]);
+  await h.settle("new-child");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:new-child", "completed:root"]);
 });
 
-test("keeps retry statuses without an action lifecycle-only", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("session-a", "busy") });
-  await adapter.event({ event: retryStatus("session-a", 1) });
-  await adapter.event({ event: status("session-a", "idle") });
-
-  assert.deepEqual(submitted, [
-    { source: "opencode", kind: "began", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
-    { source: "opencode", kind: "completed", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
-  ]);
+test("completion excerpts inspect twelve recent native entries, newest assistant first text only", async (t) => {
+  const h = createHarness(t, { contexts: { root: [assistant(text("older")), assistant({ type: "reasoning", text: "private-reasoning" },
+    { type: "tool", text: "private-tool" }, text(" "), text("first eligible"), text("second excluded")),
+    { type: "synthetic", text: "private-child-report" }, { type: "system", text: "private-system" },
+    { type: "compaction", summary: "private-compaction" }] } });
+  await h.complete("root");
+  assert.equal(h.events.at(-1).excerpt, "first eligible");
+  assert.deepEqual(h.contextRequests, [{ sessionID: "root" }]);
 });
 
-test("completes an idle root immediately when it has no known active descendants", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "began", session_id: "root" },
-    { kind: "completed", session_id: "root" },
-  ]);
-});
-
-test("defers root completion for busy and retry descendants until the final child settles", async () => {
-  const { client } = createClient({
-    sessions: {
-      root: { directory: "/work/root" },
-      child: { directory: "/work/child", parentID: "root" },
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("child", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: status("child", "retry") });
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "began", session_id: "root" },
-  ]);
-
-  await adapter.event({ event: status("child", "idle") });
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "began", session_id: "root" },
-    { kind: "completed", session_id: "root" },
-  ]);
-});
-
-test("does not restart the turn when a finished background task wakes its deferred root", async () => {
-  const { client } = createClient({
-    sessions: {
-      root: { directory: "/work/root" },
-      child: { directory: "/work/child", parentID: "root" },
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("child", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("child", "idle") });
-  await adapter.event({ event: status("root", "idle") });
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "began", session_id: "root" },
-    { kind: "completed", session_id: "root" },
-  ]);
-});
-
-test("begins a new turn once a deferred root completion has been released", async () => {
-  const { client } = createClient({
-    sessions: {
-      root: { directory: "/work/root" },
-      child: { directory: "/work/child", parentID: "root" },
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("child", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: status("child", "idle") });
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "began", session_id: "root" },
-    { kind: "completed", session_id: "root" },
-    { kind: "began", session_id: "root" },
-    { kind: "completed", session_id: "root" },
-  ]);
-});
-
-test("never submits lifecycle events for a background task session", async () => {
-  const { client } = createClient({
-    sessions: {
-      root: { directory: "/work/root" },
-      child: { directory: "/work/child", parentID: "root" },
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("child", "busy") });
-  await adapter.event({ event: status("child", "idle") });
-
-  assert.deepEqual(submitted, []);
-});
-
-test("retains a deferred root completion across duplicate idle statuses", async () => {
-  const { client } = createClient({
-    sessions: {
-      root: { directory: "/work/root" },
-      child: { directory: "/work/child", parentID: "root" },
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("child", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: status("child", "idle") });
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "began", session_id: "root" },
-    { kind: "completed", session_id: "root" },
-  ]);
-});
-
-test("retains a known active child when a metadata lookup fails", async () => {
-  let childLookupFails = false;
-  const sessions = {
-    root: { directory: "/work/root" },
-    child: { directory: "/work/child", parentID: "root" },
-  };
-  const { client } = createClient({
-    getSession(sessionID) {
-      if (sessionID === "child" && childLookupFails) throw new Error("unavailable");
-      return { data: sessions[sessionID] };
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("child", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  childLookupFails = true;
-  await adapter.event({ event: status("child", "busy") });
-  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
-
-  childLookupFails = false;
-  await adapter.event({ event: status("child", "idle") });
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "began", session_id: "root" },
-    { kind: "completed", session_id: "root" },
-  ]);
-});
-
-test("retains a tracked root when a lookup failure hides the session tree", async () => {
-  let rootLookupFails = false;
-  const sessions = {
-    root: { directory: "/work/root" },
-    child: { directory: "/work/child", parentID: "root" },
-  };
-  const { client } = createClient({
-    getSession(sessionID) {
-      if (sessionID === "root" && rootLookupFails) throw new Error("unavailable");
-      return { data: sessions[sessionID] };
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("child", "busy") });
-  rootLookupFails = true;
-  await adapter.event({ event: status("root", "idle") });
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "began", session_id: "root" },
-  ]);
-});
-
-test("retains a deferred root when only a duplicate idle fails its lookup", async () => {
-  let rootLookupFails = false;
-  const sessions = {
-    root: { directory: "/work/root" },
-    child: { directory: "/work/child", parentID: "root" },
-  };
-  const { client } = createClient({
-    getSession(sessionID) {
-      if (sessionID === "root" && rootLookupFails) throw new Error("unavailable");
-      return { data: sessions[sessionID] };
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("child", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  rootLookupFails = true;
-  await adapter.event({ event: status("root", "idle") });
-  rootLookupFails = false;
-  await adapter.event({ event: status("child", "idle") });
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "began", session_id: "root" },
-    { kind: "completed", session_id: "root" },
-  ]);
-});
-
-test("settles a retry-only child and releases its pending root", async () => {
-  const { client } = createClient({
-    sessions: {
-      root: { directory: "/work/root" },
-      child: { directory: "/work/child", parentID: "root" },
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("child", "retry") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: status("child", "idle") });
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "began", session_id: "root" },
-    { kind: "completed", session_id: "root" },
-  ]);
-});
-
-test("merges nested descendants observed before their parent and root", async () => {
-  const { client } = createClient({
-    sessions: {
-      root: { directory: "/work/root" },
-      child: { directory: "/work/child", parentID: "root" },
-      grandchild: { directory: "/work/grandchild", parentID: "child" },
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("grandchild", "busy") });
-  await adapter.event({ event: status("child", "busy") });
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: status("child", "idle") });
-  await adapter.event({ event: status("grandchild", "idle") });
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "began", session_id: "root" },
-    { kind: "completed", session_id: "root" },
-  ]);
-});
-
-test("ignores settled duplicate idle events after terminal tree cleanup", async () => {
-  const { client } = createClient({
-    sessions: {
-      root: { directory: "/work/root" },
-      child: { directory: "/work/child", parentID: "root" },
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: status("child", "idle") });
-  await adapter.event({ event: status("child", "idle") });
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "began", session_id: "root" },
-    { kind: "completed", session_id: "root" },
-  ]);
-});
-
-test("prunes settled provisional child trees before their root is observed", async () => {
-  const { client } = createClient({
-    sessions: {
-      root: { directory: "/work/root" },
-      child: { directory: "/work/child", parentID: "root" },
-      failedChild: { directory: "/work/failed-child", parentID: "root" },
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("child", "busy") });
-  await adapter.event({ event: status("child", "idle") });
-  await adapter.event({ event: status("failedChild", "busy") });
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "failedChild", error: { name: "UnknownError" } } } });
-  await adapter.event({ event: status("child", "idle") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "failed", session_id: "failedChild" },
-    { kind: "began", session_id: "root" },
-    { kind: "completed", session_id: "root" },
-  ]);
-});
-
-test("treats a session payload without a parentID key as a root", async () => {
-  const { client } = createClient({
-    sessions: { session: { directory: "/work/session" } },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("session", "busy") });
-  await adapter.event({ event: status("session", "idle") });
-
-  assert.deepEqual(submitted.map((event) => event.kind), ["began", "completed"]);
-});
-
-test("falls back to per-session completion when session parent metadata is unusable", async () => {
-  const { client } = createClient({
-    sessions: { session: { directory: "/work/session", parentID: "session" } },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("session", "busy") });
-  await adapter.event({ event: status("session", "idle") });
-
-  assert.deepEqual(submitted.map((event) => event.kind), ["began", "completed"]);
-});
-
-test("settles a deferred root after a child terminal error and cleans up duplicate lifecycle state", async () => {
-  const { client } = createClient({
-    sessions: {
-      root: { directory: "/work/root" },
-      child: { directory: "/work/child", parentID: "root" },
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("child", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "child", error: { name: "UnknownError" } } } });
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "child", error: { name: "UnknownError" } } } });
-  await adapter.event({ event: status("child", "idle") });
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "began", session_id: "root" },
-    { kind: "failed", session_id: "child" },
-    { kind: "completed", session_id: "root" },
-    { kind: "began", session_id: "root" },
-    { kind: "completed", session_id: "root" },
-  ]);
-});
-
-test("clears only matching legacy attention requests", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session-a", id: "permission-1" } } });
-  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session-a", id: "permission-1" } } });
-  await adapter.event({ event: { type: "permission.replied", properties: { sessionID: "session-a", requestID: "permission-2" } } });
-  await adapter.event({ event: { type: "permission.replied", properties: { sessionID: "session-a", requestID: "permission-1" } } });
-  await adapter.event({ event: { type: "question.asked", properties: { sessionID: "session-a", id: "question-1" } } });
-  await adapter.event({ event: { type: "question.rejected", properties: { sessionID: "session-a", requestID: "question-1" } } });
-
-  assert.deepEqual(submitted.map(({ kind, request_id }) => ({ kind, request_id })), [
-    { kind: "attention", request_id: "permission-1" },
-    { kind: "attention-cleared", request_id: "permission-1" },
-    { kind: "attention", request_id: "question-1" },
-    { kind: "attention-cleared", request_id: "question-1" },
-  ]);
-});
-
-test("shares attention keys between legacy and V2 permission and question events", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session-a", id: "permission-1" } } });
-  await adapter.event({ event: { type: "permission.v2.replied", properties: { sessionID: "session-a", requestID: "permission-1" } } });
-  await adapter.event({ event: { type: "permission.v2.asked", properties: { sessionID: "session-a", id: "permission-2" } } });
-  await adapter.event({ event: { type: "permission.replied", properties: { sessionID: "session-a", requestID: "permission-2" } } });
-  await adapter.event({ event: { type: "question.v2.asked", properties: { sessionID: "session-a", id: "question-1" } } });
-  await adapter.event({ event: { type: "question.replied", properties: { sessionID: "session-a", requestID: "question-1" } } });
-  await adapter.event({ event: { type: "question.asked", properties: { sessionID: "session-a", id: "question-2" } } });
-  await adapter.event({ event: { type: "question.v2.rejected", properties: { sessionID: "session-a", requestID: "question-2" } } });
-  await adapter.event({ event: { type: "question.v2.asked", properties: { sessionID: "session-a", id: "question-3" } } });
-  await adapter.event({ event: { type: "question.v2.replied", properties: { sessionID: "session-a", requestID: "question-3" } } });
-
-  assert.deepEqual(submitted.map(({ kind, request_id }) => ({ kind, request_id })), [
-    { kind: "attention", request_id: "permission-1" },
-    { kind: "attention-cleared", request_id: "permission-1" },
-    { kind: "attention", request_id: "permission-2" },
-    { kind: "attention-cleared", request_id: "permission-2" },
-    { kind: "attention", request_id: "question-1" },
-    { kind: "attention-cleared", request_id: "question-1" },
-    { kind: "attention", request_id: "question-2" },
-    { kind: "attention-cleared", request_id: "question-2" },
-    { kind: "attention", request_id: "question-3" },
-    { kind: "attention-cleared", request_id: "question-3" },
-  ]);
-});
-
-test("only terminal non-aborted session errors fail and prevent a later idle completion", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("session-a", "busy") });
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "session-a", error: { name: "MessageAbortedError" } } } });
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "session-a", error: { name: "APIError", data: { isRetryable: true } } } } });
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "session-a", error: { name: "UnknownError", data: { isRecoverable: true } } } } });
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "session-a", error: { name: "ToolError" } } } });
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "session-a", error: { name: "UserAbortError" } } } });
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "session-a", error: { name: "UnknownError" } } } });
-  await adapter.event({ event: status("session-a", "idle") });
-  await adapter.event({ event: { type: "session.error", properties: { error: { name: "UnknownError" } } } });
-
-  assert.deepEqual(submitted.map((event) => event.kind), ["began", "failed"]);
-});
-
-test("fails a terminal session error without busy and clears its attention", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session-a", id: "request-a" } } });
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "session-a", error: { name: "UnknownError" } } } });
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "session-a", error: { name: "UnknownError" } } } });
-  await adapter.event({ event: status("session-a", "idle") });
-  await adapter.event({ event: { type: "permission.replied", properties: { sessionID: "session-a", requestID: "request-a" } } });
-
-  assert.deepEqual(submitted.map(({ kind, request_id }) => ({ kind, request_id })), [
-    { kind: "attention", request_id: "request-a" },
-    { kind: "failed", request_id: "" },
-  ]);
-});
-
-test("fails active sessions for terminal AssistantError variants", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-  const terminalErrors = ["StructuredOutputError", "ContextOverflowError", "ContentFilterError"];
-
-  for (const [index, name] of terminalErrors.entries()) {
-    const sessionID = `session-${index}`;
-    await adapter.event({ event: status(sessionID, "busy") });
-    await adapter.event({ event: { type: "session.error", properties: { sessionID, error: { name } } } });
+test("newest assistant without eligible text never falls back to older assistant", async (t) => {
+  for (const content of [[{ type: "reasoning", text: "private" }], [text(" ")], [text("hidden", { synthetic: true })],
+    [text("hidden", { ignored: true })], [], [{ type: "tool", text: "private" }]]) {
+    const h = createHarness(t, { contexts: { root: [assistant(text("older")), assistant(...content)] } });
+    await h.complete("root");
+    assert.equal(h.events.at(-1).excerpt, undefined);
   }
-  await adapter.event({ event: { type: "session.error", properties: { error: { name: "ContextOverflowError" } } } });
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "began", session_id: "session-0" },
-    { kind: "failed", session_id: "session-0" },
-    { kind: "began", session_id: "session-1" },
-    { kind: "failed", session_id: "session-1" },
-    { kind: "began", session_id: "session-2" },
-    { kind: "failed", session_id: "session-2" },
-  ]);
+  const h = createHarness(t, { contexts: { root: [assistant(text("outside window")), ...Array.from({ length: 12 }, () => ({ type: "system", text: "excluded" }))] } });
+  await h.complete("root");
+  assert.equal(h.events.at(-1).excerpt, undefined);
 });
 
-test("uses the canonical notifier subprocess arguments and JSON payload", async (t) => {
-  const calls = [];
-  const bunDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Bun");
-  Object.defineProperty(globalThis, "Bun", {
-    configurable: true,
-    value: {
-      spawn(command, options) {
-      calls.push({ command, options });
-      return { exited: Promise.resolve(), kill() {} };
-    },
-    },
-  });
-  t.after(() => {
-    if (bunDescriptor) Object.defineProperty(globalThis, "Bun", bunDescriptor);
-    else delete globalThis.Bun;
-  });
-  const { client } = createClient();
-  const adapter = await agentNotifyPlugin({ client });
-
-  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session-a", id: "request-a" } } });
-
-  assert.deepEqual(calls, [{
-    command: ["agent-notify", "event"],
-    options: {
-      stdin: new TextEncoder().encode("{\"source\":\"opencode\",\"event\":\"attention\",\"session_id\":\"session-a\",\"session_dir\":\"/work/session-a\",\"request_id\":\"request-a\"}"),
-      stdout: "ignore",
-      stderr: "ignore",
-    },
-  }]);
+test("deferred root excerpts use prior root text, never child context or synthetic reports", async (t) => {
+  const h = createHarness(t, { sessions: tree, contexts: { root: [assistant(text("root text before child")), { type: "synthetic", text: "private child report" }],
+    child: [assistant(text("private child text"))] } });
+  await h.emit(execution("root", "started"), execution("child", "started"));
+  await h.settle("root");
+  await h.settle("child");
+  await h.scheduler.advanceBy(50);
+  assert.equal(h.events.at(-1).excerpt, "root text before child");
+  assert.deepEqual(h.contextRequests, [{ sessionID: "root" }]);
 });
 
-test("uses and clears the 10-second outer subprocess deadline", async (t) => {
-  const scheduled = [];
-  const cleared = [];
-  const originalSetTimeout = globalThis.setTimeout;
-  const originalClearTimeout = globalThis.clearTimeout;
-  const bunDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Bun");
-  globalThis.setTimeout = (_callback, delay) => {
-    const timer = { delay };
-    scheduled.push(timer);
-    return timer;
-  };
-  globalThis.clearTimeout = (timer) => cleared.push(timer);
-  Object.defineProperty(globalThis, "Bun", {
-    configurable: true,
-    value: {
-      spawn() {
-        return { exited: Promise.resolve(), kill() {} };
-      },
-    },
-  });
-  t.after(() => {
-    globalThis.setTimeout = originalSetTimeout;
-    globalThis.clearTimeout = originalClearTimeout;
-    if (bunDescriptor) Object.defineProperty(globalThis, "Bun", bunDescriptor);
-    else delete globalThis.Bun;
-  });
-  const { client } = createClient();
-  const adapter = await agentNotifyPlugin({ client });
-
-  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session-a", id: "request-a" } } });
-
-  assert.deepEqual(scheduled, [{ delay: 10_000 }]);
-  assert.deepEqual(cleared, scheduled);
+test("context missing/rejected/one-second timeout are excerpt-free, with late results discarded", async (t) => {
+  for (const getContext of [() => undefined, () => { throw new Error("private transport failure"); }]) {
+    const h = createHarness(t, { getContext });
+    await h.complete("root");
+    assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+    assert.equal(h.events.at(-1).excerpt, undefined);
+  }
+  const context = deferred();
+  const h = createHarness(t, { getContext() { return context.promise; } });
+  await h.complete("root");
+  await h.scheduler.advanceBy(999);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  await h.scheduler.advanceBy(1);
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+  context.resolve([assistant(text("too late"))]);
+  await flush();
+  assert.equal(h.events.at(-1).excerpt, undefined);
 });
 
-test("propagates canonical JSON to the notifier process stdin", async (t) => {
-  const fixtureDirectory = await mkdtemp(join(tmpdir(), "agent-notify-opencode-"));
+test("structured failure uses message/type, never response bodies, and preserves excerpt corpus", async (t) => {
+  const h = createHarness(t);
+  await h.emit(failure("message"), failure("type", { type: "provider.rate-limit", response: { body: "private-response-sentinel" } }));
+  assert.deepEqual(h.events.map((event) => event.excerpt), ["test failure", "provider.rate-limit"]);
+  for (const [index, entry] of corpus.cases.entries()) {
+    const id = `corpus-${index}`;
+    const c = createHarness(t, { contexts: { [id]: [assistant(text(entry.input))] } });
+    await c.complete(id);
+    assert.equal(c.events.at(-1).excerpt, entry.excerpt || undefined, entry.name);
+    await c.emit(failure(`error-${index}`, { type: "error", message: entry.input }));
+    assert.equal(c.events.at(-1).excerpt, entry.input ? entry.excerpt || undefined : "error", entry.name);
+  }
+  assert.equal(JSON.stringify(h.events).includes("private-response-sentinel"), false);
+});
+
+test("live excerpt opt-out performs no context request and no error excerpt", async (t) => {
+  t.after(() => rmSync(settingsFile, { force: true }));
+  const h = createHarness(t, { contexts: { root: [assistant(text("visible"))] } });
+  await h.emit(execution("root", "started"));
+  writeFileSync(settingsFile, "EXCERPT=0\n");
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  await h.emit(failure("failure"));
+  assert.equal(h.events.at(-1).excerpt, undefined);
+  assert.deepEqual(h.contextRequests, []);
+  writeFileSync(settingsFile, "EXCERPT=1\n");
+  await h.complete("root");
+  assert.equal(h.events.at(-1).excerpt, "visible");
+  writeFileSync(settingsFile, "malformed settings\n");
+  await h.complete("root");
+  assert.equal(h.events.at(-1).excerpt, "visible");
+});
+
+test("2048-byte transport degradation drops only excerpt; bounds reject invalid identifiers/dirs", async (t) => {
+  const wide = "実".repeat(256);
+  const h = createHarness(t, { sessions: { [wide]: session(wide, undefined, `/${"実".repeat(255)}`) },
+    contexts: { [wide]: [assistant(text("完了".repeat(200)))] } });
+  await h.complete(wide);
+  assert.equal(h.events.at(-1).event, "completed");
+  assert.equal(h.events.at(-1).excerpt, undefined);
+  for (const call of h.calls) assert.ok(call.options.stdin.byteLength <= 2048);
+  const bad = createHarness(t, { getSession() { return { location: { directory: "x".repeat(257) } }; } });
+  await bad.complete("root");
+  assert.deepEqual(bad.events, []);
+});
+
+test("inherited server pane variables and arbitrary metadata never change project attribution", async (t) => {
+  const prior = { TMUX: process.env.TMUX, TMUX_PANE: process.env.TMUX_PANE };
+  t.after(() => { for (const [key, value] of Object.entries(prior)) {
+    if (value === undefined) delete process.env[key]; else process.env[key] = value;
+  } });
+  process.env.TMUX = "server-terminal-sentinel";
+  process.env.TMUX_PANE = "%42";
+  const h = createHarness(t, { sessions: { root: { ...session("root", undefined, "/work/actual-project"),
+    metadata: { TMUX_PANE: "%99", pane: "%88", directory: "/work/wrong-terminal" } } } });
+  await h.complete("root");
+  await h.emit(permission("root", "asked"), failure("root"));
+  assert.ok(h.events.every((event) => event.session_dir === "/work/actual-project" && !("tmux_session" in event)));
+  assert.ok(h.calls.every((call) => call.command[0] === "agent-notify"));
+});
+
+test("canonical subprocess arguments, discarded output, ten-second deadline and advisory spawn/kill failures", async (t) => {
+  const stalled = deferred();
+  const h = createHarness(t, { delivery() { return stalled.promise; } });
+  await h.emit(permission("root", "asked"));
+  assert.deepEqual(h.calls[0].command, ["agent-notify", "event"]);
+  assert.deepEqual(h.events[0], { source: "opencode", event: "attention", session_id: "root", session_dir: "/work/root", request_id: "request" });
+  assert.equal(h.calls[0].options.stdout, "ignore");
+  assert.equal(h.calls[0].options.stderr, "ignore");
+  await h.scheduler.advanceBy(9999);
+  assert.equal(h.calls[0].kills, 0);
+  await h.scheduler.advanceBy(1);
+  assert.equal(h.calls[0].kills, 1);
+  const bad = createHarness(t, { delivery() { throw new Error("private spawn error"); } });
+  await bad.emit(permission("root", "asked"), permission("root", "asked", "second"));
+  assert.equal(bad.events.length, 2);
+});
+
+test("cleanup aborts stream, cancels pending context/lookup/queues, and terminates owned delivery", async (t) => {
+  const context = deferred();
+  const h = createHarness(t, { getContext() { return context.promise; } });
+  await h.complete("root");
+  h.cleanup();
+  context.resolve([assistant(text("late"))]);
+  await h.scheduler.advanceBy(1000);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  assert.deepEqual(h.scheduler.pending, []);
+  const lookup = deferred();
+  const l = createHarness(t, { getSession() { return lookup.promise; } });
+  await l.emit(execution("root", "started"));
+  l.cleanup();
+  lookup.resolve(session("root"));
+  await flush();
+  assert.deepEqual(l.events, []);
+  const delivery = deferred();
+  const d = createHarness(t, { delivery() { return delivery.promise; } });
+  await d.emit(permission("root", "asked"), permission("root", "asked", "queued"));
+  d.cleanup();
+  assert.equal(d.calls[0].kills, 1);
+  delivery.resolve(0);
+  await flush();
+  assert.equal(d.calls.length, 1);
+});
+
+test("stream failure/end cancels eligibility, is advisory, and fresh reload does not replay turns", async (t) => {
+  for (const error of [undefined, new Error("private stream failure")]) {
+    const h = createHarness(t);
+    await h.emit(execution("root", "started"));
+    await h.settle("root");
+    h.stream.end(error);
+    await flush();
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root"]);
+    assert.equal(h.stream.signal.aborted, true);
+    const fresh = createHarness(t);
+    await fresh.emit(execution("root", "succeeded"), status("root", "idle"));
+    await fresh.scheduler.advanceBy(50);
+    assert.deepEqual(fresh.events, []);
+  }
+});
+
+test("normalization reaches real subprocess stdin without shell interpolation", async (t) => {
+  const fixtureDirectory = await mkdtemp(join(tmpdir(), "agent-notify-stdin-"));
+  t.after(() => rm(fixtureDirectory, { force: true, recursive: true }));
   const notifier = join(fixtureDirectory, "notifier.mjs");
   const received = join(fixtureDirectory, "received.json");
   await writeFile(notifier, `#!/usr/bin/env node
@@ -804,1058 +915,50 @@ for await (const chunk of process.stdin) input += chunk;
 await writeFile(process.env.NOTIFIER_OUTPUT, input);
 `);
   await chmod(notifier, 0o700);
-  t.after(() => rm(fixtureDirectory, { force: true, recursive: true }));
-
-  const bunDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Bun");
-  Object.defineProperty(globalThis, "Bun", {
-    configurable: true,
-    value: {
-      spawn(_command, options) {
-      const child = spawnChild(notifier, [], {
-        env: { ...process.env, NOTIFIER_OUTPUT: received },
-        stdio: ["pipe", "ignore", "ignore"],
-      });
-      child.stdin.end(options.stdin);
-      return { exited: once(child, "exit"), kill: () => child.kill() };
-    },
-    },
-  });
-  t.after(() => {
-    if (bunDescriptor) Object.defineProperty(globalThis, "Bun", bunDescriptor);
-    else delete globalThis.Bun;
-  });
-  const { client } = createClient();
-  const adapter = await agentNotifyPlugin({ client });
-
-  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session-a", id: "request-a" } } });
-
-  assert.deepEqual(JSON.parse(await readFile(received, "utf8")), {
-    source: "opencode",
-    event: "attention",
-    session_id: "session-a",
-    session_dir: "/work/session-a",
-    request_id: "request-a",
-  });
+  const exited = deferred();
+  const h = createHarness(t, { delivery(event, call) {
+    const child = spawnChild(notifier, [], { env: { PATH: process.env.PATH, NOTIFIER_OUTPUT: received }, stdio: ["pipe", "ignore", "ignore"] });
+    child.stdin.end(call.options.stdin);
+    return once(child, "exit").then(() => exited.resolve());
+  } });
+  await h.emit(permission("root", "asked"));
+  await exited.promise;
+  assert.deepEqual(JSON.parse(await readFile(received, "utf8")), h.events[0]);
 });
 
-test("deduplicates busy, terminal errors, and idle events for one active turn", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("session-a", "busy") });
-  await adapter.event({ event: status("session-a", "busy") });
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "session-a", error: { name: "UnknownError" } } } });
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "session-a", error: { name: "UnknownError" } } } });
-  await adapter.event({ event: status("session-a", "idle") });
-  await adapter.event({ event: status("session-a", "idle") });
-
-  assert.deepEqual(submitted.map((event) => event.kind), ["began", "failed"]);
-});
-
-test("clears attention for only the exact session when a turn terminates", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "a", id: "request-a" } } });
-  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "a:similar", id: "request-a" } } });
-  await adapter.event({ event: status("a", "busy") });
-  await adapter.event({ event: status("a", "idle") });
-  await adapter.event({ event: { type: "permission.replied", properties: { sessionID: "a:similar", requestID: "request-a" } } });
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "attention", session_id: "a" },
-    { kind: "attention", session_id: "a:similar" },
-    { kind: "began", session_id: "a" },
-    { kind: "completed", session_id: "a" },
-    { kind: "attention-cleared", session_id: "a:similar" },
-  ]);
-});
-
-test("carries the tail of the root session's last assistant message on a completion", async () => {
-  const { client, messageRequests } = createClient({
-    messages: {
-      "session-a": [
-        { info: { role: "user" }, parts: [textPart("run the suite")] },
-        assistantMessage(textPart("All 14 tests pass.")),
-      ],
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("session-a", "busy") });
-  await adapter.event({ event: status("session-a", "idle") });
-
-  assert.deepEqual(submitted, [
-    { source: "opencode", kind: "began", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
-    { source: "opencode", kind: "completed", session_id: "session-a", session_dir: "/work/session-a", request_id: "", excerpt: "All 14 tests pass." },
-  ]);
-  assert.deepEqual(messageRequests, [{ path: { id: "session-a" }, query: { limit: 12 } }]);
-});
-
-test("takes a deferred root completion's excerpt from the root, never from a descendant", async () => {
-  const { client, messageRequests } = createClient({
-    sessions: {
-      root: { directory: "/work/root" },
-      child: { directory: "/work/child", parentID: "root" },
-    },
-    messages: {
-      root: [assistantMessage(textPart("A focused lifecycle review is still running."))],
-      child: [assistantMessage(textPart("Subagent internal report."))],
-    },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("child", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: status("child", "idle") });
-
-  // The excerpt predates the background work it was waiting on; that staleness is accepted.
-  assert.deepEqual(submitted.map(({ kind, session_id, excerpt }) => ({ kind, session_id, excerpt })), [
-    { kind: "began", session_id: "root", excerpt: undefined },
-    { kind: "completed", session_id: "root", excerpt: "A focused lifecycle review is still running." },
-  ]);
-  assert.deepEqual(messageRequests.map((request) => request.path.id), ["root"]);
-});
-
-test("selects only non-synthetic, non-ignored text parts of the most recent assistant message", async () => {
-  const cases = [
-    { parts: [textPart("hidden", { synthetic: true }), textPart("visible")], excerpt: "visible" },
-    { parts: [textPart("hidden", { ignored: true }), textPart("visible")], excerpt: "visible" },
-    { parts: [{ type: "reasoning", text: "thinking out loud" }], excerpt: undefined },
-    { parts: [textPart("only synthetic", { synthetic: true })], excerpt: undefined },
-    { parts: [textPart("   ")], excerpt: undefined },
-  ];
-
-  for (const [index, entry] of cases.entries()) {
-    const sessionID = `session-${index}`;
-    const { client } = createClient({
-      messages: {
-        [sessionID]: [
-          assistantMessage(textPart("an older assistant message")),
-          assistantMessage(...entry.parts),
-        ],
-      },
-    });
-    const submitted = [];
-    const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-    await adapter.event({ event: status(sessionID, "busy") });
-    await adapter.event({ event: status(sessionID, "idle") });
-
-    assert.equal(submitted[1].excerpt, entry.excerpt, `case ${index}`);
+test("two consecutive child failures remain deliverable through the unchanged notifier core", async (t) => {
+  const h = createHarness(t, { sessions: tree });
+  await h.emit(execution("root", "started"));
+  for (let index = 0; index < 2; index += 1) {
+    await h.emit(execution("child", "started"), status("child", "busy"), failure("child"), status("child", "idle"));
   }
-});
-
-test("treats both message-fetch failure modes as no excerpt available", async () => {
-  for (const getMessages of [() => { throw new Error("transport failure"); }, () => ({ data: undefined, error: {} })]) {
-    const { client } = createClient({ getMessages });
-    const submitted = [];
-    const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-    await adapter.event({ event: status("session-a", "busy") });
-    await adapter.event({ event: status("session-a", "idle") });
-
-    assert.deepEqual(submitted.map(({ kind, excerpt }) => ({ kind, excerpt })), [
-      { kind: "began", excerpt: undefined },
-      { kind: "completed", excerpt: undefined },
-    ]);
-  }
-});
-
-test("times out a stalled message fetch and submits an excerpt-free completion", async (t) => {
-  const scheduled = [];
-  const cleared = [];
-  const originalSetTimeout = globalThis.setTimeout;
-  const originalClearTimeout = globalThis.clearTimeout;
-  globalThis.setTimeout = (callback, delay) => {
-    const timer = { callback, delay };
-    scheduled.push(timer);
-    return timer;
-  };
-  globalThis.clearTimeout = (timer) => cleared.push(timer);
-  t.after(() => {
-    globalThis.setTimeout = originalSetTimeout;
-    globalThis.clearTimeout = originalClearTimeout;
-  });
-  let markMessagesRequested;
-  const messagesRequested = new Promise((resolve) => {
-    markMessagesRequested = resolve;
-  });
-  const { client } = createClient({
-    getMessages: () => {
-      markMessagesRequested();
-      return new Promise(() => {});
-    },
-  });
-  const submitted = [];
-  const scheduler = new FakeScheduler();
-  const adapter = await agentNotifyPluginFactory({
-    client,
-    submit: async (event) => submitted.push(event),
-    schedule: scheduler.schedule,
-    clear: scheduler.clear,
-  });
-
-  await adapter.event({ event: status("session-a", "busy") });
-  await adapter.event({ event: status("session-a", "idle") });
-  const completion = scheduler.advanceBy(50);
-  await messagesRequested;
-  assert.deepEqual(scheduled.map(({ delay }) => delay), [1_000]);
-  scheduled[0].callback();
-  await completion;
-
-  assert.deepEqual(submitted, [
-    { source: "opencode", kind: "began", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
-    { source: "opencode", kind: "completed", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
-  ]);
-  assert.deepEqual(cleared, scheduled);
-});
-
-test("carries the terminal error's message and falls back to its name", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "with-message", error: { name: "ProviderAuthError", data: { message: "invalid api key" } } } } });
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "without-message", error: { name: "MessageOutputLengthError" } } } });
-
-  assert.deepEqual(submitted.map(({ kind, excerpt }) => ({ kind, excerpt })), [
-    { kind: "failed", excerpt: "invalid api key" },
-    { kind: "failed", excerpt: "MessageOutputLengthError" },
-  ]);
-});
-
-test("drops only the excerpt when the encoded payload would exceed its transport bound", async (t) => {
-  const calls = [];
-  const bunDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Bun");
-  Object.defineProperty(globalThis, "Bun", {
-    configurable: true,
-    value: {
-      spawn(command, options) {
-        calls.push({ command, options });
-        return { exited: Promise.resolve(), kill() {} };
-      },
-    },
-  });
-  t.after(() => {
-    if (bunDescriptor) Object.defineProperty(globalThis, "Bun", bunDescriptor);
-    else delete globalThis.Bun;
-  });
-
-  const wide = "実".repeat(256);
-  const { client } = createClient({
-    sessions: { [wide]: { directory: `/${"実".repeat(255)}` } },
-    messages: { [wide]: [assistantMessage(textPart("完了".repeat(200)))] },
-  });
-  const adapter = await agentNotifyPlugin({ client });
-
-  await adapter.event({ event: status(wide, "busy") });
-  await adapter.event({ event: status(wide, "idle") });
-
-  const payloads = calls.map(({ options }) => JSON.parse(new TextDecoder().decode(options.stdin)));
-  assert.equal(payloads.length, 2);
-  assert.equal(payloads[1].event, "completed");
-  assert.equal(payloads[1].excerpt, undefined);
-});
-
-test("honours the excerpt setting per decision, including a change made mid-session", async (t) => {
-  t.after(() => rmSync(settingsFile, { force: true }));
-  const { client, messageRequests } = createClient({
-    messages: { "session-a": [assistantMessage(textPart("All 14 tests pass."))] },
-  });
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-  const completeOnce = async (sessionID) => {
-    await adapter.event({ event: status(sessionID, "busy") });
-    await adapter.event({ event: status(sessionID, "idle") });
-    return submitted.at(-1).excerpt;
-  };
-
-  rmSync(settingsFile, { force: true });
-  assert.equal(await completeOnce("session-a"), "All 14 tests pass.");
-  writeFileSync(settingsFile, "# agent-notify settings\nEXCERPT=1\n");
-  assert.equal(await completeOnce("session-a"), "All 14 tests pass.");
-  writeFileSync(settingsFile, "this file is not key=value at all\n");
-  assert.equal(await completeOnce("session-a"), "All 14 tests pass.");
-
-  const requestsBefore = messageRequests.length;
-  writeFileSync(settingsFile, "# agent-notify settings\nEXCERPT=0\n");
-  assert.equal(await completeOnce("session-a"), undefined);
-  // Disabled means the messages are never requested, not merely never forwarded.
-  assert.equal(messageRequests.length, requestsBefore);
-});
-
-test("produces the corpus excerpt for every sanitisation case", async () => {
-  for (const [index, entry] of corpus.cases.entries()) {
-    const sessionID = `corpus-${index}`;
-    const { client } = createClient({
-      messages: { [sessionID]: [assistantMessage(textPart(entry.input))] },
-    });
-    const submitted = [];
-    const adapter = await agentNotifyPlugin({ client, submit: async (event) => submitted.push(event) });
-
-    await adapter.event({ event: status(sessionID, "busy") });
-    await adapter.event({ event: status(sessionID, "idle") });
-
-    assert.equal(submitted[1].excerpt, entry.excerpt === "" ? undefined : entry.excerpt, entry.name);
-  }
-});
-
-test("runs adapter events through the canonical notifier subprocess contract", async (t) => {
-  const calls = [];
-  const bunDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Bun");
-  Object.defineProperty(globalThis, "Bun", {
-    configurable: true,
-    value: {
-      spawn(command, options) {
-      calls.push({ command, options });
-      return { exited: Promise.resolve(), kill() {} };
-    },
-    },
-  });
-  t.after(() => {
-    if (bunDescriptor) Object.defineProperty(globalThis, "Bun", bunDescriptor);
-    else delete globalThis.Bun;
-  });
-  const { client } = createClient();
-  const adapter = await agentNotifyPlugin({ client });
-
-  await adapter.event({ event: status("session-a", "busy") });
-  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session-a", id: "request-a" } } });
-
-  assert.deepEqual(calls.map(({ command, options }) => ({ command, stdin: JSON.parse(new TextDecoder().decode(options.stdin)) })), [
-    {
-      command: ["agent-notify", "event"],
-      stdin: { source: "opencode", event: "began", session_id: "session-a", session_dir: "/work/session-a", request_id: "" },
-    },
-    {
-      command: ["agent-notify", "event"],
-      stdin: { source: "opencode", event: "attention", session_id: "session-a", session_dir: "/work/session-a", request_id: "request-a" },
-    },
-  ]);
-});
-
-test("debounces a plain root completion and reuses its candidate for compatibility idle", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const scheduler = new FakeScheduler();
-  const adapter = await agentNotifyPluginFactory({
-    client,
-    submit: async (event) => submitted.push(event),
-    schedule: scheduler.schedule,
-    clear: scheduler.clear,
-  });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: { type: "session.idle", properties: { sessionID: "root" } } });
-  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
-  assert.equal(scheduler.timers.filter((timer) => !timer.cancelled).length, 1);
-
-  await scheduler.advanceBy(49);
-  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
-  await scheduler.advanceBy(1);
-  assert.deepEqual(submitted.map((event) => event.kind), ["began", "completed"]);
-});
-
-test("cancels a stale descendant-settlement candidate when the root resumes", async () => {
-  const { client } = createClient({
-    sessions: {
-      root: { directory: "/work/root" },
-      child: { directory: "/work/child", parentID: "root" },
-    },
-  });
-  const submitted = [];
-  const scheduler = new FakeScheduler();
-  const adapter = await agentNotifyPluginFactory({
-    client,
-    submit: async (event) => submitted.push(event),
-    schedule: scheduler.schedule,
-    clear: scheduler.clear,
-  });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("child", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: status("child", "idle") });
-  const stale = scheduler.timers.at(-1);
-  await adapter.event({ event: status("root", "busy") });
-  await scheduler.fireStale(stale);
-  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
-
-  await adapter.event({ event: status("root", "idle") });
-  await scheduler.advanceBy(50);
-  assert.deepEqual(submitted.map((event) => event.kind), ["began", "completed"]);
-});
-
-test("does not complete when the root becomes busy during deferred excerpt retrieval", async () => {
-  let resolveMessages;
-  const messagesRequested = new Promise((resolve) => {
-    resolveMessages = resolve;
-  });
-  const { client } = createClient({
-    getMessages() {
-      return messagesRequested;
-    },
-  });
-  const submitted = [];
-  const scheduler = new FakeScheduler();
-  const adapter = await agentNotifyPluginFactory({
-    client,
-    submit: async (event) => submitted.push(event),
-    schedule: scheduler.schedule,
-    clear: scheduler.clear,
-  });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  const completion = scheduler.advanceBy(50);
-  await Promise.resolve();
-  await adapter.event({ event: status("root", "busy") });
-  resolveMessages({ data: [] });
-  await completion;
-
-  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
-});
-
-test("cancels a root completion candidate when the root terminates", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const scheduler = new FakeScheduler();
-  const adapter = await agentNotifyPluginFactory({
-    client,
-    submit: async (event) => submitted.push(event),
-    schedule: scheduler.schedule,
-    clear: scheduler.clear,
-  });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  const stale = scheduler.timers.at(-1);
-  await adapter.event({ event: { type: "session.error", properties: { sessionID: "root", error: { name: "UnknownError" } } } });
-  await scheduler.fireStale(stale);
-
-  assert.deepEqual(submitted.map((event) => event.kind), ["began", "failed"]);
-});
-
-test("uses tracked-tree fallback after lookup failure before releasing the root", async () => {
-  let rootLookupFails = false;
-  const sessions = {
-    root: { directory: "/work/root" },
-    child: { directory: "/work/child", parentID: "root" },
-  };
-  const { client } = createClient({
-    getSession(sessionID) {
-      if (sessionID === "root" && rootLookupFails) throw new Error("unavailable");
-      return { data: sessions[sessionID] };
-    },
-  });
-  const submitted = [];
-  const scheduler = new FakeScheduler();
-  const adapter = await agentNotifyPluginFactory({
-    client,
-    submit: async (event) => submitted.push(event),
-    schedule: scheduler.schedule,
-    clear: scheduler.clear,
-  });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("child", "busy") });
-  rootLookupFails = true;
-  await adapter.event({ event: status("root", "idle") });
-  rootLookupFails = false;
-  await adapter.event({ event: status("child", "idle") });
-
-  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
-  assert.equal(scheduler.timers.filter((timer) => !timer.cancelled && !timer.fired).length, 1);
-  await scheduler.advanceBy(50);
-
-  assert.deepEqual(submitted.map(({ kind, session_id }) => ({ kind, session_id })), [
-    { kind: "began", session_id: "root" },
-    { kind: "completed", session_id: "root" },
-  ]);
-});
-
-test("cancels a known root candidate before a deferred busy lookup resolves", async () => {
-  let deferLookup = false;
-  let resolveLookup;
-  const lookup = new Promise((resolve) => {
-    resolveLookup = resolve;
-  });
-  const sessions = { root: { directory: "/work/root" } };
-  const { client } = createClient({
-    getSession(sessionID) {
-      return deferLookup ? lookup : { data: sessions[sessionID] };
-    },
-  });
-  const submitted = [];
-  const scheduler = new FakeScheduler();
-  const adapter = await agentNotifyPluginFactory({
-    client,
-    submit: async (event) => submitted.push(event),
-    schedule: scheduler.schedule,
-    clear: scheduler.clear,
-  });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  const stale = scheduler.timers.at(-1);
-  deferLookup = true;
-  const resumed = adapter.event({ event: status("root", "busy") });
-
-  assert.equal(stale.cancelled, true);
-  await scheduler.fireStale(stale);
-  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
-  resolveLookup({ data: sessions.root });
-  await resumed;
-  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
-
-  deferLookup = false;
-  await adapter.event({ event: status("root", "idle") });
-  await scheduler.advanceBy(50);
-  assert.deepEqual(submitted.map((event) => event.kind), ["began", "completed"]);
-});
-
-test("cancels a known descendant retry candidate before its deferred lookup resolves", async () => {
-  let deferLookup = false;
-  let resolveLookup;
-  const lookup = new Promise((resolve) => {
-    resolveLookup = resolve;
-  });
-  const sessions = {
-    root: { directory: "/work/root" },
-    child: { directory: "/work/child", parentID: "root" },
-  };
-  const { client } = createClient({
-    getSession(sessionID) {
-      return deferLookup ? lookup : { data: sessions[sessionID] };
-    },
-  });
-  const submitted = [];
-  const scheduler = new FakeScheduler();
-  const adapter = await agentNotifyPluginFactory({
-    client,
-    submit: async (event) => submitted.push(event),
-    schedule: scheduler.schedule,
-    clear: scheduler.clear,
-  });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("child", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: status("child", "idle") });
-  const stale = scheduler.timers.at(-1);
-  deferLookup = true;
-  const retried = adapter.event({ event: retryStatus("child", 1) });
-
-  assert.equal(stale.cancelled, true);
-  await scheduler.fireStale(stale);
-  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
-  resolveLookup({ data: sessions.child });
-  await retried;
-
-  deferLookup = false;
-  await adapter.event({ event: status("child", "idle") });
-  await scheduler.advanceBy(50);
-  assert.deepEqual(submitted.map((event) => event.kind), ["began", "completed"]);
-});
-
-test("cancels a known descendant candidate before its deferred terminal lookup resolves", async () => {
-  let deferLookup = false;
-  let resolveLookup;
-  const lookup = new Promise((resolve) => {
-    resolveLookup = resolve;
-  });
-  const sessions = {
-    root: { directory: "/work/root" },
-    child: { directory: "/work/child", parentID: "root" },
-  };
-  const { client } = createClient({
-    getSession(sessionID) {
-      return deferLookup ? lookup : { data: sessions[sessionID] };
-    },
-  });
-  const submitted = [];
-  const scheduler = new FakeScheduler();
-  const adapter = await agentNotifyPluginFactory({
-    client,
-    submit: async (event) => submitted.push(event),
-    schedule: scheduler.schedule,
-    clear: scheduler.clear,
-  });
-
-  await adapter.event({ event: status("root", "busy") });
-  await adapter.event({ event: status("child", "busy") });
-  await adapter.event({ event: status("root", "idle") });
-  await adapter.event({ event: status("child", "idle") });
-  const stale = scheduler.timers.at(-1);
-  deferLookup = true;
-  const failed = adapter.event({ event: { type: "session.error", properties: { sessionID: "child", error: { name: "UnknownError" } } } });
-
-  assert.equal(stale.cancelled, true);
-  await scheduler.fireStale(stale);
-  assert.deepEqual(submitted.map((event) => event.kind), ["began"]);
-  resolveLookup({ data: sessions.child });
-  await failed;
-  assert.deepEqual(submitted.map((event) => event.kind), ["began", "failed"]);
-
-  await scheduler.advanceBy(50);
-  assert.deepEqual(submitted.map((event) => event.kind), ["began", "failed", "completed"]);
-});
-
-test("discovers one absolute tmux executable and gates pane-targeted lookups to notification kinds", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const environment = { TMUX: "tmux-environment-marker", TMUX_PANE: "%42" };
-  const calls = [];
-  let discoveries = 0;
-  const child = tmuxChild({ chunks: [new TextEncoder().encode("team/api\n")] });
-  const adapter = await agentNotifyPlugin({
-    client,
-    submit: async (event) => submitted.push(event),
-    environment,
-    which(command) {
-      discoveries += 1;
-      assert.equal(command, "tmux");
-      return "/private path/tmux executable";
-    },
-    tmuxSpawn(command, options) {
-      calls.push({ command, options });
-      return child.child;
-    },
-  });
-
-  assert.equal(discoveries, 1);
-  await adapter.event({ event: status("session-a", "busy") });
-  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session-a", id: "request-a" } } });
-  await adapter.event({ event: { type: "permission.replied", properties: { sessionID: "session-a", requestID: "request-a" } } });
-  environment.TMUX_PANE = "not-a-pane";
-  await adapter.event({ event: { type: "question.asked", properties: { sessionID: "session-a", id: "request-b" } } });
-
-  assert.deepEqual(calls, [{
-    command: ["/private path/tmux executable", "display-message", "-p", "-t", "%42", "#S"],
-    options: { stdout: "pipe", stderr: "ignore" },
-  }]);
-  assert.deepEqual(submitted.map(({ kind, tmux_session }) => ({ kind, tmux_session })), [
-    { kind: "began", tmux_session: undefined },
-    { kind: "attention", tmux_session: "team/api" },
-    { kind: "attention-cleared", tmux_session: undefined },
-    { kind: "attention", tmux_session: undefined },
-  ]);
-
-  const relativeSubmitted = [];
-  const relativeAdapter = await agentNotifyPlugin({
-    client: createClient().client,
-    submit: async (event) => relativeSubmitted.push(event),
-    environment: { TMUX: "present", TMUX_PANE: "%1" },
-    which: () => "tmux",
-    tmuxSpawn() { throw new Error("relative executable must not run"); },
-  });
-  await relativeAdapter.event({ event: { type: "permission.asked", properties: { sessionID: "relative", id: "request" } } });
-  assert.equal(relativeSubmitted[0].tmux_session, undefined);
-});
-
-test("fails open without leaking rejected tmux inputs or process failures", async () => {
-  const rejected = [
-    { name: "nonzero", chunks: [new TextEncoder().encode("stdout-marker\n")], exit: 1 },
-    { name: "malformed UTF-8", chunks: [new Uint8Array([0xc3, 0x28])] },
-    { name: "multiline", chunks: [new TextEncoder().encode("stdout-marker\nnext")] },
-    { name: "C0", chunks: [new TextEncoder().encode("stdout-marker\u0001")] },
-    { name: "DEL", chunks: [new TextEncoder().encode("stdout-marker\u007f")] },
-    { name: "empty", chunks: [] },
-  ];
-
-  for (const entry of rejected) {
-    const { client } = createClient();
-    const submitted = [];
-    const adapter = await agentNotifyPlugin({
-      client,
-      submit: async (event) => submitted.push(event),
-      environment: { TMUX: "tmux-environment-marker", TMUX_PANE: "%999" },
-      which: () => "/private executable-marker/tmux path",
-      tmuxSpawn: () => {
-        const child = tmuxChild(entry).child;
-        child.stderr = new TextEncoder().encode("stderr-marker");
-        return child;
-      },
-    });
-    await adapter.event({ event: { type: "permission.asked", properties: { sessionID: entry.name, id: "request" } } });
-
-    assert.equal(submitted[0].tmux_session, undefined, entry.name);
-    assert.doesNotMatch(JSON.stringify(submitted), /tmux-environment-marker|999|executable-marker|stdout-marker|stderr-marker/);
-  }
-
-  const { client } = createClient();
-  const submitted = [];
-  const adapter = await agentNotifyPlugin({
-    client,
-    submit: async (event) => submitted.push(event),
-    environment: { TMUX: "tmux-environment-marker", TMUX_PANE: "%999" },
-    which: () => "/private executable-marker/tmux path",
-    tmuxSpawn() { throw new Error("command-error-marker"); },
-  });
-  await adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session", id: "request" } } });
-  assert.equal(submitted[0].tmux_session, undefined);
-  assert.doesNotMatch(JSON.stringify(submitted), /tmux-environment-marker|999|executable-marker|command-error-marker/);
-});
-
-test("suppresses pane lookup for an empty TMUX marker and a pane longer than 255 digits", async () => {
-  const cases = [
-    { name: "empty TMUX", environment: { TMUX: "", TMUX_PANE: "%1" }, expectedCalls: 0 },
-    { name: "255 pane digits", environment: { TMUX: "present", TMUX_PANE: `%${"9".repeat(255)}` }, expectedCalls: 1 },
-    { name: "256 pane digits", environment: { TMUX: "present", TMUX_PANE: `%${"9".repeat(256)}` }, expectedCalls: 0 },
-  ];
-
-  for (const entry of cases) {
-    const { client } = createClient();
-    const submitted = [];
-    const calls = [];
-    const adapter = await agentNotifyPlugin({
-      client,
-      submit: async (event) => submitted.push(event),
-      environment: entry.environment,
-      which: () => "/tmp/tmux",
-      tmuxSpawn(command) {
-        calls.push(command);
-        return tmuxChild({ chunks: [new TextEncoder().encode("session-name\n")] }).child;
-      },
-    });
-
-    await adapter.event({ event: { type: "permission.asked", properties: { sessionID: entry.name, id: "request" } } });
-
-    assert.equal(calls.length, entry.expectedCalls, entry.name);
-    assert.equal(submitted[0].tmux_session, entry.expectedCalls ? "session-name" : undefined, entry.name);
-  }
-});
-
-test("omits whitespace-only and overlong tmux stdout without treating it as context", async () => {
-  const cases = [
-    { name: "whitespace", output: "  \n" },
-    { name: "257 UTF-16 units", output: "a".repeat(257) },
-  ];
-
-  for (const entry of cases) {
-    const submitted = [];
-    const adapter = await agentNotifyPlugin({
-      client: createClient().client,
-      submit: async (event) => submitted.push(event),
-      environment: { TMUX: "present", TMUX_PANE: "%1" },
-      which: () => "/tmp/tmux",
-      tmuxSpawn: () => tmuxChild({ chunks: [new TextEncoder().encode(entry.output)] }).child,
-    });
-
-    await adapter.event({ event: { type: "permission.asked", properties: { sessionID: entry.name, id: "request" } } });
-
-    assert.equal(submitted[0].tmux_session, undefined, entry.name);
-    assert.doesNotMatch(JSON.stringify(submitted), /session-name|a{257}/, entry.name);
-  }
-});
-
-test("allows exactly 1,024 tmux stdout bytes to finish normally but rejects 1,025 bytes", async () => {
-  const exact = controlledTmuxChild({ chunks: [new Uint8Array(1_024).fill(0x61)] });
-  const overflow = controlledTmuxChild({
-    chunks: [new Uint8Array(1_025).fill(0x61), new TextEncoder().encode("overflow-late-marker\n")],
-  });
-  const results = [];
-
-  for (const [name, fixture] of [["exact", exact], ["overflow", overflow]]) {
-    const submitted = [];
-    const adapter = await agentNotifyPlugin({
-      client: createClient().client,
-      submit: async (event) => submitted.push(event),
-      environment: { TMUX: "present", TMUX_PANE: "%1" },
-      which: () => "/tmp/tmux",
-      tmuxSpawn: () => fixture.child,
-    });
-    await adapter.event({ event: { type: "permission.asked", properties: { sessionID: name, id: "request" } } });
-    results.push({ submitted, fixture });
-  }
-
-  assert.equal(results[0].fixture.killed, false);
-  assert.equal(results[0].fixture.returnCalls, 0);
-  assert.equal(results[0].submitted[0].tmux_session, undefined);
-  assert.equal(results[1].fixture.killed, true);
-  assert.equal(results[1].fixture.returnCalls, 1);
-  assert.equal(results[1].submitted[0].tmux_session, undefined);
-  assert.doesNotMatch(JSON.stringify(results[1].submitted), /overflow-late-marker/);
-});
-
-test("cannot accept or leak tmux output delivered after its deadline", async () => {
-  const submitted = [];
-  const late = deferredTmuxChild();
-  let deadline;
-  const adapter = await agentNotifyPlugin({
-    client: createClient().client,
-    submit: async (event) => submitted.push(event),
-    environment: { TMUX: "present", TMUX_PANE: "%1" },
-    which: () => "/tmp/tmux",
-    tmuxSpawn: () => late.child,
-    tmuxSetTimeout(callback, delay) {
-      assert.equal(delay, 500);
-      deadline = callback;
-      return {};
-    },
-    tmuxClearTimeout() {},
-  });
-
-  const pending = adapter.event({ event: { type: "permission.asked", properties: { sessionID: "deadline", id: "request" } } });
-  await Promise.resolve();
-  await Promise.resolve();
-  deadline();
-  await pending;
-  late.release("deadline-late-marker\n");
-  await Promise.resolve();
-  await Promise.resolve();
-
-  assert.equal(late.killed, true);
-  assert.equal(submitted[0].tmux_session, undefined);
-  assert.doesNotMatch(JSON.stringify(submitted), /deadline-late-marker/);
-});
-
-test("terminates tmux lookups on the 500 ms deadline and 1,024-byte overflow", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const hanging = controlledTmuxChild({ stalled: true });
-  let deadline;
-  const adapter = await agentNotifyPluginFactory({
-    client,
-    submit: async (event) => submitted.push(event),
-    environment: { TMUX: "present", TMUX_PANE: "%1" },
-    which: () => "/tmp/tmux",
-    tmuxSpawn: () => hanging.child,
-    tmuxSetTimeout(callback, delay) {
-      assert.equal(delay, 500);
-      deadline = callback;
-      return { delay };
-    },
-    tmuxClearTimeout() {},
-  });
-  const pending = adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session", id: "request" } } });
-  await Promise.resolve();
-  await Promise.resolve();
-  deadline();
-  await pending;
-
-  assert.equal(hanging.killed, true);
-  assert.equal(hanging.returnCalls, 1);
-  assert.equal(submitted[0].tmux_session, undefined);
-
-  const overflow = controlledTmuxChild({ chunks: [new Uint8Array(1_025)] });
-  const overflowSubmitted = [];
-  const overflowAdapter = await agentNotifyPlugin({
-    client: createClient().client,
-    submit: async (event) => overflowSubmitted.push(event),
-    environment: { TMUX: "present", TMUX_PANE: "%1" },
-    which: () => "/tmp/tmux",
-    tmuxSpawn: () => overflow.child,
-  });
-  await overflowAdapter.event({ event: { type: "permission.asked", properties: { sessionID: "overflow", id: "request" } } });
-
-  assert.equal(overflow.killed, true);
-  assert.equal(overflow.returnCalls, 1);
-  assert.equal(overflowSubmitted[0].tmux_session, undefined);
-});
-
-test("keeps same-session attention submissions FIFO while tmux lookup is pending", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const tmux = deferredTmuxChild();
-  let started;
-  const lookupStarted = new Promise((resolve) => { started = resolve; });
-  const adapter = await agentNotifyPluginFactory({
-    client,
-    submit: async (event) => submitted.push(event),
-    environment: { TMUX: "present", TMUX_PANE: "%1" },
-    which: () => "/tmp/tmux",
-    tmuxSpawn() {
-      started();
-      return tmux.child;
-    },
-  });
-
-  const asked = adapter.event({ event: { type: "permission.asked", properties: { sessionID: "session", id: "request" } } });
-  await lookupStarted;
-  const replied = adapter.event({ event: { type: "permission.replied", properties: { sessionID: "session", requestID: "request" } } });
-  await Promise.resolve();
-  await Promise.resolve();
-  assert.deepEqual(submitted, []);
-
-  tmux.release("ordered-name\n");
-  await Promise.all([asked, replied]);
-  assert.deepEqual(submitted.map(({ kind, tmux_session }) => ({ kind, tmux_session })), [
-    { kind: "attention", tmux_session: "ordered-name" },
-    { kind: "attention-cleared", tmux_session: undefined },
-  ]);
-});
-
-test("finishes failed-tree bookkeeping before a pending tmux notification", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const scheduler = new FakeScheduler();
-  const tmux = deferredTmuxChild();
-  let spawnCount = 0;
-  let started;
-  const lookupStarted = new Promise((resolve) => { started = resolve; });
-  const adapter = await agentNotifyPluginFactory({
-    client,
-    submit: async (event) => submitted.push(event),
-    schedule: scheduler.schedule,
-    clear: scheduler.clear,
-    environment: { TMUX: "present", TMUX_PANE: "%1" },
-    which: () => "/tmp/tmux",
-    tmuxSpawn() {
-      spawnCount += 1;
-      if (spawnCount === 1) {
-        started();
-        return tmux.child;
-      }
-      return tmuxChild().child;
-    },
-  });
-
-  await adapter.event({ event: status("root", "busy") });
-  const failed = adapter.event({ event: { type: "session.error", properties: { sessionID: "root", error: { name: "UnknownError" } } } });
-  await lookupStarted;
-  const restarted = adapter.event({ event: status("root", "busy") });
-  await Promise.resolve();
-  await Promise.resolve();
-  const settled = adapter.event({ event: status("root", "idle") });
-  await settled;
-
-  tmux.release("failed-name\n");
-  await Promise.all([failed, restarted]);
-  await scheduler.advanceBy(50);
-  assert.deepEqual(submitted.map((event) => event.kind), ["began", "failed", "began", "completed"]);
-});
-
-test("uses fresh emission-local tmux results for concurrent and renamed panes", async () => {
-  const { client } = createClient();
-  const submitted = [];
-  const environment = { TMUX: "present", TMUX_PANE: "%1" };
-  const first = deferredTmuxChild();
-  const second = deferredTmuxChild();
-  const calls = [];
-  let announceFirst;
-  let announceSecond;
-  const firstStarted = new Promise((resolve) => { announceFirst = resolve; });
-  const secondStarted = new Promise((resolve) => { announceSecond = resolve; });
-  const adapter = await agentNotifyPluginFactory({
-    client,
-    submit: async (event) => submitted.push(event),
-    environment,
-    which: () => "/tmp/tmux",
-    tmuxSpawn(command) {
-      calls.push(command);
-      if (calls.length === 1) {
-        announceFirst();
-        return first.child;
-      }
-      announceSecond();
-      return second.child;
-    },
-  });
-
-  const firstEvent = adapter.event({ event: { type: "permission.asked", properties: { sessionID: "first", id: "first" } } });
-  await firstStarted;
-  environment.TMUX_PANE = "%2";
-  const secondEvent = adapter.event({ event: { type: "permission.asked", properties: { sessionID: "second", id: "second" } } });
-  await secondStarted;
-  second.release("second-name\n");
-  await secondEvent;
-  first.release("first-name\n");
-  await firstEvent;
-
-  assert.deepEqual(calls, [
-    ["/tmp/tmux", "display-message", "-p", "-t", "%1", "#S"],
-    ["/tmp/tmux", "display-message", "-p", "-t", "%2", "#S"],
-  ]);
-  assert.deepEqual(submitted.map(({ session_id, tmux_session }) => ({ session_id, tmux_session })), [
-    { session_id: "second", tmux_session: "second-name" },
-    { session_id: "first", tmux_session: "first-name" },
-  ]);
-
-  const renamed = [];
-  const renameAdapter = await agentNotifyPlugin({
-    client: createClient().client,
-    submit: async (event) => renamed.push(event),
-    environment: { TMUX: "present", TMUX_PANE: "%3" },
-    which: () => "/tmp/tmux",
-    tmuxSpawn: (() => {
-      const names = ["before-rename\n", "after-rename\n"];
-      return () => tmuxChild({ chunks: [new TextEncoder().encode(names.shift())] }).child;
-    })(),
-  });
-  await renameAdapter.event({ event: { type: "permission.asked", properties: { sessionID: "rename", id: "one" } } });
-  await renameAdapter.event({ event: { type: "question.asked", properties: { sessionID: "rename", id: "two" } } });
-  assert.deepEqual(renamed.map((event) => event.tmux_session), ["before-rename", "after-rename"]);
-});
-
-test("drops tmux context before excerpts at the OpenCode payload bound", async (t) => {
-  const calls = [];
-  const bunDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Bun");
-  Object.defineProperty(globalThis, "Bun", {
-    configurable: true,
-    value: {
-      spawn(command, options) {
-        calls.push({ command, options });
-        return { exited: Promise.resolve(), kill() {} };
-      },
-    },
-  });
-  t.after(() => {
-    if (bunDescriptor) Object.defineProperty(globalThis, "Bun", bunDescriptor);
-    else delete globalThis.Bun;
-  });
-
-  const wide = "実".repeat(256);
-  const directory = `/${"実".repeat(255)}`;
-  const tmuxSpawn = () => tmuxChild({ chunks: [new TextEncoder().encode("t".repeat(256))] }).child;
-  const environment = { TMUX: "present", TMUX_PANE: "%1" };
-
-  const excerptFits = createClient({
-    sessions: { [wide]: { directory } },
-    messages: { [wide]: [assistantMessage(textPart("x".repeat(199)))] },
-  });
-  const adapter = await agentNotifyPlugin({
-    client: excerptFits.client,
-    environment,
-    which: () => "/tmp/tmux",
-    tmuxSpawn,
-  });
-  await adapter.event({ event: status(wide, "busy") });
-  await adapter.event({ event: status(wide, "idle") });
-  const retainedExcerpt = JSON.parse(new TextDecoder().decode(calls.at(-1).options.stdin));
-  assert.equal(retainedExcerpt.tmux_session, undefined);
-  assert.equal(retainedExcerpt.excerpt, "x".repeat(199));
-
-  calls.length = 0;
-  const excerptTooLarge = createClient({
-    sessions: { [wide]: { directory } },
-    messages: { [wide]: [assistantMessage(textPart("😀".repeat(120)))] },
-  });
-  const oversizedExcerptAdapter = await agentNotifyPlugin({
-    client: excerptTooLarge.client,
-    environment,
-    which: () => "/tmp/tmux",
-    tmuxSpawn,
-  });
-  await oversizedExcerptAdapter.event({ event: status(wide, "busy") });
-  await oversizedExcerptAdapter.event({ event: status(wide, "idle") });
-  const baseOnly = JSON.parse(new TextDecoder().decode(calls.at(-1).options.stdin));
-  assert.equal(baseOnly.tmux_session, undefined);
-  assert.equal(baseOnly.excerpt, undefined);
-
-  calls.length = 0;
-  const baseOversized = createClient({ sessions: { [wide]: { directory } } });
-  const baseOversizedAdapter = await agentNotifyPlugin({ client: baseOversized.client });
-  await baseOversizedAdapter.event({
-    event: { type: "permission.asked", properties: { sessionID: wide, id: wide } },
-  });
-  assert.deepEqual(calls, []);
+  const fixture = await mkdtemp(join(tmpdir(), "agent-notify-child-core-"));
+  t.after(() => rm(fixture, { force: true, recursive: true }));
+  const inputs = join(fixture, "events.jsonl");
+  await writeFile(inputs, h.events.map((event) => JSON.stringify(event)).join("\n") + "\n");
+  const script = join(fixture, "check.zsh");
+  await writeFile(script, `emulate -R zsh
+setopt errexit no_unset pipe_fail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export HOME=$1/home AGENT_NOTIFY_STATE_DIR=$1/state AGENT_NOTIFY_DIAGNOSTIC_DIR=$1/diagnostics
+export AGENT_NOTIFY_MIN_RUNTIME_SECONDS=30 AGENT_NOTIFY_ATTENTION_DEBOUNCE_SECONDS=60
+source "$2/lib/agent-notify/config.zsh"
+source "$2/lib/agent-notify/json.zsh"
+source "$2/lib/agent-notify/state.zsh"
+source "$2/lib/agent-notify/delivery.zsh"
+source "$2/lib/agent-notify/event.zsh"
+integer deliveries=0
+agent_notify_diag() { :; }
+agent_notify_deliver() { (( deliveries++ )); return 0; }
+integer now=100
+while IFS= read -r event; do
+  AGENT_NOTIFY_NOW=$now agent_notify_event <<< "$event"
+  (( now += 100 ))
+done < "$1/events.jsonl"
+[[ $deliveries == 2 ]]
+`);
+  const root = new URL("../../", import.meta.url).pathname;
+  const child = spawnChild("/bin/zsh", [script, fixture, root], { stdio: "ignore" });
+  const [code] = await once(child, "exit");
+  assert.equal(code, 0, "child-only resets must clear terminal suppression without modifying notifier core");
 });

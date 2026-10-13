@@ -23,10 +23,11 @@ function writeText(path, text) {
 
 try {
   let source = readText(sourcePath);
-  if (!source.includes('binary = "agent-notify"')) throw new Error('unrecognized OpenCode binary template');
-  if (!source.includes('spawn([binary, "event"], {')) throw new Error('OpenCode template does not invoke the event subcommand');
+  if (!/\bexport\s+default\b/.test(source) || !/\bid:\s*["']agent-notify["']/.test(source) || !/\bsetup\s*[:(]/.test(source) || !/\bevent\.subscribe\s*\(/.test(source)) throw new Error('unrecognized native OpenCode definition');
+  const invocation = 'spawn(["agent-notify", "event"], {';
+  if (!source.includes(invocation)) throw new Error('unrecognized OpenCode event invocation template');
   if (!source.includes('session_dir') || !source.includes('request_id')) throw new Error('OpenCode template does not use the normalized event contract');
-  source = source.replace('binary = "agent-notify"', `binary = ${JSON.stringify(notifierPath)}`);
+  source = source.replace(invocation, `spawn([${JSON.stringify(notifierPath)}, "event"], {`);
   writeText(outputPath, `// >>> agent-notify managed plugin >>>\n${source}`);
 } catch (error) {
   throw error;

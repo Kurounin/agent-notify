@@ -1,10 +1,38 @@
-# Tested compatibility policy. Installation will invoke these checks before mutation.
+# Compatibility policy. Installation invokes these checks before mutation.
+# OpenCode 2.0.27 is the verification baseline, not a claim of runtime verification.
 typeset -gr AGENT_NOTIFY_MACOS_MIN_MAJOR=13
-typeset -gr AGENT_NOTIFY_MACOS_MAX_MAJOR=26
+typeset -gr AGENT_NOTIFY_MACOS_MAX_MAJOR=27
 typeset -gr AGENT_NOTIFY_CLAUDE_CODE_MIN_VERSION='1.0.0'
 typeset -gr AGENT_NOTIFY_CLAUDE_CODE_MAX_VERSION='3.0.0'
-typeset -gr AGENT_NOTIFY_OPEN_CODE_MIN_VERSION='1.0.0'
-typeset -gr AGENT_NOTIFY_OPEN_CODE_MAX_VERSION='2.0.0'
+typeset -gr AGENT_NOTIFY_OPEN_CODE_MIN_VERSION='2.0.27'
+typeset -gr AGENT_NOTIFY_OPEN_CODE_MAX_VERSION='2.1.0'
+
+agent_notify_opencode_version_token() {
+  local output=$1
+  [[ $output =~ '^(opencode[[:blank:]]+)?(v?[0-9]+\.[0-9]+\.[0-9]+)$' ]] || return 1
+  REPLY=$match[2]
+}
+
+agent_notify_opencode_version_in_range() {
+  local value=${1#v} index lower=0 upper=0
+  local -a parts minimum maximum
+  parts=(${(s:.:)value})
+  minimum=(${(s:.:)AGENT_NOTIFY_OPEN_CODE_MIN_VERSION})
+  maximum=(${(s:.:)AGENT_NOTIFY_OPEN_CODE_MAX_VERSION})
+  # Compare components, not packed numbers: 1.1000.27 must not alias 2.0.27,
+  # and later 2.0 patches must not carry into the excluded 2.1 line.
+  for index in 1 2 3; do
+    if (( lower == 0 )); then
+      (( 10#$parts[$index] < 10#$minimum[$index] )) && lower=-1
+      (( 10#$parts[$index] > 10#$minimum[$index] )) && lower=1
+    fi
+    if (( upper == 0 )); then
+      (( 10#$parts[$index] < 10#$maximum[$index] )) && upper=-1
+      (( 10#$parts[$index] > 10#$maximum[$index] )) && upper=1
+    fi
+  done
+  (( lower >= 0 && upper < 0 ))
+}
 
 agent_notify_version_number() {
   local value=${1#v} major minor patch
@@ -39,7 +67,8 @@ agent_notify_validate_version() {
       agent_notify_version_in_range "$value" "$AGENT_NOTIFY_CLAUDE_CODE_MIN_VERSION" "$AGENT_NOTIFY_CLAUDE_CODE_MAX_VERSION"
       ;;
     opencode)
-      agent_notify_version_in_range "$value" "$AGENT_NOTIFY_OPEN_CODE_MIN_VERSION" "$AGENT_NOTIFY_OPEN_CODE_MAX_VERSION"
+      agent_notify_opencode_version_token "$value" || return 1
+      agent_notify_opencode_version_in_range "$REPLY"
       ;;
     *) return 2 ;;
   esac

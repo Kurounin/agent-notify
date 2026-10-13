@@ -34,7 +34,7 @@ assert_equals() {
   [[ $1 == "$2" ]] || { print -u2 -- "expected '$2', got '$1'"; exit 1; }
 }
 
-assert_equals "$AGENT_NOTIFY_OPEN_CODE_ATTENTION_FAMILY" 'permission.asked/replied and question.asked/replied/rejected'
+assert_equals "$AGENT_NOTIFY_OPEN_CODE_ATTENTION_FAMILY" 'permission.asked/replied and form.created/replied/cancelled'
 
 send_event() {
   local now=$1 fixture=$2
@@ -78,7 +78,7 @@ assert_equals "$(agent_notify_display_context '' '/tmp/   ')" 'Unknown project'
 typeset deliveries_before_dropped_tmux=$deliveries
 integer dropped_tmux_index=0
 for tmux_session in '' "$oversized_tmux_session" 'c0-marker\u0001' 'del-marker\u007f'; do
-  (( dropped_tmux_index++ ))
+  (( ++dropped_tmux_index ))
   print -rn -- "{\"source\":\"claude-code\",\"kind\":\"began\",\"session_id\":\"tmux-dropped-$dropped_tmux_index\",\"session_dir\":\"/tmp/project\"}" | AGENT_NOTIFY_NOW=$(( 1000 + dropped_tmux_index * 100 )) agent_notify_event
   print -rn -- "{\"source\":\"claude-code\",\"kind\":\"completed\",\"session_id\":\"tmux-dropped-$dropped_tmux_index\",\"session_dir\":\"/tmp/project\",\"tmux_session\":\"$tmux_session\"}" | AGENT_NOTIFY_NOW=$(( 1030 + dropped_tmux_index * 100 )) agent_notify_event
   assert_equals "$last_delivery_context" 'project'

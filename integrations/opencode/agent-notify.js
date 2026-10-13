@@ -1,5 +1,4 @@
 import { readFileSync } from "node:fs";
-import { isAbsolute } from "node:path";
 
 const SOURCE = "opencode";
 const MAX_IDENTIFIER_LENGTH = 256;
@@ -10,205 +9,61 @@ const MAX_PAYLOAD_BYTES = 2048;
 const MESSAGE_FETCH_LIMIT = 12;
 const MESSAGE_FETCH_TIMEOUT_MS = 1_000;
 const SUBPROCESS_OUTER_TIMEOUT_MS = 10_000;
-const TMUX_LOOKUP_TIMEOUT_MS = 500;
-const TMUX_STDOUT_MAX_BYTES = 1_024;
 const ROOT_QUIESCENCE_MS = 50;
 const EXCERPT_TRUNCATION_MARKER = "…";
 const EXCERPT_CODE_MARKER = "[code]";
 const SETTINGS_RELATIVE_PATH = "/Library/Application Support/agent-notify/settings.conf";
 const EXCERPT_DISABLED = /^[ \t]*EXCERPT[ \t]*=[ \t]*0[ \t]*$/m;
-// Escape payloads go before ESC itself becomes a deletable control character, and line breaks
-// become spaces before the remaining control characters are deleted, or their text runs together.
+// Remove escape payloads before ESC itself; replace line breaks before deleting controls.
 const ANSI_ESCAPE = /\x1b\][\s\S]*?(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -\/]*[@-~]|\x1b[@-Z\\-_]/g;
 const LINE_BREAK = new RegExp("[\\u000a\\u000b\\u000c\\u000d\\u0085\\u2028\\u2029]", "g");
 const CONTROL = /[\x00-\x1f\x7f-\x9f]/g;
-// Bidirectional and zero-width formatting can rewrite how the notification renders. ZWJ and VS16
-// stay because removing them breaks emoji.
+// Preserve ZWJ and VS16: removing them breaks emoji graphemes.
 const INVISIBLE = new RegExp("[\\u061c\\u200b\\u200c\\u200e\\u200f\\u202a-\\u202e\\u2066-\\u2069\\ufeff]", "g");
 const CODE_FENCE = /```[\s\S]*?```/g;
 const BACKTICKS = /`+/g;
 const EXCERPT_REJECTED = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f\\u2028\\u2029]");
-const NORMALIZED_EVENT_KINDS = new Set([
-  "began",
-  "attention",
-  "attention-cleared",
-  "completed",
-  "failed",
-]);
-
-const ATTENTION_EVENTS = Object.freeze([
-  "permission.asked",
-  "permission.replied",
-  "question.asked",
-  "question.replied",
-  "question.rejected",
-  "permission.v2.asked",
-  "permission.v2.replied",
-  "question.v2.asked",
-  "question.v2.replied",
-  "question.v2.rejected",
+const NORMALIZED_EVENT_KINDS = new Set(["began", "attention", "attention-cleared", "completed", "failed", "reset"]);
+const EXECUTION_EVENTS = new Map([
+  ["session.execution.started", "started"],
+  ["session.execution.succeeded", "succeeded"],
+  ["session.execution.failed", "failed"],
+  ["session.execution.interrupted", "interrupted"],
 ]);
 
 function boundedIdentifier(value) {
-  if (
-    typeof value !== "string" ||
-    value.length === 0 ||
-    value.length > MAX_IDENTIFIER_LENGTH ||
-    /[\u0000-\u001f\u007f]/.test(value)
-  ) {
-    return undefined;
-  }
-
-  return value;
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_IDENTIFIER_LENGTH &&
+    !/[\u0000-\u001f\u007f]/.test(value) ? value : undefined;
 }
 
 function boundedDirectory(value) {
-  return boundedIdentifier(value);
+  return typeof value === "string" && value.startsWith("/") ? boundedIdentifier(value) : undefined;
 }
 
-function boundedRequestID(value) {
-  return value === "" ? "" : boundedIdentifier(value);
+function boundedLocation(value) {
+  const directory = boundedDirectory(value?.directory);
+  const workspaceID = boundedIdentifier(value?.workspaceID);
+  return directory && (value.workspaceID === undefined || workspaceID)
+    ? { directory, workspaceID } : undefined;
+}
+
+function sameLocation(left, right) {
+  return Boolean(left && right && left.directory === right.directory && left.workspaceID === right.workspaceID);
+}
+
+function sessionMetadata(value, sessionID) {
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      (value.id !== undefined && value.id !== sessionID)) return undefined;
+  const directory = boundedDirectory(value.location?.directory);
+  if (!directory) return undefined;
+  const parentID = boundedIdentifier(value.parentID);
+  return { directory, parentID, location: boundedLocation(value.location),
+    relationship: value.parentID === undefined || Boolean(parentID && parentID !== sessionID) };
 }
 
 function boundedExcerpt(value) {
-  if (
-    typeof value !== "string" ||
-    value.length === 0 ||
-    value.length > MAX_EXCERPT_LENGTH ||
-    EXCERPT_REJECTED.test(value)
-  ) {
-    return undefined;
-  }
-
-  return value;
-}
-
-function discoverTmuxExecutable(which) {
-  try {
-    const executable = typeof which === "function" ? which("tmux") : undefined;
-    return typeof executable === "string" && isAbsolute(executable) ? executable : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-async function collectStdout(stdout, setCancel) {
-  if (!stdout || typeof stdout[Symbol.asyncIterator] !== "function") return undefined;
-
-  const iterator = stdout[Symbol.asyncIterator]();
-  if (!iterator || typeof iterator.next !== "function") return undefined;
-  const cancelled = Symbol("cancelled");
-  let cancelRead;
-  const cancelledRead = new Promise((resolve) => {
-    cancelRead = () => {
-      resolve(cancelled);
-      try {
-        const returned = iterator.return?.();
-        if (returned && typeof returned.then === "function") returned.catch(() => {});
-      } catch {
-        // Tmux context is advisory.
-      }
-    };
-  });
-  setCancel(cancelRead);
-
-  const chunks = [];
-  let length = 0;
-  try {
-    while (true) {
-      const next = await Promise.race([iterator.next(), cancelledRead]);
-      if (next === cancelled) return undefined;
-      if (next.done) break;
-      const chunk = next.value;
-      if (!(chunk instanceof Uint8Array)) return undefined;
-      length += chunk.byteLength;
-      if (length > TMUX_STDOUT_MAX_BYTES) {
-        cancelRead();
-        return { overflow: true };
-      }
-      chunks.push(chunk);
-    }
-  } catch {
-    return undefined;
-  } finally {
-    setCancel(undefined);
-  }
-
-  const output = new Uint8Array(length);
-  let offset = 0;
-  for (const chunk of chunks) {
-    output.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return { output };
-}
-
-function validTmuxSession(output) {
-  try {
-    const value = new TextDecoder("utf-8", { fatal: true }).decode(output);
-    const session = value.endsWith("\n") ? value.slice(0, -1) : value;
-    return session.trim().length === 0 ? undefined : boundedIdentifier(session);
-  } catch {
-    return undefined;
-  }
-}
-
-async function lookupTmuxSession({ executable, environment, spawn, setTimeout: schedule, clearTimeout: clear }) {
-  const pane = environment?.TMUX_PANE;
-  if (
-    !executable ||
-    typeof spawn !== "function" ||
-    typeof environment?.TMUX !== "string" ||
-    environment.TMUX.length === 0 ||
-    typeof pane !== "string" ||
-    !/^%[0-9]{1,255}$/.test(pane)
-  ) return undefined;
-
-  let child;
-  try {
-    child = spawn([executable, "display-message", "-p", "-t", pane, "#S"], {
-      stdout: "pipe",
-      stderr: "ignore",
-    });
-  } catch {
-    return undefined;
-  }
-  if (!child || !child.exited) return undefined;
-
-  let terminated = false;
-  let cancelStdout;
-  const terminate = () => {
-    if (terminated) return;
-    terminated = true;
-    cancelStdout?.();
-    try {
-      child.kill();
-    } catch {
-      // Tmux context is advisory.
-    }
-  };
-  const capture = (async () => {
-    const captured = await collectStdout(child.stdout, (cancel) => { cancelStdout = cancel; });
-    if (!captured || captured.overflow) {
-      terminate();
-      return undefined;
-    }
-    if (await child.exited !== 0 || terminated) return undefined;
-    return validTmuxSession(captured.output);
-  })().catch(() => undefined);
-
-  let timer;
-  const deadline = new Promise((resolve) => {
-    timer = schedule(() => {
-      terminate();
-      resolve(undefined);
-    }, TMUX_LOOKUP_TIMEOUT_MS);
-  });
-  try {
-    return await Promise.race([capture, deadline]);
-  } finally {
-    clear(timer);
-  }
+  return typeof value === "string" && value.length > 0 && value.length <= MAX_EXCERPT_LENGTH &&
+    !EXCERPT_REJECTED.test(value) ? value : undefined;
 }
 
 function settingsPath() {
@@ -216,51 +71,37 @@ function settingsPath() {
   return environment.AGENT_NOTIFY_SETTINGS_FILE || `${environment.HOME ?? ""}${SETTINGS_RELATIVE_PATH}`;
 }
 
-// Read per excerpt decision rather than cached at plugin load, so a session that is already running
-// honours a change to the setting without being restarted.
+// Read at each decision, so a running session honours a live opt-out.
 function excerptsEnabled() {
   try {
     return !EXCERPT_DISABLED.test(readFileSync(settingsPath(), "utf8"));
   } catch {
-    // An absent, unreadable, or malformed settings file leaves excerpts enabled.
     return true;
   }
 }
 
 function sanitizeExcerpt(text) {
-  return text
-    .normalize("NFC")
-    .replace(ANSI_ESCAPE, "")
-    .replace(LINE_BREAK, " ")
-    .replace(CONTROL, "")
-    .replace(INVISIBLE, "")
-    .replace(CODE_FENCE, EXCERPT_CODE_MARKER)
-    .replace(BACKTICKS, "")
-    .replace(/\s+/g, " ")
-    .trim();
+  return text.normalize("NFC").replace(ANSI_ESCAPE, "").replace(LINE_BREAK, " ")
+    .replace(CONTROL, "").replace(INVISIBLE, "").replace(CODE_FENCE, EXCERPT_CODE_MARKER)
+    .replace(BACKTICKS, "").replace(/\s+/g, " ").trim();
 }
 
 function utf8ByteLength(text) {
   let bytes = 0;
   for (const character of text) {
-    const codePoint = character.codePointAt(0);
-    bytes += codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+    const point = character.codePointAt(0);
+    bytes += point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
   }
   return bytes;
 }
 
-function graphemeClusters(text) {
-  const clusters = [];
-  for (const cluster of new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)) clusters.push(cluster.segment);
-  return clusters;
-}
-
 function boundExcerpt(text) {
   if (text.length === 0) return "";
-  const clusters = graphemeClusters(text);
-  if (clusters.length <= MAX_EXCERPT_GRAPHEMES && text.length <= MAX_EXCERPT_LENGTH && utf8ByteLength(text) <= MAX_EXCERPT_BYTES) return text;
+  const clusters = [...new Intl.Segmenter(undefined, { granularity: "grapheme" }).segment(text)]
+    .map((cluster) => cluster.segment);
+  if (clusters.length <= MAX_EXCERPT_GRAPHEMES && text.length <= MAX_EXCERPT_LENGTH &&
+      utf8ByteLength(text) <= MAX_EXCERPT_BYTES) return text;
 
-  const maxGraphemes = MAX_EXCERPT_GRAPHEMES - 1;
   const maxUnits = MAX_EXCERPT_LENGTH - EXCERPT_TRUNCATION_MARKER.length;
   const maxBytes = MAX_EXCERPT_BYTES - utf8ByteLength(EXCERPT_TRUNCATION_MARKER);
   let graphemes = 0;
@@ -270,7 +111,8 @@ function boundExcerpt(text) {
   while (index > 0) {
     const cluster = clusters[index - 1];
     const clusterBytes = utf8ByteLength(cluster);
-    if (graphemes + 1 > maxGraphemes || units + cluster.length > maxUnits || bytes + clusterBytes > maxBytes) break;
+    if (graphemes + 1 >= MAX_EXCERPT_GRAPHEMES || units + cluster.length > maxUnits ||
+        bytes + clusterBytes > maxBytes) break;
     graphemes += 1;
     units += cluster.length;
     bytes += clusterBytes;
@@ -283,571 +125,529 @@ function excerptFrom(text) {
   return typeof text === "string" && text.length > 0 ? boundExcerpt(sanitizeExcerpt(text)) || undefined : undefined;
 }
 
-function attentionKey(eventType, requestID) {
-  return `${eventType.startsWith("permission.") ? "permission" : "question"}:${requestID}`;
-}
-
-function sessionIDFrom(event) {
-  return boundedIdentifier(event?.properties?.sessionID);
-}
-
-function requestIDFrom(event) {
-  const properties = event?.properties;
-  return boundedIdentifier(event?.type?.endsWith(".asked") ? properties?.id : properties?.requestID);
-}
-
-function retryActionRequestID(event) {
-  const status = event?.properties?.status;
-  const action = status?.action;
-  const attempt = status?.attempt;
-  if (
-    !action ||
-    typeof action !== "object" ||
-    Array.isArray(action) ||
-    Object.keys(action).length === 0 ||
-    (typeof attempt !== "string" && (typeof attempt !== "number" || !Number.isFinite(attempt))) ||
-    String(attempt).length === 0
-  ) return undefined;
-
-  return boundedRequestID(`retry:${attempt}`);
-}
-
-function terminalError(event) {
-  const error = event?.properties?.error;
-  if (!error || typeof error !== "object") return false;
-
-  if (
-    error.name === "MessageAbortedError" ||
-    error.name === "AbortError" ||
-    error.name === "UserAbortError" ||
-    error.name === "ToolError" ||
-    error.isRetryable === true ||
-    error.isRecoverable === true ||
-    error.data?.isRetryable === true ||
-    error.data?.isRecoverable === true
-  ) return false;
-  if (error.name === "APIError") return error.data?.isRetryable === false;
-
-  return error.name === "ProviderAuthError" ||
-    error.name === "UnknownError" ||
-    error.name === "MessageOutputLengthError" ||
-    error.name === "StructuredOutputError" ||
-    error.name === "ContextOverflowError" ||
-    error.name === "ContentFilterError";
-}
-
 function encodeEvent(event) {
   if (event?.source !== SOURCE || !NORMALIZED_EVENT_KINDS.has(event.kind)) return undefined;
-
   const sessionID = boundedIdentifier(event.session_id);
   const sessionDir = boundedDirectory(event.session_dir);
-  const requestID = event.request_id === undefined ? "" : boundedRequestID(event.request_id);
+  const requestID = event.request_id === undefined || event.request_id === "" ? "" : boundedIdentifier(event.request_id);
   if (!sessionID || !sessionDir || requestID === undefined) return undefined;
   if ((event.kind === "attention" || event.kind === "attention-cleared") && !requestID) return undefined;
-
+  const normalized = { source: SOURCE, event: event.kind, session_id: sessionID, session_dir: sessionDir, request_id: requestID };
   const excerpt = boundedExcerpt(event.excerpt);
-  const tmuxSession = boundedIdentifier(event.tmux_session);
-  const normalized = {
-    source: SOURCE,
-    event: event.kind,
-    session_id: sessionID,
-    session_dir: sessionDir,
-    request_id: requestID,
-  };
-  if (tmuxSession) normalized.tmux_session = tmuxSession;
   if (excerpt) normalized.excerpt = excerpt;
-
   let encoded = JSON.stringify(normalized);
-  if (tmuxSession && new TextEncoder().encode(encoded).byteLength > MAX_PAYLOAD_BYTES) {
-    delete normalized.tmux_session;
-    encoded = JSON.stringify(normalized);
-  }
-  // An oversized payload must cost the excerpt, never the event.
-  if (excerpt && new TextEncoder().encode(encoded).byteLength > MAX_PAYLOAD_BYTES) {
+  // Oversized payloads cost the excerpt, never an otherwise valid event.
+  if (excerpt && utf8ByteLength(encoded) > MAX_PAYLOAD_BYTES) {
     delete normalized.excerpt;
     encoded = JSON.stringify(normalized);
   }
-  if (new TextEncoder().encode(encoded).byteLength > MAX_PAYLOAD_BYTES) return undefined;
-  return encoded;
+  return utf8ByteLength(encoded) <= MAX_PAYLOAD_BYTES ? encoded : undefined;
 }
 
-function createBinarySubmitter({
-  spawn = globalThis.Bun?.spawn,
-  binary = "agent-notify",
-  timeoutMs = SUBPROCESS_OUTER_TIMEOUT_MS,
-} = {}) {
-  return async (event) => {
-    const input = encodeEvent(event);
-    if (!input || typeof spawn !== "function") return;
-
-    try {
-      const process = spawn([binary, "event"], {
-        stdin: new TextEncoder().encode(input),
-        stdout: "ignore",
-        stderr: "ignore",
-      });
-      const timeout = setTimeout(() => process.kill(), timeoutMs);
-      try {
-        await process.exited;
-      } finally {
-        clearTimeout(timeout);
-      }
-    } catch {
-      // Notifications are advisory and must not affect OpenCode execution.
+// Retain only the verified, bounded contract. Raw forms, inbox items, metadata and responses
+// never enter observation state, notification queues, or diagnostics.
+function normalizeEvent(event) {
+  const data = event?.data;
+  if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
+  let kind = EXECUTION_EVENTS.get(event.type);
+  let sessionID = boundedIdentifier(data.sessionID);
+  let requestID;
+  let family;
+  let status;
+  if (event.type === "session.status") {
+    status = data.status?.type;
+    if (!["busy", "idle", "retry"].includes(status)) return undefined;
+    kind = "status";
+    if (status === "retry" && data.status.action && typeof data.status.action === "object" &&
+        !Array.isArray(data.status.action) && Object.keys(data.status.action).length > 0 &&
+        (typeof data.status.attempt === "string" || Number.isFinite(data.status.attempt))) {
+      requestID = boundedIdentifier(`retry:${data.status.attempt}`);
     }
-  };
+  } else if (event.type === "permission.asked" || event.type === "permission.replied") {
+    kind = event.type.endsWith(".asked") ? "attention" : "cleared";
+    family = "permission";
+    requestID = boundedIdentifier(kind === "attention" ? data.id : data.requestID);
+  } else if (event.type === "form.created") {
+    kind = "attention";
+    family = "form";
+    sessionID = boundedIdentifier(data.form?.sessionID);
+    requestID = boundedIdentifier(data.form?.id);
+  } else if (event.type === "form.replied" || event.type === "form.cancelled") {
+    kind = "cleared";
+    family = "form";
+    requestID = boundedIdentifier(data.id);
+  } else if (["session.created", "session.moved", "session.deleted"].includes(event.type)) {
+    kind = event.type.slice("session.".length);
+  } else if (["session.inbox.enqueued", "session.inbox.delivered", "session.inbox.cancelled"].includes(event.type)) {
+    kind = event.type.slice("session.inbox.".length);
+    requestID = boundedIdentifier(data.inboxID);
+    if (!requestID) return undefined;
+  }
+  if (!kind || !sessionID || (family === "form" && sessionID === "global") || (family && !requestID)) return undefined;
+  const directory = boundedDirectory(data.location?.directory) ?? boundedDirectory(event.location?.directory);
+  const parentValue = data.parentID;
+  const parentID = boundedIdentifier(parentValue);
+  const relationship = kind === "created" && directory &&
+    (parentValue === undefined || (parentID && parentID !== sessionID));
+  const errorText = kind === "failed" && excerptsEnabled()
+    ? excerptFrom(typeof data.error?.message === "string" && data.error.message.length > 0 ? data.error.message : data.error?.type)
+    : undefined;
+  const nativeLocation = kind === "created" || kind === "moved" ? boundedLocation(data.location) : undefined;
+  return { kind, sessionID, requestID, family, status, directory, parentID, relationship, errorText, nativeLocation };
 }
 
-function createOpenCodeAdapter({
-  client,
-  submit = createBinarySubmitter(),
-  schedule = globalThis.setTimeout,
-  clear = globalThis.clearTimeout,
-  environment = globalThis.process?.env ?? {},
-  which = globalThis.Bun?.which,
-  tmuxSpawn = globalThis.Bun?.spawn,
-  tmuxSetTimeout = globalThis.setTimeout,
-  tmuxClearTimeout = globalThis.clearTimeout,
-}) {
-  const tmuxExecutable = discoverTmuxExecutable(which);
-  const activeTurns = new Set();
-  const terminatedTurns = new Set();
-  const attention = new Map();
+function setupAdapter(ctx) {
+  const schedule = globalThis.setTimeout;
+  const clear = globalThis.clearTimeout;
+  const spawn = globalThis.Bun?.spawn;
+  const controller = new AbortController();
+  const sessions = new Map();
+  const ownership = new Map();
+  const deleted = new Set();
+  const departed = new Set();
+  // Instance location is routing identity only, never a display-directory fallback.
+  const instanceLocation = boundedLocation(ctx.location);
+  const candidates = new Map();
   const notificationTails = new Map();
-  const sessionTrees = new Map();
-  const sessionRoots = new Map();
-  const completionCandidates = new Map();
-  let nextCompletionToken = 1;
+  const queuedControls = new Set();
+  const timers = new Map();
+  const children = new Map();
+  let stopped = false;
+  const pendingIntake = new Set();
 
-  async function lookup(sessionID) {
-    try {
-      const result = await client.session.get({ path: { id: sessionID } });
-      const details = result?.data;
-      const directory = boundedDirectory(details?.directory);
-      const parentValue = details?.parentID;
-      const parentID = parentValue === null || parentValue === undefined
-        ? undefined
-        : boundedIdentifier(parentValue);
-      // OpenCode omits parentID entirely for root sessions, so an absent key means root.
-      const treeMetadata = Boolean(
-        directory &&
-        (parentValue === null || parentValue === undefined || (parentID && parentID !== sessionID)),
-      );
-      return { directory, parentID, treeMetadata };
-    } catch {
-      return { directory: undefined, treeMetadata: false };
-    }
+  function later(callback, delay, cancelled = () => {}) {
+    const timer = schedule(() => {
+      timers.delete(timer);
+      callback();
+    }, delay);
+    timers.set(timer, cancelled);
+    return timer;
   }
 
-  // Always called with the root session id: in a deferred completion the event being processed
-  // belongs to a descendant, whose messages are a subagent's internal report.
-  async function sessionExcerpt(rootID) {
-    if (!excerptsEnabled()) return undefined;
+  function cancelTimer(timer) {
+    if (timer === undefined) return;
+    clear(timer);
+    timers.delete(timer);
+  }
 
-    let timeout;
+  async function bounded(work, timeoutMs, onTimeout = () => {}) {
+    let timer;
     try {
-      const result = await Promise.race([
-        client.session.messages({ path: { id: rootID }, query: { limit: MESSAGE_FETCH_LIMIT } }),
+      return await Promise.race([
+        Promise.resolve().then(() => stopped ? undefined : work()),
         new Promise((resolve) => {
-          timeout = setTimeout(resolve, MESSAGE_FETCH_TIMEOUT_MS);
+          timer = later(() => { onTimeout(); resolve(undefined); }, timeoutMs, () => resolve(undefined));
         }),
       ]);
-      if (timeout !== undefined) clearTimeout(timeout);
-      const messages = result?.data;
-      if (!Array.isArray(messages)) return undefined;
-
-      for (let index = messages.length - 1; index >= 0; index -= 1) {
-        const message = messages[index];
-        if (message?.info?.role !== "assistant") continue;
-
-        const parts = Array.isArray(message.parts) ? message.parts : [];
-        // Reasoning parts outnumber text parts in real sessions, so select text by predicate.
-        const part = parts.find((candidate) =>
-          candidate?.type === "text" &&
-          !candidate.synthetic &&
-          !candidate.ignored &&
-          typeof candidate.text === "string" &&
-          candidate.text.trim().length > 0,
-        );
-        return part ? excerptFrom(part.text) : undefined;
-      }
-      return undefined;
     } catch {
-      if (timeout !== undefined) clearTimeout(timeout);
-      // The client resolves {data: undefined} on a 4xx but rejects on a transport failure.
       return undefined;
+    } finally {
+      cancelTimer(timer);
     }
   }
 
-  function errorExcerpt(event) {
-    if (!excerptsEnabled()) return undefined;
-
-    const error = event?.properties?.error;
-    const message = typeof error?.data?.message === "string" && error.data.message.length > 0
-      ? error.data.message
-      : error?.name;
-    return excerptFrom(message);
-  }
-
-  function removeTree(rootID) {
-    const tree = sessionTrees.get(rootID);
-    if (!tree) return;
-
-    cancelCompletionCandidate(rootID);
-    for (const sessionID of tree.keys()) sessionRoots.delete(sessionID);
-    sessionTrees.delete(rootID);
-  }
-
-  function mergeTree(fromRootID, toRootID) {
-    if (fromRootID === toRootID) return;
-
-    const fromTree = sessionTrees.get(fromRootID);
-    if (!fromTree) return;
-
-    cancelCompletionCandidate(fromRootID);
-    cancelCompletionCandidate(toRootID);
-    const toTree = sessionTrees.get(toRootID) ?? new Map();
-    for (const [sessionID, session] of fromTree) {
-      if (!toTree.has(sessionID)) toTree.set(sessionID, session);
-      sessionRoots.set(sessionID, toRootID);
+  function rootFor(sessionID) {
+    const visited = new Set();
+    let id = sessionID;
+    while (sessions.get(id)?.parentID) {
+      if (visited.has(id)) return undefined;
+      visited.add(id);
+      id = sessions.get(id).parentID;
     }
-    sessionTrees.set(toRootID, toTree);
-    sessionTrees.delete(fromRootID);
+    return id;
   }
 
-  function recordSession(sessionID, details, status) {
-    const rootID = details.parentID
-      ? sessionRoots.get(details.parentID) ?? details.parentID
-      : sessionID;
-    const previousRootID = sessionRoots.get(sessionID);
-    if (previousRootID && previousRootID !== rootID) {
-      mergeTree(previousRootID, rootID);
-    }
-    if (sessionID !== rootID && sessionTrees.has(sessionID)) {
-      mergeTree(sessionID, rootID);
-    }
-
-    const tree = sessionTrees.get(rootID) ?? new Map();
-    const previous = tree.get(sessionID);
-    tree.set(sessionID, {
-      directory: details.directory,
-      parentID: details.parentID,
-      status,
-      pending: status === "busy" || status === "retry" ? false : previous?.pending,
-    });
-    sessionTrees.set(rootID, tree);
-    sessionRoots.set(sessionID, rootID);
-    if (status === "busy" || status === "retry" || status === "terminal") cancelCompletionCandidate(rootID);
-    return rootID;
-  }
-
-  function hasPendingCompletion(sessionID) {
-    return sessionTrees.get(sessionID)?.get(sessionID)?.pending === true;
-  }
-
-  function pendingRoot(rootID) {
-    const tree = sessionTrees.get(rootID);
-    const root = tree?.get(rootID);
-    if (!root?.pending || root.status !== "idle") return undefined;
-
-    for (const [sessionID, session] of tree) {
-      if (sessionID !== rootID && (session.status === "busy" || session.status === "retry")) return undefined;
-    }
-    return { tree, root };
-  }
-
-  function cancelCompletionCandidate(rootID) {
-    const candidate = completionCandidates.get(rootID);
+  function cancelCandidate(rootID) {
+    const candidate = candidates.get(rootID);
     if (!candidate) return;
-
-    completionCandidates.delete(rootID);
-    clear(candidate.timer);
+    candidates.delete(rootID);
+    cancelTimer(candidate.timer);
   }
 
-  async function completeCandidate(rootID, token) {
-    const candidate = completionCandidates.get(rootID);
-    if (!candidate || candidate.token !== token || !pendingRoot(rootID)) return;
-
-    const excerpt = await sessionExcerpt(rootID);
-    const pending = pendingRoot(rootID);
-    if (completionCandidates.get(rootID) !== candidate || candidate.token !== token || !pending) return;
-
-    completionCandidates.delete(rootID);
-    pending.root.pending = false;
-    removeTree(rootID);
-    await notify("completed", rootID, pending.root.directory, "", excerpt);
+  function invalidate(sessionID) {
+    const rootID = rootFor(sessionID);
+    if (sessions.has(sessionID)) cancelCandidate(rootID);
+    else for (const id of candidates.keys()) cancelCandidate(id);
   }
 
-  function completePendingRoot(rootID) {
-    if (!pendingRoot(rootID) || completionCandidates.has(rootID)) return;
+  function validOwner(sessionID, token) {
+    return !stopped && !deleted.has(sessionID) && !departed.has(sessionID) && ownership.get(sessionID) === token;
+  }
 
-    const candidate = { token: nextCompletionToken, timer: undefined };
-    nextCompletionToken += 1;
-    candidate.timer = schedule(async () => {
+  function validRelationship(id, metadata) {
+    if (!metadata?.relationship) return false;
+    let ancestor = metadata.parentID;
+    const visited = new Set([id]);
+    while (ancestor) {
+      if (visited.has(ancestor)) return false;
+      visited.add(ancestor);
+      ancestor = sessions.get(ancestor)?.parentID;
+    }
+    return true;
+  }
+
+  function intakeScope(entry) {
+    const id = entry.event.sessionID;
+    const known = sessions.get(id);
+    const scope = new Set();
+    const include = (member) => {
+      while (member && !scope.has(member)) {
+        scope.add(member);
+        member = sessions.get(member)?.parentID;
+      }
+    };
+    if (known?.relationshipKnown || entry.ready) include(id);
+    for (const metadata of [entry.event, entry.details]) {
+      if (!validRelationship(id, metadata)) continue;
+      include(id);
+      include(metadata.parentID);
+    }
+    // Until lookup/fallback resolves an unknown relationship it may belong to any tree.
+    return scope.size > 0 ? scope : undefined;
+  }
+
+  function drainIntake() {
+    const blocked = [];
+    for (const entry of pendingIntake) {
+      if (!validOwner(entry.event.sessionID, entry.token)) {
+        pendingIntake.delete(entry);
+        continue;
+      }
+      const scope = intakeScope(entry);
+      const waiting = blocked.some((earlier) => {
+        const previousScope = intakeScope(earlier);
+        return !scope || !previousScope || [...scope].some((id) => previousScope.has(id));
+      });
+      if (!entry.ready || waiting) {
+        blocked.push(entry);
+        continue;
+      }
+      pendingIntake.delete(entry);
+      try { reduce(entry.event, entry.token, entry.details); } catch { /* Advisory. */ }
+    }
+    if (!stopped) considerCompletions();
+  }
+
+  function resolveEntry(entry) {
+    const ticket = {};
+    entry.lookupTicket = ticket;
+    entry.ready = false;
+    entry.details = undefined;
+    void (async () => {
+      const details = await bounded(() => ctx.session.get({ sessionID: entry.event.sessionID }), MESSAGE_FETCH_TIMEOUT_MS);
+      if (stopped || !pendingIntake.has(entry) || entry.lookupTicket !== ticket) return;
+      try { entry.details = sessionMetadata(details, entry.event.sessionID); } catch { /* Lookup unavailable. */ }
+      entry.ready = true;
+      drainIntake();
+    })().catch(() => {});
+  }
+
+  function recordMetadata(event, details) {
+    const id = event.sessionID;
+    let session = sessions.get(id);
+    const directory = details?.directory ?? event.directory ?? session?.directory;
+    if (!directory) return undefined;
+    // A usable lookup directory does not make its relationship trustworthy.
+    const metadata = validRelationship(id, details) ? details : event;
+    const parentID = metadata.parentID;
+    const relationship = validRelationship(id, metadata);
+    if (!session) {
+      session = { directory, parentID: undefined, status: "unknown", executing: false, outcome: undefined,
+        turnOpen: false, requests: new Set(), inbox: new Map(), awaitingOutcome: false, relationshipKnown: false };
+      sessions.set(id, session);
+    }
+    if (relationship && session.parentID !== parentID) {
+      // Dynamic parent traversal merges provisional trees without losing descendant state.
+      cancelCandidate(rootFor(id));
+      session.parentID = parentID;
+      cancelCandidate(rootFor(id));
+    }
+    if (relationship) session.relationshipKnown = true;
+    if (session.directory !== directory) invalidate(id);
+    session.directory = directory;
+    return session;
+  }
+
+  function eligible(rootID) {
+    const root = sessions.get(rootID);
+    if (stopped || !root || root.parentID || !root.turnOpen || root.executing ||
+        root.outcome !== "succeeded" || root.status !== "idle") return false;
+    for (const entry of pendingIntake) {
+      if (!validOwner(entry.event.sessionID, entry.token)) continue;
+      const scope = intakeScope(entry);
+      if (!scope || scope.has(rootID)) return false;
+    }
+    for (const [id, session] of sessions) {
+      if (rootFor(id) !== rootID) continue;
+      if (session.awaitingOutcome || [...session.inbox.values()].includes("pending")) return false;
+      if (id !== rootID && (session.executing ||
+          (["busy", "retry"].includes(session.status) && !["failed", "interrupted"].includes(session.outcome)))) return false;
+    }
+    return true;
+  }
+
+  async function sessionExcerpt(rootID) {
+    if (!excerptsEnabled()) return undefined;
+    const messages = await bounded(() => ctx.session.context({ sessionID: rootID }), MESSAGE_FETCH_TIMEOUT_MS);
+    if (stopped || !Array.isArray(messages)) return undefined;
+    for (let index = messages.length - 1; index >= Math.max(0, messages.length - MESSAGE_FETCH_LIMIT); index -= 1) {
+      const message = messages[index];
+      if (message?.type !== "assistant") continue;
+      const part = Array.isArray(message.content) ? message.content.find((item) =>
+        item?.type === "text" && !item.synthetic && !item.ignored &&
+        typeof item.text === "string" && item.text.trim().length > 0) : undefined;
+      return part ? excerptFrom(part.text) : undefined;
+    }
+    return undefined;
+  }
+
+  function terminate(child) {
+    try { child.kill(); } catch { /* Advisory, including during cleanup. */ }
+  }
+
+  async function submit(event, commit) {
+    const input = encodeEvent(event);
+    if (!input || stopped || typeof spawn !== "function") return;
+    try {
+      // No await between the queue's eligibility check and subprocess submission.
+      commit?.();
+      const child = spawn(["agent-notify", "event"], {
+        stdin: new TextEncoder().encode(input), stdout: "ignore", stderr: "ignore",
+      });
+      let terminated = false;
+      const kill = () => {
+        if (!terminated) { terminated = true; terminate(child); }
+      };
+      children.set(child, kill);
       try {
-        await completeCandidate(rootID, candidate.token);
-      } catch {
-        // Notifications are advisory and timer failures must not escape OpenCode's event loop.
+        await bounded(() => child.exited, SUBPROCESS_OUTER_TIMEOUT_MS, kill);
+      } finally {
+        children.delete(child);
       }
-    }, ROOT_QUIESCENCE_MS);
-    completionCandidates.set(rootID, candidate);
-  }
-
-  function pruneSettledTree(rootID) {
-    const tree = sessionTrees.get(rootID);
-    if (!tree) return;
-
-    const root = tree.get(rootID);
-    const hasActiveSession = [...tree.values()].some(
-      (session) => session.status === "busy" || session.status === "retry",
-    );
-    if (!root?.pending && !hasActiveSession) removeTree(rootID);
-  }
-
-  async function fallBackToSessionLifecycle(sessionID, details, status) {
-    const rootID = sessionRoots.get(sessionID);
-    const session = rootID ? sessionTrees.get(rootID)?.get(sessionID) : undefined;
-    const directory = details.directory ?? session?.directory;
-
-    if (session) {
-      if (directory) session.directory = directory;
-
-      if (status === "busy" || status === "retry") {
-        const resumesPendingTurn = session.pending;
-        session.status = status;
-        session.pending = false;
-        cancelCompletionCandidate(rootID);
-        if (status !== "busy" || activeTurns.has(sessionID)) return;
-
-        terminatedTurns.delete(sessionID);
-        activeTurns.add(sessionID);
-        if (!directory) {
-          activeTurns.delete(sessionID);
-          return;
-        }
-        if (sessionID === rootID && !resumesPendingTurn) await notify("began", sessionID, directory);
-        return;
-      }
-
-      if (status === "idle") {
-        const previousStatus = session.status;
-        session.status = "idle";
-        const wasActive = activeTurns.delete(sessionID);
-        if (wasActive) attention.delete(sessionID);
-        if (sessionID === rootID) {
-          if (!wasActive && session.pending) return;
-          if (wasActive || previousStatus === "busy" || previousStatus === "retry") session.pending = true;
-          completePendingRoot(rootID);
-          pruneSettledTree(rootID);
-          return;
-        }
-        completePendingRoot(rootID);
-        pruneSettledTree(rootID);
-      }
-      return;
-    }
-
-    if (status === "busy") {
-      if (activeTurns.has(sessionID)) return;
-      terminatedTurns.delete(sessionID);
-      activeTurns.add(sessionID);
-      if (!directory) {
-        activeTurns.delete(sessionID);
-        return;
-      }
-      await notify("began", sessionID, directory);
-      return;
-    }
-
-    if (status === "idle" && activeTurns.has(sessionID)) {
-      activeTurns.delete(sessionID);
-      attention.delete(sessionID);
-      if (directory) await notifyCompleted(sessionID, directory);
+    } catch {
+      // No raw subprocess output or host-visible errors.
     }
   }
 
   function queueNotification(sessionID, operation) {
     const previous = notificationTails.get(sessionID) ?? Promise.resolve();
-    const queued = previous.catch(() => undefined).then(operation);
-    const tail = queued.catch(() => undefined);
+    const tail = previous.catch(() => {}).then(operation).catch(() => {});
     notificationTails.set(sessionID, tail);
-    tail.finally(() => {
+    void tail.then(() => {
       if (notificationTails.get(sessionID) === tail) notificationTails.delete(sessionID);
     });
-    return queued;
   }
 
-  async function notify(kind, sessionID, sessionDir, requestID = "", excerpt = undefined) {
-    const event = {
-      source: SOURCE,
-      kind,
-      session_id: sessionID,
-      session_dir: sessionDir,
-      request_id: requestID,
-    };
+  function notify(kind, sessionID, requestID = "", excerpt, guard = () => true, commit) {
+    const directory = sessions.get(sessionID)?.directory;
+    const event = { source: SOURCE, kind, session_id: sessionID, session_dir: directory, request_id: requestID };
     if (excerpt) event.excerpt = excerpt;
-    const tmuxSession = kind === "attention" || kind === "completed" || kind === "failed"
-      ? lookupTmuxSession({
-        executable: tmuxExecutable,
-        environment,
-        spawn: tmuxSpawn,
-        setTimeout: tmuxSetTimeout,
-        clearTimeout: tmuxClearTimeout,
-      })
-      : undefined;
-    return queueNotification(sessionID, async () => {
-      const resolvedTmuxSession = await tmuxSession;
-      if (resolvedTmuxSession) event.tmux_session = resolvedTmuxSession;
-      await submit(event);
+    const queued = { event, token: ownership.get(sessionID) };
+    if (kind === "began" || kind === "reset") queuedControls.add(queued);
+    queueNotification(sessionID, () => {
+      queuedControls.delete(queued);
+      if (validOwner(sessionID, queued.token) && guard()) return submit(event, commit);
     });
   }
 
-  async function notifyCompleted(rootID, sessionDir) {
-    await notify("completed", rootID, sessionDir, "", await sessionExcerpt(rootID));
+  function considerCompletions() {
+    for (const rootID of sessions.keys()) {
+      if (!eligible(rootID) || candidates.has(rootID)) continue;
+      const candidate = { timer: undefined };
+      candidates.set(rootID, candidate);
+      const valid = () => {
+        if (candidates.get(rootID) !== candidate) return false;
+        if (eligible(rootID)) return true;
+        cancelCandidate(rootID);
+        // Intake may still be resolving metadata. Its final reducer will reconsider eligibility.
+        considerCompletions();
+        return false;
+      };
+      candidate.timer = later(() => {
+        void (async () => {
+          if (!valid()) return;
+          const excerpt = await sessionExcerpt(rootID);
+          if (!valid()) return;
+          notify("completed", rootID, "", excerpt, valid, () => {
+            sessions.get(rootID).turnOpen = false;
+            cancelCandidate(rootID);
+          });
+        })().catch(() => {});
+      }, ROOT_QUIESCENCE_MS);
+    }
   }
 
-  async function notifyRetryAction(sessionID, sessionDir, event) {
-    const requestID = retryActionRequestID(event);
-    if (!requestID || !sessionDir) return;
-
-    const key = `retry:${requestID}`;
-    const requests = attention.get(sessionID) ?? new Set();
-    if (requests.has(key)) return;
-
-    requests.add(key);
-    attention.set(sessionID, requests);
-    await notify("attention", sessionID, sessionDir, requestID);
+  function activate(id, session) {
+    if (session.executing) return;
+    session.executing = true;
+    session.outcome = undefined;
+    session.requests.clear();
+    if (session.parentID) notify("reset", id);
+    else if (!session.turnOpen) {
+      session.turnOpen = true;
+      notify("began", id);
+    }
   }
 
-  return {
-    async event({ event }) {
-      const sessionID = sessionIDFrom(event);
-      if (!sessionID) return;
+  function reduce(event, token, details) {
+    const id = event.sessionID;
+    if (!validOwner(id, token)) return;
+    if (event.kind === "moved" && !sameLocation(details?.location, event.nativeLocation)) details = undefined;
+    const session = recordMetadata(event, details);
+    if (!session) return;
+    if (event.kind === "created" || event.kind === "moved") return;
+    if (event.kind === "started") {
+      activate(id, session);
+      session.status = "busy";
+    } else if (event.kind === "status") {
+      if (event.status === "busy") activate(id, session);
+      if (event.status === "retry" && !session.executing && (session.parentID || session.turnOpen)) activate(id, session);
+      session.status = event.status;
+      if (event.status === "retry" && event.requestID && !session.requests.has(`retry:${event.requestID}`)) {
+        session.requests.add(`retry:${event.requestID}`);
+        notify("attention", id, event.requestID);
+      }
+    } else if (["succeeded", "failed", "interrupted"].includes(event.kind)) {
+      if (!session.executing && session.outcome === event.kind && !session.awaitingOutcome) return;
+      if (!session.executing && session.outcome && !session.awaitingOutcome && event.kind === "succeeded") return;
+      session.executing = false;
+      session.outcome = event.kind;
+      // Terminal outcomes settle adapter-local execution; only success is completion-eligible.
+      // In particular, a subsequent busy-only activation must not inherit stale busy status.
+      session.status = "idle";
+      session.awaitingOutcome = false;
+      session.requests.clear();
+      if (event.kind !== "succeeded") {
+        session.turnOpen = false;
+        notify(event.kind === "failed" ? "failed" : "reset", id, "", event.errorText);
+      }
+    } else if (event.kind === "enqueued") {
+      if (!session.inbox.has(event.requestID)) session.inbox.set(event.requestID, "pending");
+    } else if (event.kind === "delivered" || event.kind === "cancelled") {
+      if (session.inbox.get(event.requestID) !== "pending") return;
+      session.inbox.set(event.requestID, event.kind);
+      if (event.kind === "delivered") session.awaitingOutcome = true;
+    } else if (event.kind === "attention" || event.kind === "cleared") {
+      const key = `${event.family}:${event.requestID}`;
+      if (event.kind === "attention" && !session.requests.has(key)) {
+        session.requests.add(key);
+        notify("attention", id, event.requestID);
+      } else if (event.kind === "cleared" && session.requests.delete(key)) {
+        notify("attention-cleared", id, event.requestID);
+      }
+    }
+  }
 
-      const isLifecycleEvent =
-        event.type === "session.status" ||
-        event.type === "session.next.prompted" ||
-        event.type === "session.next.prompt.admitted" ||
-        event.type === "session.idle";
-      if (isLifecycleEvent) {
-        const status = event.type === "session.status"
-          ? event.properties?.status?.type
-          : event.type === "session.idle" ? "idle" : "busy";
-        const knownRootID = status === "busy" || status === "retry"
-          ? sessionRoots.get(sessionID)
-          : undefined;
-        if (knownRootID) cancelCompletionCandidate(knownRootID);
-        const details = await lookup(sessionID);
-        if (!details.treeMetadata) {
-          await fallBackToSessionLifecycle(sessionID, details, status);
-          if (status === "retry") await notifyRetryAction(sessionID, details.directory, event);
-          return;
-        }
-
-        const isTracked = sessionRoots.has(sessionID);
-        if (
-          status !== "busy" &&
-          status !== "retry" &&
-          (status !== "idle" || (!isTracked && !activeTurns.has(sessionID)))
-        ) return;
-
-        // A background task waking its root resumes the turn the user is still waiting on, so the
-        // turn must not restart: the notifier times a completion from the began it last recorded.
-        const resumesPendingTurn = hasPendingCompletion(sessionID);
-        const rootID = recordSession(sessionID, details, status);
-        if (status === "busy") {
-          if (activeTurns.has(sessionID)) return;
-          terminatedTurns.delete(sessionID);
-          activeTurns.add(sessionID);
-          if (sessionID === rootID && !resumesPendingTurn) await notify("began", sessionID, details.directory);
-          return;
-        }
-
-        if (status === "retry") {
-          await notifyRetryAction(sessionID, details.directory, event);
-          return;
-        }
-
-        if (status === "idle") {
-          const wasActive = activeTurns.delete(sessionID);
-          if (wasActive) attention.delete(sessionID);
-          if (sessionID === rootID) {
-            const session = sessionTrees.get(rootID)?.get(sessionID);
-            if (wasActive) session.pending = true;
-          }
-          completePendingRoot(rootID);
-          pruneSettledTree(rootID);
-        }
+  function ingest(event) {
+    const normalized = normalizeEvent(event);
+    if (stopped || !normalized) return;
+    const id = normalized.sessionID;
+    if (departed.has(id) && normalized.kind !== "moved") {
+      if (normalized.kind !== "created" || !sameLocation(normalized.nativeLocation, instanceLocation)) return;
+      departed.delete(id);
+    }
+    if (!ownership.has(id)) ownership.set(id, {});
+    // Invalidation is synchronous at intake, not hidden behind metadata or delivery latency.
+    const observedInbox = sessions.get(id)?.inbox;
+    const invalidating = ["started", "failed", "interrupted", "deleted", "moved"].includes(normalized.kind) ||
+      (normalized.kind === "status" && ["busy", "retry"].includes(normalized.status)) ||
+      (normalized.kind === "enqueued" && !observedInbox?.has(normalized.requestID)) ||
+      (["delivered", "cancelled"].includes(normalized.kind) && observedInbox?.get(normalized.requestID) === "pending");
+    if (invalidating) invalidate(id);
+    if (normalized.kind === "deleted") {
+      const directory = sessions.get(id)?.directory ?? normalized.directory;
+      ownership.set(id, {});
+      sessions.delete(id);
+      deleted.add(id);
+      for (const queued of queuedControls) if (queued.event.session_id === id) queuedControls.delete(queued);
+      // The reset is owned by deletion, not by the removed observation state.
+      // Queue it on the fresh token while rejecting all prior lookup/queue results.
+      if (directory) {
+        const token = ownership.get(id);
+        queueNotification(id, () => {
+          if (!stopped && ownership.get(id) === token) return submit({ source: SOURCE, kind: "reset", session_id: id,
+            session_dir: directory, request_id: "" });
+        });
+      }
+      drainIntake();
+      return;
+    }
+    if (normalized.kind === "moved") {
+      const previousToken = ownership.get(id);
+      ownership.set(id, {});
+      if (!sameLocation(normalized.nativeLocation, instanceLocation)) {
+        // The bus sends this move to both owners, but future events reach only the destination.
+        // Drop outgoing observation, not just its candidate token: old success cannot be re-armed.
+        departed.add(id);
+        sessions.delete(id);
+        for (const queued of queuedControls) if (queued.event.session_id === id) queuedControls.delete(queued);
+        drainIntake();
         return;
       }
-
-      if (event.type === "session.error") {
-        if (!terminalError(event) || terminatedTurns.has(sessionID)) return;
-
-        const knownRootID = sessionRoots.get(sessionID);
-        if (knownRootID) cancelCompletionCandidate(knownRootID);
-        terminatedTurns.add(sessionID);
-        activeTurns.delete(sessionID);
-        attention.delete(sessionID);
-        const excerpt = errorExcerpt(event);
-        const details = await lookup(sessionID);
-        const rootID = sessionRoots.get(sessionID);
-        const session = rootID ? sessionTrees.get(rootID)?.get(sessionID) : undefined;
-        const directory = details.directory ?? session?.directory;
-        if (details.treeMetadata) {
-          const trackedRootID = recordSession(sessionID, details, "terminal");
-          const notification = details.directory ? [sessionID, details.directory, excerpt] : undefined;
-          if (sessionID === trackedRootID) removeTree(trackedRootID);
-          else {
-            completePendingRoot(trackedRootID);
-            pruneSettledTree(trackedRootID);
-          }
-          if (notification) await notify("failed", notification[0], notification[1], "", notification[2]);
-          return;
-        }
-
-        if (session) {
-          session.status = "terminal";
-          const notification = directory ? [sessionID, directory, excerpt] : undefined;
-          if (sessionID === rootID) removeTree(rootID);
-          else {
-            completePendingRoot(rootID);
-            pruneSettledTree(rootID);
-          }
-          if (notification) await notify("failed", notification[0], notification[1], "", notification[2]);
-          return;
-        }
-
-        if (directory) await notify("failed", sessionID, directory, "", excerpt);
-        return;
+      departed.delete(id);
+      const session = sessions.get(id);
+      if (session) session.directory = normalized.nativeLocation.directory;
+      // Unsubmitted begins/child resets remain necessary for the notifier's next execution.
+      // Refresh them in place in FIFO; submitted controls have already left this set.
+      for (const queued of queuedControls) {
+        if (queued.event.session_id !== id || queued.token !== previousToken) continue;
+        queued.token = ownership.get(id);
+        queued.event.session_dir = normalized.nativeLocation.directory;
       }
-
-      if (!ATTENTION_EVENTS.includes(event.type)) return;
-
-      const requestID = requestIDFrom(event);
-      if (!requestID) return;
-      const { directory } = await lookup(sessionID);
-      if (!directory) return;
-
-      const key = attentionKey(event.type, requestID);
-      if (event.type.endsWith(".asked")) {
-        const requests = attention.get(sessionID) ?? new Set();
-        if (requests.has(key)) return;
-        requests.add(key);
-        attention.set(sessionID, requests);
-        await notify("attention", sessionID, directory, requestID);
-        return;
+      // Same-owner movement cancels old delivery attribution, not earlier lifecycle inputs.
+      // Re-resolve those inputs against current ownership, keeping their ingress positions and
+      // rejecting late results from the obsolete lookup tickets.
+      for (const entry of pendingIntake) {
+        if (entry.event.sessionID !== id) continue;
+        entry.token = ownership.get(id);
+        resolveEntry(entry);
       }
+    }
+    if (deleted.has(id)) {
+      if (normalized.kind !== "created") return;
+      deleted.delete(id);
+      ownership.set(id, {});
+    }
+    const entry = { event: normalized, token: ownership.get(id), ready: false, details: undefined };
+    pendingIntake.add(entry);
+    // Lookup latency is independent across events; reduction remains ordered within affected trees.
+    resolveEntry(entry);
+  }
 
-      const requests = attention.get(sessionID);
-      if (requests?.delete(key)) {
-        if (requests.size === 0) attention.delete(sessionID);
-        await notify("attention-cleared", sessionID, directory, requestID);
+  function cleanup() {
+    if (stopped) return;
+    stopped = true;
+    try { controller.abort(); } catch { /* Advisory. */ }
+    for (const [timer, cancelled] of timers) {
+      try { clear(timer); cancelled(); } catch { /* Advisory. */ }
+    }
+    timers.clear();
+    for (const kill of children.values()) kill();
+    children.clear();
+    candidates.clear();
+    sessions.clear();
+    ownership.clear();
+    deleted.clear();
+    departed.clear();
+    pendingIntake.clear();
+    notificationTails.clear();
+    queuedControls.clear();
+  }
+
+  void (async () => {
+    try {
+      for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+        try { ingest(event); } catch { /* Malformed events do not end observation. */ }
       }
-    },
-  };
+    } catch {
+      // A stream error is not execution success; never expose its raw error.
+    } finally {
+      cleanup();
+    }
+  })();
+  return cleanup;
 }
 
-export default async function agentNotifyPlugin(options) {
-  return createOpenCodeAdapter(options);
-}
+// Plugin.define is an identity helper in 2.0.27; the loader accepts this native definition.
+// Keep one default export and one installed file, with no package installation requirement.
+export default { id: "agent-notify", setup: setupAdapter };

@@ -111,7 +111,7 @@ preflight() {
   agent_notify_validate_version macos "$macos" || die "unsupported macOS version: $macos"
   version_from "$("$claude_bin" --version 2>/dev/null)" || die 'unparseable Claude Code version'
   agent_notify_validate_version claude-code "$REPLY" || die "unsupported Claude Code version: $REPLY"
-  version_from "$("$opencode_bin" --version 2>/dev/null)" || die 'unparseable OpenCode version'
+  agent_notify_opencode_version_token "$("$opencode_bin" --version 2>/dev/null)" || die 'unparseable OpenCode version'
   agent_notify_validate_version opencode "$REPLY" || die "unsupported OpenCode version: $REPLY"
   [[ -x $root/bin/agent-notify && -d $root/lib/agent-notify && -r $root/integrations/opencode/agent-notify.js && -r $root/integrations/claude/agent-notify-hook.zsh && -r $root/integrations/claude/agent-notify-hook.jxa ]] || die 'repository installation sources are incomplete'
   [[ -r $keychain_helper && -r $settings_helper && -r $plugin_helper && -r $manifest_helper ]] || die 'installer helper unavailable'
@@ -185,9 +185,10 @@ preview() {
   print -- "  backups: $backup_root/<unique>/ (0700 directory; 0600 files)"
   print -- "  excerpt settings: $settings_conf_path (created only if absent; never overwritten by a reinstall)"
   print -- "  Pushover and downstream push services receive agent name, a sanitized and bounded tmux-or-project display context, normalized state, and, when enabled and available, a sanitized bounded single-line excerpt."
-  print -- "  When tmux is detected, the adapters automatically perform a bounded lookup for the originating pane; a valid result uses its current innermost session name, otherwise the project basename is used."
+  print -- "  When tmux is detected, the Claude adapter automatically performs a bounded lookup for the originating pane; a valid result uses its current innermost session name, otherwise the project basename is used."
+  print -- "  OpenCode always uses the resolved session-directory project basename: its shared-server environment does not establish an originating pane, and this V2 adapter does not discover panes or perform tmux lookup."
   print -- "  Tmux is optional; its user-chosen innermost session name can be sensitive."
-  print -- "  Claude completion excerpts use final assistant output; Claude failure excerpts use the categorical error identifier, never free-text error detail. OpenCode completion excerpts use relevant root-session assistant text; OpenCode failure excerpts use error message when present or error name otherwise. Excerpts are sanitized and bounded: the selected source is sent in full when it already fits the bound and truncated when longer; model output or OpenCode error messages can repeat sensitive content such as secrets or paths."
+  print -- "  Claude completion excerpts use final assistant output; Claude failure excerpts use the categorical error identifier, never free-text error detail. OpenCode completion excerpts use relevant root-session assistant text available through native context; OpenCode failure excerpts use structured error message when present or error type otherwise, never response bodies. Excerpts are sanitized and bounded: the selected source is sent in full when it already fits the bound and truncated when longer; model output or OpenCode error messages can repeat sensitive content such as secrets or paths."
   print -- "  Message excerpts are enabled by default; set EXCERPT=0 in $settings_conf_path to stop sending them."
   probe_keychain "$keychain_selector_service" && print -- '  existing v2 credential generation: will be replaced after confirmation' || print -- '  existing v2 credential generation: absent'
   classify_file "$install_bin" "$root/bin/agent-notify" executable

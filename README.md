@@ -10,9 +10,9 @@ The installer validates these supported ranges before collecting credentials or 
 
 - macOS 13 through 27
 - Claude Code `>= 1.0.0, < 3.0.0`
-- OpenCode `>= 2.0.27, < 2.1.0` (native V2 only; V1 is no longer supported)
+- OpenCode `>= 2.0.27, < 2.3.0` (native V2 only, including 2.2.1; V1 is no longer supported)
 
-OpenCode **2.0.27 is the runtime-verified baseline**: isolated checks passed for generated-plugin loading, native subscription, unload/reload, and background-child and background-shell output consumption with one original root begin/completion per scenario. The accepted patch range does not mean every patch was individually tested, or that observed-tree quiescence is a global timing guarantee. Preflight accepts complete numeric version tokens, including the normal `opencode v2.0.27` output and optional `v` prefix; extra components, prerelease/build suffixes, and malformed output are rejected rather than truncated to a supported prefix. macOS and Claude policy are unchanged.
+OpenCode **2.0.27 is the runtime-verified baseline**: isolated checks passed for generated-plugin loading, native subscription, unload/reload, and background-child and background-shell output consumption with one original root begin/completion per scenario. The expanded accepted range includes the 2.1 and 2.2 minor lines; it does not mean every accepted release was individually runtime-tested, or that observed-tree quiescence is a global timing guarantee. Preflight accepts complete numeric version tokens, including the normal `opencode v2.2.1` output and optional `v` prefix; extra components, prerelease/build suffixes, and malformed output are rejected rather than truncated to a supported prefix. macOS and Claude policy are unchanged.
 
 Install both `claude` and `opencode` so they are executable on `PATH`, and have a Pushover user key and application token ready. The project uses macOS built-ins: `/bin/zsh`, `/usr/bin/osascript` (JXA), `/usr/bin/security`, `/usr/bin/curl`, `shasum`, and standard BSD file utilities. No npm install or tmux installation is required for the runtime integration.
 

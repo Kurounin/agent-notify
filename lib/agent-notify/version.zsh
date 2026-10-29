@@ -5,7 +5,7 @@ typeset -gr AGENT_NOTIFY_MACOS_MAX_MAJOR=27
 typeset -gr AGENT_NOTIFY_CLAUDE_CODE_MIN_VERSION='1.0.0'
 typeset -gr AGENT_NOTIFY_CLAUDE_CODE_MAX_VERSION='3.0.0'
 typeset -gr AGENT_NOTIFY_OPEN_CODE_MIN_VERSION='2.0.27'
-typeset -gr AGENT_NOTIFY_OPEN_CODE_MAX_VERSION='2.1.0'
+typeset -gr AGENT_NOTIFY_OPEN_CODE_MAX_VERSION='2.3.0'
 
 agent_notify_opencode_version_token() {
   local output=$1
@@ -20,7 +20,7 @@ agent_notify_opencode_version_in_range() {
   minimum=(${(s:.:)AGENT_NOTIFY_OPEN_CODE_MIN_VERSION})
   maximum=(${(s:.:)AGENT_NOTIFY_OPEN_CODE_MAX_VERSION})
   # Compare components, not packed numbers: 1.1000.27 must not alias 2.0.27,
-  # and later 2.0 patches must not carry into the excluded 2.1 line.
+  # and later 2.2 patches must not carry into the excluded 2.3 line.
   for index in 1 2 3; do
     if (( lower == 0 )); then
       (( 10#$parts[$index] < 10#$minimum[$index] )) && lower=-1

@@ -21,8 +21,8 @@ trap '/bin/rm -rf "$test_root"' EXIT
 "$root/bin/agent-notify" validate-version macos 27.0.1.1 >/dev/null 2>&1 && { print -u2 -- 'unparseable macOS 27 version accepted'; exit 1; }
 "$root/bin/agent-notify" validate-version claude-code 3.0.0 >/dev/null 2>&1 && { print -u2 -- 'unsupported Claude upper boundary accepted'; exit 1; }
 "$root/bin/agent-notify" validate-version claude-code 2.0.0.1 >/dev/null 2>&1 && { print -u2 -- 'unparseable Claude version accepted'; exit 1; }
-typeset -a supported_opencode_versions=(2.0.27 v2.0.27 'opencode 2.0.27' 'opencode v2.0.27' $'opencode\tv2.0.27' 2.0.28 2.0.999 2.0.1000)
-typeset -a rejected_opencode_versions=(1.0.0 1.999.999 1.1000.27 2.0.0 2.0.26 2.1.0 3.0.0 2.0.27.1 2.0.27-rc.1 2.0.27+build.1 'opencode v2.0.27.1' 'opencode v2.0.27-rc.1' 'opencode v2.0.27+build.1' unknown 'opencode unknown' 'opencode v2.0.27 trailing' 'prefix 2.0.27' 2.0 '2.0.27 2.1.0' opencodet2.0.27 'opencode t2.0.27')
+typeset -a supported_opencode_versions=(2.0.27 v2.0.27 'opencode 2.0.27' 'opencode v2.0.27' $'opencode\tv2.0.27' 2.0.28 2.0.999 2.0.1000 2.1.0 2.1.999 2.2.0 2.2.1 v2.2.1 'opencode 2.2.1' 'opencode v2.2.1' $'opencode\tv2.2.1' 2.2.999 2.2.1000)
+typeset -a rejected_opencode_versions=(1.0.0 1.999.999 1.1000.27 2.0.0 2.0.26 2.3.0 v2.3.0 'opencode v2.3.0' 2.1000.27 3.0.0 2.0.27.1 2.0.27-rc.1 2.0.27+build.1 'opencode v2.0.27.1' 'opencode v2.0.27-rc.1' 'opencode v2.0.27+build.1' 2.2.1.1 2.2.1-rc.1 2.2.1+build.1 'opencode v2.2.1.1' 'opencode v2.2.1-rc.1' 'opencode v2.2.1+build.1' unknown 'opencode unknown' 'opencode v2.0.27 trailing' 'opencode v2.2.1 trailing' 'prefix 2.0.27' 2.0 '2.0.27 2.1.0' opencodet2.0.27 'opencode t2.0.27')
 for version in $supported_opencode_versions; do
   "$root/bin/agent-notify" validate-version opencode "$version" || { print -u2 -- 'supported OpenCode version rejected'; exit 1; }
 done
@@ -49,7 +49,7 @@ make_security() { print -r -- '#!/bin/zsh
 exit 0' > "$1"; /bin/chmod 700 "$1"; }
 typeset fake="$test_root/fake"; /bin/mkdir -p "$fake"
 typeset keychain_state="$test_root/keychain-state"; /bin/mkdir "$keychain_state"; print -- old-generation > "$keychain_state/selector"
-make_client "$fake/claude" 'claude 1.2.3'; make_client "$fake/opencode" 'opencode v2.0.27'; make_helper "$fake/jxa" "$root/installer/opencode-plugin.jxa"; make_keychain_helper "$fake/keychain-jxa" "$keychain_state"; make_security "$fake/security"
+make_client "$fake/claude" 'claude 1.2.3'; make_client "$fake/opencode" 'opencode v2.2.1'; make_helper "$fake/jxa" "$root/installer/opencode-plugin.jxa"; make_keychain_helper "$fake/keychain-jxa" "$keychain_state"; make_security "$fake/security"
 /usr/bin/touch "$fake/plugin-jxa"; /bin/chmod 600 "$fake/plugin-jxa"
 typeset -a env=(AGENT_NOTIFY_INSTALL_HOME="$test_root/home" AGENT_NOTIFY_INSTALL_SKIP_PLATFORM_CHECK=1 AGENT_NOTIFY_INSTALL_MACOS_VERSION=14.5 AGENT_NOTIFY_INSTALL_CLAUDE_BIN="$fake/claude" AGENT_NOTIFY_INSTALL_OPENCODE_BIN="$fake/opencode" AGENT_NOTIFY_INSTALL_SECURITY_BIN="$fake/security" AGENT_NOTIFY_INSTALL_JXA_BIN="$fake/jxa" AGENT_NOTIFY_INSTALL_KEYCHAIN_HELPER="$fake/keychain-jxa" AGENT_NOTIFY_INSTALL_SETTINGS_HELPER="$fake/jxa" AGENT_NOTIFY_INSTALL_PLUGIN_HELPER="$fake/plugin-jxa")
 
@@ -73,6 +73,7 @@ for version in $supported_opencode_versions; do
   make_client "$fake/version-opencode" "$version"
   env $env AGENT_NOTIFY_INSTALL_OPENCODE_BIN="$fake/version-opencode" "$root/bin/agent-notify-install" --dry-run >/dev/null || { print -u2 -- 'supported OpenCode preflight rejected'; exit 1; }
 done
+[[ ! -e "$test_root/home" && $(<"$keychain_state/selector") == old-generation && ! -e "$keychain_state/current-generation" ]] || { print -u2 -- 'supported OpenCode dry-run mutated the fixture home or credentials'; exit 1; }
 
 typeset keychain_shim_log="$test_root/keychain-shim.log"
 /usr/bin/touch "$keychain_shim_log"

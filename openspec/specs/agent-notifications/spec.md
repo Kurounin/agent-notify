@@ -513,7 +513,7 @@ The adapter SHALL track observed `session.inbox.enqueued` items by `data.session
 - **AND** after relevant shells and other observed work settle it SHALL reconsider one completion through the normal quiescence path
 
 ### Requirement: Declare supported integration compatibility
-The repository SHALL declare supported macOS, Claude Code, and OpenCode ranges, identify the exact version used for real OpenCode verification, and declare the native permission/form event family. Initially OpenCode support SHALL be `>= 2.0.27, < 2.1.0`, with 2.0.27 as the verification baseline; V1 and earlier V2 releases SHALL NOT be supported. Accepting a patch range SHALL NOT be described as runtime-testing every patch, and a verification baseline SHALL NOT be described as runtime-verified before successful real-host checks. macOS and Claude compatibility parsing/policy SHALL remain unchanged. Before collecting credentials or performing mutation, the installer SHALL verify clients satisfy this policy and abort without changes for unsupported or unparseable versions. OpenCode preflight SHALL validate the complete announced version token, accepting the normal label and optional `v` prefix, and SHALL NOT accept malformed or unsupported suffixes/additional components by extracting a numeric prefix. Prerelease/build suffixes unsupported by the existing numeric version policy SHALL be rejected.
+The repository SHALL declare supported macOS, Claude Code, and OpenCode ranges, identify the exact version used for real OpenCode verification, and declare the native permission/form event family. OpenCode support SHALL be `>= 2.0.27, < 2.3.0`, with 2.0.27 as the runtime-verified baseline; V1 and earlier V2 releases SHALL NOT be supported. Accepting a version range SHALL NOT be described as runtime-testing every accepted release, and a verification baseline SHALL NOT be described as runtime-verified before successful real-host checks. macOS and Claude compatibility parsing/policy SHALL remain unchanged. Before collecting credentials or performing mutation, the installer SHALL verify clients satisfy this policy and abort without changes for unsupported or unparseable versions. OpenCode preflight SHALL validate the complete announced version token, accepting the normal label and optional `v` prefix, and SHALL NOT accept malformed or unsupported suffixes/additional components by extracting a numeric prefix. Prerelease/build suffixes unsupported by the existing numeric version policy SHALL be rejected.
 
 #### Scenario: An installed client is unsupported
 - **WHEN** the installer cannot verify a supported Claude Code or OpenCode version
@@ -524,20 +524,24 @@ The repository SHALL declare supported macOS, Claude Code, and OpenCode ranges, 
 - **THEN** compatibility validation and installation SHALL reject it without offering a legacy adapter fallback
 
 #### Scenario: OpenCode is in the supported patch line
-- **WHEN** a parseable OpenCode version is at least 2.0.27 and less than 2.1.0
+- **WHEN** a parseable OpenCode version is at least 2.0.27 and less than 2.3.0, including 2.1.0 and 2.2.1
 - **THEN** version-policy validation SHALL accept it while documentation separately identifies the version actually runtime-verified
 
 #### Scenario: OpenCode is in a later minor line
-- **WHEN** OpenCode is 2.1.0 or newer
-- **THEN** the initial compatibility policy SHALL reject it until support is deliberately expanded with evidence
+- **WHEN** OpenCode is 2.3.0 or newer
+- **THEN** the compatibility policy SHALL reject it until support is deliberately expanded with evidence
 
 #### Scenario: OpenCode reports its installed version with a label
-- **WHEN** the installed client reports `opencode v2.0.27`
-- **THEN** preflight SHALL validate the complete `v2.0.27` version token and accept it under the supported range
+- **WHEN** the installed client reports `opencode v2.0.27` or `opencode v2.2.1`
+- **THEN** preflight SHALL validate the complete version token and accept it under the supported range
+
+#### Scenario: OpenCode reports its installed version without a label
+- **WHEN** the installed client reports `v2.2.1` or `2.2.1`
+- **THEN** preflight, including dry-run, SHALL accept it under the supported range
 
 #### Scenario: OpenCode reports an unsupported version token suffix
-- **WHEN** OpenCode reports `opencode v2.0.27.1`, `opencode v2.0.27-rc.1`, or a version token with build metadata
-- **THEN** preflight, including dry-run, SHALL reject that complete token before credential collection or mutation rather than accept its `2.0.27` numeric prefix
+- **WHEN** OpenCode reports `opencode v2.0.27.1`, `opencode v2.0.27-rc.1`, `opencode v2.2.1.1`, `opencode v2.2.1-rc.1`, or a version token with build metadata
+- **THEN** preflight, including dry-run, SHALL reject that complete token before credential collection or mutation rather than accept its numeric prefix
 
 ### Requirement: Normalize native OpenCode permission and form attention
 The OpenCode adapter SHALL use only native `permission.asked/replied` and `form.created/replied/cancelled` attention events. It SHALL extract permission request IDs from `data.id` when asked and `data.requestID` when replied, and form IDs/session IDs from `data.form` when created and `data.id/sessionID` when settled. Attention SHALL be deduplicated by session, family, and request identifier; settlement SHALL clear only a matching observed request. Valid child requests SHALL remain observable independently of root lifecycle suppression. Forms owned by `global`, malformed requests, and requests lacking usable session-directory context SHALL be ignored. Form fields, answers, titles, URLs, and request metadata SHALL NOT be included in excerpts, normalized events, state, or diagnostics, and observation SHALL NOT reply or change host decisions.

@@ -7,7 +7,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import plugin, * as pluginModule from "../../integrations/opencode/agent-notify.js";
-import { assistant, createHarness, deferred, execution, flush, inbox, LocationRouter, native, session, status, text } from "./native-harness.js";
+import { assistant, createHarness, deferred, execution, flush, inbox, LocationRouter, native, session,
+  shellCreated, shellDeleted, shellExited, status, text } from "./native-harness.js";
 
 const directory = await mkdtemp(join(tmpdir(), "agent-notify-native-"));
 const settingsFile = join(directory, "settings.conf");
@@ -23,6 +24,14 @@ const form = (id, action, request = "request") => action === "created"
   : native(`form.${action}`, id, { id: request, answers: { secret: "private-answer-sentinel" } });
 const failure = (id, error = { type: "provider.invalid-request", message: "test failure", response: { body: "private-response-sentinel" } }) =>
   execution(id, "failed", { error });
+
+test("pinned native shell fixtures associate only creation, never fabricate settlement sessions", () => {
+  const created = shellCreated("sh_one", "root");
+  assert.equal(created.data.info.metadata.sessionID, "root");
+  assert.equal(Object.hasOwn(created.data, "sessionID"), false);
+  assert.deepEqual(shellExited("sh_one").data, { id: "sh_one", status: "exited", exit: 0 });
+  assert.deepEqual(shellDeleted("sh_one").data, { id: "sh_one" });
+});
 
 test("exports one native definition; detached setup owns an abortable subscription", async (t) => {
   assert.deepEqual(Object.keys(pluginModule), ["default"]);
@@ -57,6 +66,89 @@ test("requires observed activation, native success, idle and 50 ms quiescence", 
   assert.equal(h.events.length, 2);
   assert.deepEqual(h.getRequests[0], { sessionID: "unobserved" });
 });
+
+test("a root shell defers the original turn until settlement and fresh 50 ms quiescence", async (t) => {
+  const h = createHarness(t);
+  await h.emit(execution("root", "started"), shellCreated("sh_one", "root"));
+  await h.settle("root");
+  await h.scheduler.advanceBy(5000);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  await h.emit(shellExited("sh_one"));
+  await h.scheduler.advanceBy(49);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  await h.scheduler.advanceBy(1);
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+});
+
+test("all root/child/nested shells block only their own tree regardless of cwd or shared directory", async (t) => {
+  const h = createHarness(t, { sessions: { ...tree, other: session("other", undefined, "/work/root") } });
+  await h.emit(execution("root", "started"), execution("other", "started"),
+    shellCreated("sh_root", "root"), shellCreated("sh_child", "child", { cwd: "/elsewhere" }),
+    shellCreated("sh_nested", "grandchild"), shellCreated("sh_other", "other"));
+  await h.settle("root");
+  await h.settle("other");
+  await h.emit(shellCreated("sh_child", "child"), shellExited("sh_unmatched"), shellExited("sh_root"),
+    shellExited("sh_root"), shellDeleted("sh_nested"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "began:other"]);
+  await h.emit(shellExited("sh_child"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "began:other", "completed:root"]);
+  await h.emit(shellDeleted("sh_other"), shellDeleted("sh_other"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "began:other", "completed:root", "completed:other"]);
+  assert.equal(JSON.stringify(h.events).includes("sentinel"), false);
+  assert.ok(h.events.every((event) => Object.keys(event).every((key) =>
+    ["source", "event", "session_id", "session_dir", "request_id"].includes(key))));
+});
+
+test("malformed or unassociated shell creation is ignored without activation or guessing", async (t) => {
+  const h = createHarness(t);
+  const malformed = [
+    native("shell.created", "root", { id: "sh_one", status: "running" }),
+    ...[null, [], "wrong", { status: "running", id: "sh_one" }].map((info) => native("shell.created", "root", { info })),
+    ...[undefined, null, [], "root", {}, { sessionID: "" }, { sessionID: "x".repeat(513) }, { sessionID: "bad\nID" }]
+      .map((metadata) => shellCreated("sh_one", "root", { metadata })),
+    ...["", null, {}, "x".repeat(513), "bad\nID"].map((id) => shellCreated(id, "root")),
+    ...[undefined, "exited", "timeout", "killed", {}].map((status) => shellCreated("sh_one", "root", { status })),
+  ];
+  await h.emit(...malformed, shellExited("sh_unobserved"), shellDeleted("sh_unobserved"));
+  assert.deepEqual(h.events, []);
+  assert.deepEqual(h.getRequests, []);
+  await h.complete("root");
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+});
+
+test("malformed shell settlements cannot clear an observed running shell", async (t) => {
+  const h = createHarness(t);
+  await h.emit(execution("root", "started"), shellCreated("sh_one", "root"));
+  await h.settle("root");
+  await h.emit(...[undefined, "running", "invalid", {}, []].map((status) =>
+    native("shell.exited", undefined, { id: "sh_one", status })),
+  native("shell.exited", "root", { info: { id: "sh_one", status: "exited" } }),
+  native("shell.deleted", "root", { info: { id: "sh_one" } }), shellExited(""), shellDeleted({}));
+  await h.scheduler.advanceBy(1000);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  await h.emit(shellExited("sh_one"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+});
+
+for (const [label, settle] of [["nonzero", (id) => shellExited(id, "exited", 17)],
+  ["timeout", (id) => shellExited(id, "timeout")], ["killed", (id) => shellExited(id, "killed")], ["deleted", shellDeleted]]) {
+  test(`shell ${label} settles only its blocker, never agent success/failure or activation`, async (t) => {
+    const h = createHarness(t);
+    await h.emit(shellCreated("sh_unactivated", "unactivated"), settle("sh_unactivated"));
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.events, []);
+    await h.emit(execution("root", "started"), shellCreated("sh_one", "root"), settle("sh_one"));
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root"]);
+    await h.settle("root");
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+  });
+}
 
 test("busy is an activation fallback; native success projects idle without a separate status event", async (t) => {
   const h = createHarness(t);
@@ -469,6 +561,151 @@ test("root or nested activation invalidates a known candidate before stalled loo
   }
 });
 
+for (const id of ["root", "grandchild"]) {
+  test(`${id} shell creation cancels quiescence synchronously before stalled metadata`, async (t) => {
+    const lookup = deferred();
+    let stalled = false;
+    const h = createHarness(t, { getSession(name) { return stalled && name === id ? lookup.promise : tree[name]; } });
+    await h.emit(native("session.created", "child", { parentID: "root", location: tree.child.location }),
+      native("session.created", "grandchild", { parentID: "child", location: tree.grandchild.location }), execution("root", "started"));
+    await h.settle("root");
+    const stale = h.scheduler.pending.find((timer) => timer.delay === 50);
+    await h.scheduler.advanceBy(25);
+    stalled = true;
+    await h.emit(shellCreated("sh_one", id));
+    assert.equal(stale.cancelled, true);
+    stale.callback();
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root"]);
+    lookup.resolve(tree[id]);
+    await flush();
+    await h.emit(shellExited("sh_one"));
+    await h.scheduler.advanceBy(49);
+    assert.deepEqual(h.kinds, ["began:root"]);
+    await h.scheduler.advanceBy(1);
+    assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+  });
+}
+
+test("shell creation cancels delayed excerpt results without consuming the original root turn", async (t) => {
+  const context = deferred();
+  let delayed = true;
+  const h = createHarness(t, { getContext() { return delayed ? context.promise : [assistant(text("fresh"))]; } });
+  await h.emit(execution("root", "started"));
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.equal(h.contextRequests.length, 1);
+  await h.emit(shellCreated("sh_one", "root"));
+  context.resolve([assistant(text("stale"))]);
+  await flush();
+  assert.deepEqual(h.kinds, ["began:root"]);
+  delayed = false;
+  await h.emit(shellExited("sh_one"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+  assert.equal(h.events.at(-1).excerpt, "fresh");
+});
+
+test("nested shell creation discards a completion queued behind slow attention delivery", async (t) => {
+  const delivery = deferred();
+  const h = createHarness(t, { sessions: tree, delivery(event) { return event.event === "attention" ? delivery.promise : Promise.resolve(0); } });
+  await h.emit(execution("root", "started"), native("session.created", "child", { parentID: "root", location: tree.child.location }),
+    permission("root", "asked"));
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.equal(h.contextRequests.length, 1);
+  await h.emit(shellCreated("sh_one", "grandchild"));
+  delivery.resolve(0);
+  await flush();
+  assert.deepEqual(h.kinds, ["began:root", "attention:root"]);
+  await h.emit(shellDeleted("sh_one"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "attention:root", "completed:root"]);
+});
+
+for (const exitBeforeLookup of [false, true]) {
+  test(`shell ancestry resolves without activation or resurrecting settlement (early exit: ${exitBeforeLookup})`, async (t) => {
+    const lookup = deferred();
+    const h = createHarness(t, { getSession(id) { return id === "unknown" ? lookup.promise : session(id); } });
+    await h.emit(execution("root", "started"));
+    await h.settle("root");
+    await h.emit(shellCreated("sh_one", "unknown"));
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root"]);
+    if (exitBeforeLookup) await h.emit(shellExited("sh_one"));
+    lookup.resolve(session("unknown", "root"));
+    await flush();
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, exitBeforeLookup ? ["began:root", "completed:root"] : ["began:root"]);
+    if (!exitBeforeLookup) {
+      await h.emit(shellExited("sh_one"));
+      await h.scheduler.advanceBy(50);
+    }
+    assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+  });
+}
+
+for (const fallback of ["failure", "timeout"]) {
+  test(`shell metadata ${fallback} releases unrelated roots; later native ancestry picks up a live shell`, async (t) => {
+    const lookup = deferred();
+    let unavailable = false;
+    const h = createHarness(t, { getSession(id) {
+      if (id !== "unknown") return session(id);
+      if (unavailable) throw new Error("unavailable");
+      return lookup.promise;
+    } });
+    await h.emit(execution("root", "started"));
+    await h.settle("root");
+    await h.emit(shellCreated("sh_one", "unknown"));
+    if (fallback === "failure") { lookup.reject(new Error("unavailable")); await flush(); }
+    else await h.scheduler.advanceBy(1000);
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+    lookup.resolve(session("unknown", "root"));
+    await flush();
+    unavailable = true;
+    await h.emit(execution("root", "started"),
+      native("session.created", "unknown", { parentID: "root", location: { directory: "/work/unknown" } }));
+    await h.settle("root");
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root", "completed:root", "began:root"]);
+    await h.emit(shellExited("sh_one"));
+    await h.scheduler.advanceBy(50);
+    assert.deepEqual(h.kinds, ["began:root", "completed:root", "began:root", "completed:root"]);
+  });
+}
+
+test("unresolved shell ancestry stops blocking an unrelated root as soon as an independent tree resolves", async (t) => {
+  const lookup = deferred();
+  const h = createHarness(t, { getSession(id) { return id === "unknown" ? lookup.promise : session(id); } });
+  await h.emit(execution("root", "started"));
+  await h.settle("root");
+  await h.emit(shellCreated("sh_one", "unknown"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  lookup.resolve(session("unknown", undefined, "/work/root"));
+  await flush();
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+});
+
+test("a verified independent tree's shell lookups neither cancel nor starve root completion", async (t) => {
+  const lookup = deferred();
+  let stalled = false;
+  const h = createHarness(t, { getSession(id) { return stalled && id === "other" ? lookup.promise : session(id); } });
+  await h.emit(execution("root", "started"), native("session.created", "other", { location: { directory: "/work/root" } }));
+  await h.settle("root");
+  const candidate = h.scheduler.pending.find((timer) => timer.delay === 50);
+  stalled = true;
+  await h.emit(shellCreated("sh_one", "other"), shellCreated("sh_two", "other"));
+  assert.equal(candidate.cancelled, false);
+  await h.scheduler.advanceBy(50);
+  await h.complete("root");
+  assert.deepEqual(h.kinds, ["began:root", "completed:root", "began:root", "completed:root"]);
+  lookup.resolve(session("other"));
+  await flush();
+});
+
 test("root resumption during delayed excerpt cancels late text and preserves original turn", async (t) => {
   const context = deferred();
   let delayed = true;
@@ -675,6 +912,149 @@ test("deletion silently resets, invalidates pending lookup and never revives old
   await h.emit(status("root", "idle"), execution("root", "succeeded"));
   await h.scheduler.advanceBy(50);
   assert.deepEqual(h.kinds, ["began:root", "reset:root"]);
+});
+
+test("session deletion releases its shells and rejects delayed metadata and later orphan lifecycle events", async (t) => {
+  const lookup = deferred();
+  let delayed = false;
+  const h = createHarness(t, { getSession(id) { return delayed && id === "child" ? lookup.promise : tree[id]; } });
+  await h.emit(execution("root", "started"), native("session.created", "child", { parentID: "root", location: tree.child.location }));
+  await h.settle("root");
+  delayed = true;
+  await h.emit(shellCreated("sh_one", "child"), native("session.deleted", "child"), shellCreated("sh_orphan", "child"));
+  lookup.resolve(tree.child);
+  await flush();
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:child", "completed:root"]);
+  delayed = false;
+  await h.emit(native("session.created", "child", { parentID: "root", location: tree.child.location }), execution("root", "started"));
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "reset:child", "completed:root", "began:root", "completed:root"]);
+});
+
+for (const sameDirectory of [false, true]) {
+  test(`outgoing shell ownership is released despite late metadata (same directory: ${sameDirectory})`, async (t) => {
+    const oldLocation = { directory: "/work/old", workspaceID: "wrk_old" };
+    const newLocation = { directory: sameDirectory ? "/work/old" : "/work/new", workspaceID: "wrk_new" };
+    const lookup = deferred();
+    let delayed = false;
+    const sessions = { root: { id: "root", location: oldLocation } };
+    const outgoing = createHarness(t, { location: oldLocation, getSession() { return delayed ? lookup.promise : sessions.root; } });
+    const incoming = createHarness(t, { location: newLocation, sessions });
+    const router = new LocationRouter();
+    router.attach(oldLocation, outgoing.stream);
+    router.attach(newLocation, incoming.stream);
+    await router.emit(native("session.created", "root", { location: oldLocation }), execution("root", "started"), execution("root", "succeeded"));
+    delayed = true;
+    await router.emit({ ...shellCreated("sh_one", "root"), location: oldLocation });
+    sessions.root = { id: "root", location: newLocation };
+    await router.emit(native("session.moved", "root", { location: newLocation, projectID: "project" }));
+    lookup.resolve({ id: "root", location: oldLocation });
+    await flush();
+    await outgoing.scheduler.advanceBy(1000);
+    assert.deepEqual(outgoing.kinds, ["began:root"]);
+    assert.deepEqual(incoming.events, []);
+    await router.emit({ ...shellExited("sh_one"), location: newLocation }, execution("root", "started"), execution("root", "succeeded"));
+    await incoming.scheduler.advanceBy(50);
+    assert.deepEqual(incoming.kinds, ["began:root", "completed:root"]);
+    // Returning ownership must not recover the old running association or old turn.
+    delayed = false;
+    sessions.root = { id: "root", location: oldLocation };
+    await router.emit(native("session.moved", "root", { location: oldLocation, projectID: "project" }), execution("root", "started"), execution("root", "succeeded"));
+    await outgoing.scheduler.advanceBy(50);
+    assert.deepEqual(outgoing.kinds, ["began:root", "began:root", "completed:root"]);
+  });
+}
+
+test("same-owner moves retain live shells and re-resolve pending lookup under current ownership", async (t) => {
+  const lookup = deferred();
+  let delayed = false;
+  const location = { directory: "/work/root", workspaceID: "wrk_same" };
+  const h = createHarness(t, { location, getSession() { return delayed ? lookup.promise : { id: "root", location }; } });
+  await h.emit(execution("root", "started"));
+  await h.settle("root");
+  delayed = true;
+  await h.emit(shellCreated("sh_one", "root"));
+  delayed = false;
+  await h.emit(native("session.moved", "root", { location, projectID: "project" }));
+  lookup.resolve(session("root", undefined, "/work/obsolete"));
+  await flush();
+  await h.scheduler.advanceBy(1000);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  await h.emit(shellExited("sh_one"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+  assert.equal(h.events.at(-1).session_dir, location.directory);
+});
+
+for (const stop of ["cleanup", "end", "error"]) {
+  test(`${stop} discards running shells, delayed metadata and queued completion without replay`, async (t) => {
+    const lookup = deferred();
+    const context = deferred();
+    let delayed = false;
+    const h = createHarness(t, { getSession() { return delayed ? lookup.promise : session("root"); }, getContext() { return context.promise; } });
+    await h.emit(execution("root", "started"));
+    await h.settle("root");
+    await h.scheduler.advanceBy(50);
+    delayed = true;
+    await h.emit(shellCreated("sh_one", "root"));
+    if (stop === "cleanup") h.cleanup();
+    else h.stream.end(stop === "error" ? new Error("private-stream-sentinel") : undefined);
+    await flush();
+    lookup.resolve(session("root"));
+    context.resolve([assistant(text("stale"))]);
+    await flush();
+    await h.emit(shellExited("sh_one"));
+    await h.scheduler.advanceBy(1000);
+    assert.deepEqual(h.kinds, ["began:root"]);
+    assert.equal(h.scheduler.pending.length, 0);
+    const fresh = createHarness(t);
+    await fresh.emit(shellExited("sh_one"), execution("root", "succeeded"));
+    await fresh.scheduler.advanceBy(50);
+    assert.deepEqual(fresh.events, []);
+    await fresh.complete("root");
+    assert.deepEqual(fresh.kinds, ["began:root", "completed:root"]);
+  });
+}
+
+for (const id of ["root", "child"]) {
+  for (const outcome of ["succeeded", "failed", "interrupted"]) {
+    test(`${id} execution ${outcome} leaves a long-running shell blocking later success, not attention/failure`, async (t) => {
+      const h = createHarness(t, { sessions: tree });
+      await h.emit(execution("root", "started"));
+      if (id === "child") await h.emit(execution("child", "started"));
+      await h.emit(shellCreated("sh_one", id), execution(id, outcome));
+      if (id === "child") await h.settle("root");
+      await h.emit(permission(id, "asked"));
+      await h.scheduler.advanceBy(86_400_000);
+      assert.equal(h.kinds.includes("completed:root"), false);
+      assert.equal(h.kinds.includes(`attention:${id}`), true);
+      assert.equal(h.kinds.includes(`failed:${id}`), outcome === "failed");
+      await h.emit(execution(id, "started"), execution(id, "succeeded"));
+      await h.scheduler.advanceBy(50);
+      assert.equal(h.kinds.includes("completed:root"), false);
+      await h.emit(shellExited("sh_one"));
+      await h.scheduler.advanceBy(50);
+      assert.equal(h.kinds.filter((kind) => kind === "completed:root").length, 1);
+      assert.equal(h.kinds.filter((kind) => kind === "began:root").length, id === "root" && outcome !== "succeeded" ? 2 : 1);
+    });
+  }
+}
+
+test("settled shell output still requires inbox consumption and a subsequent execution outcome", async (t) => {
+  const h = createHarness(t);
+  await h.emit(execution("root", "started"), shellCreated("sh_one", "root"));
+  await h.settle("root");
+  await h.emit(shellExited("sh_one"), inbox("root", "enqueued", "msg_output"), inbox("root", "delivered", "msg_output"), status("root", "idle"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  await h.emit(execution("root", "started"));
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root"]);
+  await h.settle("root");
+  await h.scheduler.advanceBy(50);
+  assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
 });
 
 test("independent roots and plugin instances do not share turn/tree state", async (t) => {

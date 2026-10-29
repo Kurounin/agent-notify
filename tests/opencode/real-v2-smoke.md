@@ -31,19 +31,25 @@ are deliberately rejected.
 - Generates the actual managed artifact with `installer/opencode-plugin.jxa`.
   The substituted absolute notifier is a fixture-only stdin collector, not the
   notifier executable. It never reads Keychain or delivers a notification.
-- Allows only the fixture provider and only its native subagent tool. The
+- Allows only the fixture provider, its native subagent tool, and one exact
+  fixture-only shell command (`/bin/cat` reading a private FIFO in the fixture
+  project). The FIFO is created mode 0600 and released with one fixed output
+  write; there is no shell polling, arbitrary command input, or process scan. The
   scripted provider is a loopback OpenAI-compatible chat stream with no model
   credentials or external model calls. The private API password is a public,
   fixed fixture string, never an inherited credential.
 - Keeps bounded normalized fixture submissions privately; reduces native
   events to lifecycle counts in memory. Prints only categorical outcomes.
-  Shuts down its own processes and removes only its unique fixture tree.
+  Removes observed fixture shells through the private native API, shuts down
+  its own processes, and removes only its unique fixture tree.
 
 Pinned contracts used: `packages/cli/src/server-process.ts`,
 `packages/util/src/global-roots.ts`, `packages/core/src/config/discovery.ts`,
 `packages/server/src/routes.ts`, `packages/protocol/openapi.json`,
 `packages/core/src/tool/plugin/subagent.ts`, and
-`packages/core/src/session/subagent-completion.ts` at tag `v2.0.27`.
+`packages/core/src/session/subagent-completion.ts`,
+`packages/schema/src/shell.ts`, and `packages/core/src/tool/plugin/shell.ts`
+at tag `v2.0.27`.
 
 ## Evidence and interpretation
 
@@ -60,6 +66,16 @@ parent execution/result consumption, one root begin/completion, and no child
 begin/completion. No fake idle, execution, inbox, or child-result events are
 injected. These barriers verify one concrete observed native sequence, not a
 global timing guarantee.
+
+The shell scenario uses the real native `shell` tool with `background: true`.
+Its fixed command stays blocked on the fixture FIFO through the root's first
+successful local execution and a further 300 ms without completion. One write
+releases it; native shell exit and output/inbox handling must then resume the
+parent and produce one original root begin/completion after output consumption.
+The event observer retains only shell/session IDs and lifecycle status, never
+commands, output, PID, or capture paths. No shell lifecycle, execution, idle, or
+inbox events are injected. This checks live observation, not pre-subscription
+recovery, every accepted patch, or exhaustive process detection.
 
 Initial execution on 2026-10-13, using exact 2.0.27:
 
@@ -114,3 +130,30 @@ now passes 70 tests; notifier, Claude, and installer suites also passed. The
 real-host check confirms the existing concrete background-child sequence, not
 direct injection of malformed metadata or missing execution-start events. No
 live-home, Keychain, managed-service, or external-model access was used.
+
+## Running-shell execution — 2026-10-29
+
+Fresh execution with the official `@opencode/cli-darwin-arm64@2.0.27`
+archive and its pinned SHA-512 integrity passed on adapter SHA-256
+`a2f1ffcbdd02ae21ea99c11b5f4df900806e4a6f851b09de04e7b4d31ebf0d2e`:
+
+- Private isolation; generated-plugin loading/source, native subscription,
+  silent unload, and single active reload: **passed**.
+- Existing native background-child scenario: **2** children, **3** parent
+  executions, **2** results consumed, root begin/completion **1 / 1**, and
+  **0** child completions.
+- Native background-shell scenario: **1** shell observed running through the
+  parent's first successful execution and the additional 300 ms hold, with
+  **0** root completions while held. After release, native exit and output
+  consumption produced **2** total parent executions and root begin/completion
+  **1 / 1**, without a session failure.
+- All three categorical PASS checks succeeded; the command exited zero and
+  cleaned up its owned shell, server, provider, and temporary tree. No synthetic
+  lifecycle events, managed-service, live-home, Keychain, or external-model
+  access was used.
+
+The 103-test controlled adapter suite additionally establishes shell payload
+validation, tree-local association, settlement, cancellation during delayed
+work, bounded ancestry resolution, ownership changes, and inbox/outcome rules.
+The native result establishes only these exercised 2.0.27 sequences; it does
+not recover missed shell starts or guarantee exhaustive process detection.

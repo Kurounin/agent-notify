@@ -4,7 +4,8 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
-import { lstat, mkdir, mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir, userInfo } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +32,11 @@ const heldChildren = new Map();
 let parentRequests = 0;
 let resultConsumptions = 0;
 let nativeParent;
+const shellStates = new Map();
+let shellCommand;
+let shellRequests = 0;
+let shellResultConsumed = false;
+let removeFixtureShells;
 
 function check(value) {
   if (!value) throw new Error("categorical check failed");
@@ -92,7 +98,7 @@ async function normalized() {
   });
 }
 
-function reply(response, { text, calls } = {}) {
+function reply(response, { text, calls, tool = "subagent" } = {}) {
   response.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
   const chunk = (delta, finish_reason = null) => response.write(`data: ${JSON.stringify({
     id: "fixture-completion", object: "chat.completion.chunk", created: 0, model: "fixture",
@@ -100,7 +106,7 @@ function reply(response, { text, calls } = {}) {
   })}\n\n`);
   chunk({ role: "assistant" });
   if (calls) chunk({ tool_calls: calls.map((input, index) => ({
-    index, id: `fixture-call-${index}`, type: "function", function: { name: "subagent", arguments: JSON.stringify(input) },
+    index, id: `fixture-call-${index}`, type: "function", function: { name: tool, arguments: JSON.stringify(input) },
   })) });
   if (text) chunk({ content: text });
   chunk({}, calls ? "tool_calls" : "stop");
@@ -146,6 +152,17 @@ async function listenProvider() {
         reply(response, { text: consumed === 2 ? "fixture-parent-final" : "fixture-parent-waiting" });
         return;
       }
+      if (prompt.includes("fixture-shell-parent")) {
+        shellRequests += 1;
+        if (shellRequests === 1) {
+          check(input.tools.some((tool) => tool.function?.name === "shell"));
+          reply(response, { tool: "shell", calls: [{ command: shellCommand, workdir: path.join(root, "project"), background: true }] });
+          return;
+        }
+        shellResultConsumed = JSON.stringify(input.messages).includes("fixture-shell-result");
+        reply(response, { text: shellResultConsumed ? "fixture-shell-final" : "fixture-shell-waiting" });
+        return;
+      }
       check(prompt.includes("fixture-loader"));
       reply(response, { text: "fixture-loader-complete" });
     } catch {
@@ -179,6 +196,14 @@ async function subscribe(url, headers) {
         if (!data) continue;
         const event = JSON.parse(data);
         // Keep only fixture IDs, lifecycle types, and status. Never retain an event payload or output.
+        if (event.type === "shell.created") {
+          const info = event.data?.info;
+          check(shellStates.size < 16 && typeof info?.id === "string" && typeof info.metadata?.sessionID === "string");
+          shellStates.set(info.id, { sessionID: info.metadata.sessionID, status: info.status });
+        } else if (event.type === "shell.exited" || event.type === "shell.deleted") {
+          const shell = shellStates.get(event.data?.id);
+          if (shell) shell.status = event.type === "shell.deleted" ? "deleted" : event.data.status;
+        }
         if (!event.type?.startsWith("session.")) continue;
         const id = event.data?.sessionID;
         if (typeof id !== "string") continue;
@@ -260,6 +285,9 @@ if (existsSync(file) && statSync(file).size + bytes + 1 > ${MAX_CAPTURE}) proces
 appendFileSync(file, Buffer.concat([...chunks, Buffer.from("\\n")]), { mode: 0o600 });
 `, { mode: 0o600 });
   const quote = (text) => `'${text.replaceAll("'", "'\\''")}'`;
+  const shellRelease = path.join(project, "shell-release.fifo");
+  run("/usr/bin/mkfifo", ["-m", "600", shellRelease], env, project);
+  shellCommand = `/bin/cat ${quote(shellRelease)}`;
   await writeFile(stub, `#!/bin/zsh -f\n[[ "$1" == event && "$#" == 1 ]] || exit 1\nexec ${quote(process.execPath)} ${quote(stubModule)}\n`, { mode: 0o700 });
   const pluginPath = path.join(root, "config/opencode/plugins/agent-notify.js");
   run("/usr/bin/osascript", ["-l", "JavaScript", path.join(REPO, "installer/opencode-plugin.jxa"),
@@ -269,7 +297,8 @@ appendFileSync(file, Buffer.concat([...chunks, Buffer.from("\\n")]), { mode: 0o6
   const providerPort = await listenProvider();
   const config = {
     update: "disable", snapshots: false, model: "fixture/fixture", default_agent: "fixture-primary",
-    permissions: [{ action: "*", resource: "*", effect: "deny" }, { action: "subagent", resource: "fixture-child", effect: "allow" }],
+    permissions: [{ action: "*", resource: "*", effect: "deny" }, { action: "subagent", resource: "fixture-child", effect: "allow" },
+      { action: "shell", resource: shellCommand, effect: "allow" }],
     experimental: { policies: [{ action: "provider.use", resource: "*", effect: "deny" }, { action: "provider.use", resource: "fixture", effect: "allow" }] },
     providers: { fixture: { package: "@opencode/ai/providers/openai-compatible", settings: { baseURL: `http://127.0.0.1:${providerPort}/v1` },
       models: { fixture: { name: "Fixture", capabilities: { tools: true, input: ["text"], output: ["text"] }, limit: { context: 128000, output: 2048 } } } } },
@@ -298,6 +327,10 @@ appendFileSync(file, Buffer.concat([...chunks, Buffer.from("\\n")]), { mode: 0o6
     if (response.status === 204) return undefined;
     const value = await response.json();
     return Object.hasOwn(value, "data") ? value.data : value;
+  };
+  removeFixtureShells = async () => {
+    for (const id of shellStates.keys())
+      await api(`/api/shell/${encodeURIComponent(id)}?${new URLSearchParams({ "location[directory]": project })}`, "DELETE");
   };
   check((await api("/api/info")).version === "2.0.27");
   const plugins = () => api(`/api/plugin?${new URLSearchParams({ "location[directory]": project })}`);
@@ -369,6 +402,28 @@ appendFileSync(file, Buffer.concat([...chunks, Buffer.from("\\n")]), { mode: 0o6
   check(!events.some((event) => event.event === "failed"));
   check(sessionStates.get(parent).started === 3 && sessionStates.get(parent).delivered >= 3);
   console.log("PASS real-v2-smoke: exact=2.0.27 native-children=2 parent-executions=3 results-consumed=2 root-began=1 root-completed=1 child-completed=0");
+  phase = "native-background-shell-barrier";
+  const shellParent = await create("fixture-shell-parent");
+  await waitFor(() => shellStates.size === 1 && [...shellStates.values()].every((shell) =>
+    shell.sessionID === shellParent && shell.status === "running") && sessionStates.get(shellParent)?.succeeded === 1);
+  await delay(300);
+  check([...shellStates.values()].every((shell) => shell.status === "running"));
+  check(!(await normalized()).some((event) => event.session_id === shellParent && event.event === "completed"));
+  phase = "native-shell-output-consumption";
+  // One FIFO write releases only this fixture's fixed native command; no lifecycle injection.
+  const writer = await open(shellRelease, constants.O_WRONLY | constants.O_NONBLOCK);
+  try { await writer.writeFile("fixture-shell-result\n"); } finally { await writer.close(); }
+  await waitFor(() => [...shellStates.values()].every((shell) => shell.status === "exited") &&
+    shellResultConsumed && sessionStates.get(shellParent)?.succeeded >= 2);
+  phase = "native-shell-root-completion";
+  await complete(shellParent);
+  await delay(300);
+  const shellEvents = (await normalized()).filter((event) => event.session_id === shellParent);
+  check(shellEvents.filter((event) => event.event === "began").length === 1);
+  check(shellEvents.filter((event) => event.event === "completed").length === 1);
+  check(!shellEvents.some((event) => event.event === "failed"));
+  check(sessionStates.get(shellParent).started === 2 && sessionStates.get(shellParent).delivered >= 2);
+  console.log("PASS real-v2-smoke: exact=2.0.27 native-shells=1 held-root-completed=0 parent-executions=2 output-consumed=1 root-began=1 root-completed=1");
 }
 
 try {
@@ -385,8 +440,12 @@ try {
   process.exitCode = 1;
 } finally {
   try {
-    streamController?.abort();
+    try { await removeFixtureShells?.(); } catch {
+      console.error("FAIL real-v2-smoke: owned-shell-cleanup; no raw diagnostics emitted");
+      process.exitCode = 1;
+    }
     await stopServer();
+    streamController?.abort();
     await streamTask;
     if (provider) {
       provider.closeAllConnections();

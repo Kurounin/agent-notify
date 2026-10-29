@@ -368,8 +368,80 @@ For native `session.execution.failed`, the adapter SHALL submit one `failed` for
 - **WHEN** the plugin receives `session.idle`, a `properties`-only event, V1 `session.error`, `session.next.*`, `question.*`, or a speculative `.v2.*` alias
 - **THEN** it SHALL ignore those signals without invoking a V1 API or emitting a duplicate terminal event
 
+### Requirement: Defer OpenCode completion for running session-tree shells
+The OpenCode adapter SHALL defer a root's completion while an observed running shell belongs to that root or a known descendant. It SHALL associate shells by validated originating session identifiers, never directories, and settle only matching shell identifiers on native exit/deletion. Tracking SHALL remain in memory and best effort, without polling, process inspection, or additional normalized events.
+
+#### Scenario: A root succeeds while its shell is running
+- **WHEN** an activated root succeeds and becomes idle while an observed shell belonging to it remains running
+- **THEN** the adapter SHALL retain the pending turn without submitting `completed` or another `began`
+- **AND** it SHALL reconsider completion after that shell settles, subject to the existing tree, inbox, and quiescence conditions
+
+#### Scenario: Shells belong to multiple descendants
+- **WHEN** a successful idle root has observed running shells belonging to multiple known descendants, including a nested descendant
+- **THEN** completion SHALL remain deferred until every relevant shell has settled, even when those descendants are no longer executing
+
+#### Scenario: An unrelated session uses the same directory
+- **WHEN** an observed running shell belongs to a resolved independent session outside the root's tree, including one using the same directory
+- **THEN** that shell SHALL NOT block or cancel the root's completion
+- **AND** a relevant shell using a different working directory SHALL still block its own root's completion
+
+#### Scenario: Native shell creation identifies its originating session
+- **WHEN** a native `shell.created` event contains a running `data.info` record with usable shell identifier `data.info.id` and originating session identifier `data.info.metadata.sessionID`
+- **THEN** the adapter SHALL associate that shell with the originating session and its observed/resolved tree without requiring a top-level `data.sessionID`
+- **AND** shell observation alone SHALL NOT fabricate session activation, execution success, or lifecycle notifications
+
+#### Scenario: A shell precedes resolution of its session relationship
+- **WHEN** a valid shell creation arrives before its originating session's tree relationship is resolved
+- **THEN** the adapter SHALL apply the existing bounded relationship-resolution and conservative unresolved-work behavior until lookup/fallback settles
+- **AND** subsequent usable relationship information SHALL associate the still-running shell with the resolved tree rather than permanently treating it as unrelated
+
+#### Scenario: Exit and deletion identify only the shell
+- **WHEN** native `shell.exited` with a terminal status or `shell.deleted` supplies `data.id` matching an observed running shell without supplying a session identifier
+- **THEN** the adapter SHALL settle only that shell and reconsider the affected root without requiring another root idle or success event
+
+#### Scenario: Shell events are duplicated or unmatched
+- **WHEN** a creation is duplicated, a settlement is repeated, or an exit/deletion has no matching observed shell
+- **THEN** the adapter SHALL NOT create duplicate blockers, clear another shell, or produce duplicate completion notifications
+
+#### Scenario: Shell data is malformed or unassociated
+- **WHEN** a shell event has wrong native nesting, unusable identifiers, missing usable originating-session metadata, or a creation record that is not running
+- **THEN** the adapter SHALL ignore that event without guessing an association from command text or directory, exposing raw payloads, or ending observation
+
+#### Scenario: An exit event does not carry a terminal status
+- **WHEN** a `shell.exited` event matches an observed shell but its `data.status` is missing, invalid, or still running
+- **THEN** the adapter SHALL ignore that malformed settlement without clearing the running-shell blocker
+
+#### Scenario: A shell ends unsuccessfully
+- **WHEN** an observed shell exits nonzero, times out, is killed, or is deleted
+- **THEN** its settlement SHALL remove only its running-shell blocker and SHALL NOT establish session success or produce an agent-failure notification
+- **AND** a successful root SHALL still require all other completion conditions
+
+#### Scenario: A session outcome does not settle its running shells
+- **WHEN** a session reports native success, failure, or interruption while one of its observed shells is still running
+- **THEN** that execution outcome SHALL NOT by itself clear the running-shell association
+- **AND** existing session failure/interruption notification and terminal-suppression behavior SHALL remain unchanged
+
+#### Scenario: Shell output resumes the agent
+- **WHEN** a relevant shell settles and admitted inbox work or native execution resumes the deferred root to consume its output before completion submission
+- **THEN** the adapter SHALL wait for the existing inbox/execution settlement conditions without another `began` or restarting the original turn timer
+
+#### Scenario: A relevant shell is deliberately long-running
+- **WHEN** an observed shell in the root's tree remains running indefinitely without a matching settlement event
+- **THEN** the adapter SHALL keep completion deferred rather than inventing a shell lifetime limit or manufacturing completion
+- **AND** existing attention and execution-failure notifications SHALL remain available
+
+#### Scenario: Session ownership changes or observation stops
+- **WHEN** a shell's session is deleted or relinquished to another location-scoped observer, or plugin cleanup ends observation
+- **THEN** the old observation SHALL release its associated shell tracking without allowing late lookup/settlement work to revive obsolete sessions or submit stale completion
+- **AND** a same-owner move SHALL preserve still-running shell associations under current ownership
+
+#### Scenario: Shell work was not observed
+- **WHEN** shells started before the live subscription, run outside OpenCode's shell lifecycle, or belong to independently moved descendants outside the observer's scope
+- **THEN** the adapter SHALL NOT claim exhaustive detection or inspect operating-system processes to recover them
+- **AND** a new plugin generation SHALL NOT fabricate activation or replay missed shell events
+
 ### Requirement: Confirm OpenCode root quiescence before completion
-The OpenCode adapter SHALL require a short bounded quiescence interval after a successful root is idle, all known descendants are settled, and no observed inbox work remains outstanding before submitting `completed`. It SHALL maintain at most one tokenized completion candidate per root and SHALL synchronously invalidate a known candidate upon ingestion of root/descendant activation, retry, interruption, failure, deletion, ownership change, or admitted inbox work, before awaiting metadata lookup or notification delivery. It SHALL invalidate candidates when their tree is merged/removed or their plugin generation stops, and SHALL re-evaluate eligibility after the interval, after asynchronous excerpt retrieval, and immediately before subprocess submission at the front of the per-session notification FIFO. A completion waiting in that FIFO SHALL remain cancellable; the candidate/root turn SHALL NOT be consumed merely because excerpt retrieval finished. A root resumed before completion submission SHALL discard that queued completion and keep its original turn start without another `began`. A continuously valid candidate SHALL submit one completion without requiring another root idle event, consuming the turn at the submission boundary without awaiting the subprocess's exit. Already-submitted notifications SHALL NOT be treated as retractable. The event-ingestion/invalidation path SHALL NOT wait for a notifier subprocess to finish.
+The OpenCode adapter SHALL require a short bounded quiescence interval after a successful root is idle, all known descendants are settled, no observed inbox work remains outstanding, and no observed running shell belongs to the root or its known descendants before submitting `completed`. It SHALL maintain at most one tokenized completion candidate per root and SHALL synchronously invalidate a known candidate upon ingestion of root/descendant activation, retry, interruption, failure, deletion, ownership change, admitted inbox work, or a newly observed relevant running shell, before awaiting metadata lookup or notification delivery. It SHALL invalidate candidates when their tree is merged/removed or their plugin generation stops, and SHALL re-evaluate eligibility after the interval, after asynchronous excerpt retrieval, and immediately before subprocess submission at the front of the per-session notification FIFO. A completion waiting in that FIFO SHALL remain cancellable; the candidate/root turn SHALL NOT be consumed merely because excerpt retrieval finished. A root resumed before completion submission SHALL discard that queued completion and keep its original turn start without another `began`. A continuously valid candidate SHALL submit one completion without requiring another root idle event, consuming the turn at the submission boundary without awaiting the subprocess's exit. Already-submitted notifications SHALL NOT be treated as retractable. The event-ingestion/invalidation path SHALL NOT wait for a notifier subprocess to finish.
 
 Metadata reduction barriers SHALL be scoped to affected observed trees, preserving their ingestion order while permitting verified independent trees to progress. An unrelated resolved root's stalled or sustained metadata work SHALL NOT delay a continuously valid completion candidate or ready lifecycle reduction on another root. Unresolved relationships SHALL retain conservative protection against premature subtree completion until bounded lookup/fallback resolves them.
 
@@ -380,7 +452,7 @@ The adapter SHALL track observed `session.inbox.enqueued` items by `data.session
 - **THEN** the adapter SHALL cancel that candidate without `completed` or another `began` and SHALL keep tracking the same root turn
 
 #### Scenario: A deferred root remains settled
-- **WHEN** the root is successful and idle, all known descendants remain settled, and no outstanding admitted work or resumption appears throughout quiescence
+- **WHEN** the root is successful and idle, all known descendants remain settled, no relevant observed shell remains running, and no outstanding admitted work or resumption appears throughout quiescence
 - **THEN** the adapter SHALL submit one completion without another idle signal
 
 #### Scenario: Duplicate idle signals arrive during quiescence
@@ -417,7 +489,7 @@ The adapter SHALL track observed `session.inbox.enqueued` items by `data.session
 
 #### Scenario: Delivered child work fails or is interrupted
 - **WHEN** a child's delivered inbox work reaches a native execution failure/interruption and no outstanding observed work remains for that child
-- **THEN** the child SHALL be treated as settled under the existing child-outcome policy without requiring child success or automatically failing a successful root
+- **THEN** the child SHALL be treated as settled under the existing child-outcome policy without requiring child success or automatically failing the root
 
 #### Scenario: Duplicate or unrelated inbox signals arrive
 - **WHEN** an inbox admission/settlement is duplicated or a delivered/cancelled event has no matching observed item for its session and inbox identifier
@@ -426,6 +498,19 @@ The adapter SHALL track observed `session.inbox.enqueued` items by `data.session
 #### Scenario: Queued work is cancelled
 - **WHEN** the last outstanding observed inbox item is cancelled while a previously successful root is idle and all known descendants are settled
 - **THEN** the adapter SHALL re-evaluate completion eligibility rather than leaving the turn blocked indefinitely
+
+#### Scenario: A shell starts during quiescence
+- **WHEN** a new observed shell belongs to the root or a known descendant while that root's completion candidate is waiting for quiescence
+- **THEN** the adapter SHALL invalidate the candidate immediately, before any session lookup completes, and SHALL require a fresh quiescence interval once the tree is eligible again
+
+#### Scenario: A shell starts during excerpt retrieval
+- **WHEN** a relevant shell starts while a root completion's excerpt lookup is pending
+- **THEN** late excerpt results SHALL NOT cause that invalidated completion to be submitted
+
+#### Scenario: A shell starts while completion waits in the notification FIFO
+- **WHEN** a relevant shell starts after excerpt retrieval but before the queued completion reaches subprocess submission
+- **THEN** the adapter SHALL discard the queued completion without consuming the root turn or restarting its timer
+- **AND** after relevant shells and other observed work settle it SHALL reconsider one completion through the normal quiescence path
 
 ### Requirement: Declare supported integration compatibility
 The repository SHALL declare supported macOS, Claude Code, and OpenCode ranges, identify the exact version used for real OpenCode verification, and declare the native permission/form event family. Initially OpenCode support SHALL be `>= 2.0.27, < 2.1.0`, with 2.0.27 as the verification baseline; V1 and earlier V2 releases SHALL NOT be supported. Accepting a patch range SHALL NOT be described as runtime-testing every patch, and a verification baseline SHALL NOT be described as runtime-verified before successful real-host checks. macOS and Claude compatibility parsing/policy SHALL remain unchanged. Before collecting credentials or performing mutation, the installer SHALL verify clients satisfy this policy and abort without changes for unsupported or unparseable versions. OpenCode preflight SHALL validate the complete announced version token, accepting the normal label and optional `v` prefix, and SHALL NOT accept malformed or unsupported suffixes/additional components by extracting a numeric prefix. Prerelease/build suffixes unsupported by the existing numeric version policy SHALL be rejected.

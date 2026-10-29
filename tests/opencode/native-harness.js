@@ -2,11 +2,19 @@ import assert from "node:assert/strict";
 import plugin from "../../integrations/opencode/agent-notify.js";
 
 // Sanitized structural fixtures pinned to OpenCode v2.0.27 packages/schema/src/
-// {event,session-event,session-status-event,session,permission,form,session-message,session-error}.ts.
+// {event,session-event,session-status-event,session,permission,form,session-message,session-error,shell}.ts.
 let nextEventID = 0;
 export function native(type, sessionID, data = {}, extra = {}) {
-  return { id: `evt_fixture_${++nextEventID}`, created: 0, type, data: { sessionID, ...data }, ...extra };
+  return { id: `evt_fixture_${++nextEventID}`, created: 0, type,
+    data: { ...(sessionID === undefined ? {} : { sessionID }), ...data }, ...extra };
 }
+export const shellCreated = (id, sessionID, info = {}) => native("shell.created", undefined, { info: {
+  id, status: "running", command: "private-command-sentinel", cwd: "/private/cwd-sentinel", shell: "/bin/zsh",
+  file: "/private/capture-sentinel", pid: 123, metadata: { sessionID, secret: "private-metadata-sentinel" },
+  time: { started: 0 }, ...info,
+} });
+export const shellExited = (id, status = "exited", exit = 0) => native("shell.exited", undefined, { id, status, exit });
+export const shellDeleted = (id) => native("shell.deleted", undefined, { id });
 export const execution = (id, outcome, data) => native(`session.execution.${outcome}`, id, data);
 export const status = (id, type, extra = {}) => native("session.status", id, { status: { type, ...extra } });
 export const inbox = (id, action, inboxID) => native(`session.inbox.${action}`, id, { inboxID,

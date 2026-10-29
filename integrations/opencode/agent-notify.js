@@ -149,6 +149,19 @@ function encodeEvent(event) {
 function normalizeEvent(event) {
   const data = event?.data;
   if (!data || typeof data !== "object" || Array.isArray(data)) return undefined;
+  if (event.type === "shell.created") {
+    const info = data.info;
+    if (!info || typeof info !== "object" || Array.isArray(info) || info.status !== "running" ||
+        !info.metadata || typeof info.metadata !== "object" || Array.isArray(info.metadata)) return undefined;
+    const shellID = boundedIdentifier(info.id);
+    const sessionID = boundedIdentifier(info.metadata.sessionID);
+    return shellID && sessionID ? { kind: "shell-started", shellID, sessionID } : undefined;
+  }
+  if (event.type === "shell.exited" || event.type === "shell.deleted") {
+    const shellID = boundedIdentifier(data.id);
+    if (!shellID || (event.type === "shell.exited" && !["exited", "timeout", "killed"].includes(data.status))) return undefined;
+    return { kind: "shell-settled", shellID };
+  }
   let kind = EXECUTION_EVENTS.get(event.type);
   let sessionID = boundedIdentifier(data.sessionID);
   let requestID;
@@ -202,6 +215,7 @@ function setupAdapter(ctx) {
   const spawn = globalThis.Bun?.spawn;
   const controller = new AbortController();
   const sessions = new Map();
+  const shells = new Map();
   const ownership = new Map();
   const deleted = new Set();
   const departed = new Set();
@@ -383,6 +397,7 @@ function setupAdapter(ctx) {
       if (id !== rootID && (session.executing ||
           (["busy", "retry"].includes(session.status) && !["failed", "interrupted"].includes(session.outcome)))) return false;
     }
+    for (const id of shells.values()) if (rootFor(id) === rootID) return false;
     return true;
   }
 
@@ -495,7 +510,7 @@ function setupAdapter(ctx) {
     if (event.kind === "moved" && !sameLocation(details?.location, event.nativeLocation)) details = undefined;
     const session = recordMetadata(event, details);
     if (!session) return;
-    if (event.kind === "created" || event.kind === "moved") return;
+    if (["created", "moved", "shell-started"].includes(event.kind)) return;
     if (event.kind === "started") {
       activate(id, session);
       session.status = "busy";
@@ -541,15 +556,24 @@ function setupAdapter(ctx) {
   function ingest(event) {
     const normalized = normalizeEvent(event);
     if (stopped || !normalized) return;
+    // Shell liveness changes only here, never in a delayed metadata reducer.
+    if (normalized.kind === "shell-settled") {
+      if (shells.delete(normalized.shellID)) drainIntake();
+      return;
+    }
     const id = normalized.sessionID;
     if (departed.has(id) && normalized.kind !== "moved") {
       if (normalized.kind !== "created" || !sameLocation(normalized.nativeLocation, instanceLocation)) return;
       departed.delete(id);
     }
     if (!ownership.has(id)) ownership.set(id, {});
+    if (normalized.kind === "shell-started") {
+      if (deleted.has(id) || shells.has(normalized.shellID)) return;
+      shells.set(normalized.shellID, id);
+    }
     // Invalidation is synchronous at intake, not hidden behind metadata or delivery latency.
     const observedInbox = sessions.get(id)?.inbox;
-    const invalidating = ["started", "failed", "interrupted", "deleted", "moved"].includes(normalized.kind) ||
+    const invalidating = ["started", "failed", "interrupted", "deleted", "moved", "shell-started"].includes(normalized.kind) ||
       (normalized.kind === "status" && ["busy", "retry"].includes(normalized.status)) ||
       (normalized.kind === "enqueued" && !observedInbox?.has(normalized.requestID)) ||
       (["delivered", "cancelled"].includes(normalized.kind) && observedInbox?.get(normalized.requestID) === "pending");
@@ -558,6 +582,7 @@ function setupAdapter(ctx) {
       const directory = sessions.get(id)?.directory ?? normalized.directory;
       ownership.set(id, {});
       sessions.delete(id);
+      for (const [shellID, sessionID] of shells) if (sessionID === id) shells.delete(shellID);
       deleted.add(id);
       for (const queued of queuedControls) if (queued.event.session_id === id) queuedControls.delete(queued);
       // The reset is owned by deletion, not by the removed observation state.
@@ -580,6 +605,7 @@ function setupAdapter(ctx) {
         // Drop outgoing observation, not just its candidate token: old success cannot be re-armed.
         departed.add(id);
         sessions.delete(id);
+        for (const [shellID, sessionID] of shells) if (sessionID === id) shells.delete(shellID);
         for (const queued of queuedControls) if (queued.event.session_id === id) queuedControls.delete(queued);
         drainIntake();
         return;
@@ -626,6 +652,7 @@ function setupAdapter(ctx) {
     children.clear();
     candidates.clear();
     sessions.clear();
+    shells.clear();
     ownership.clear();
     deleted.clear();
     departed.clear();

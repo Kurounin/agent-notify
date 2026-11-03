@@ -36,7 +36,7 @@ typeset -a attempt_created_dirs
 usage() { print -u2 -- 'usage: agent-notify-install [--dry-run|--rollback]'; }
 die() { print -u2 -- "agent-notify-install: $*"; exit 1; }
 sha256() { /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'; }
-mode() { /usr/bin/stat -f '%Lp' "$1"; }
+mode() { /usr/bin/stat -L -f '%Lp' "$1"; }
 command_path() { command -v "$1" 2>/dev/null || true; }
 
 probe_keychain() {
@@ -141,9 +141,22 @@ mark_new_directory() {
   [[ -d $1 ]] || attempt_created_dirs+=("$1")
 }
 
+manifest_field() { "$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" "$1" 2>/dev/null; }
+
 rollback_preflight() {
   [[ -x $jxa_bin ]] || die "required executable unavailable: $jxa_bin"
   [[ -r $manifest_path ]] || die 'no installation manifest found'
+  local backup label expected backup_name recorded post_hash existed
+  backup=$(manifest_field backup) || die 'installation manifest is invalid; no changes made'
+  [[ ${backup:h} == "$backup_root" && ${backup:t} == install.* ]] || die 'recorded backup directory is not under the backup location for this home; no changes made'
+  for label expected backup_name in binary "$install_bin" agent-notify library "$install_lib" lib hook "$claude_hook_path" agent-notify-claude-hook hook_jxa "$claude_hook_jxa_path" agent-notify-claude-hook.jxa plugin "$plugin_path" agent-notify.js settings "$settings_path" settings.json; do
+    recorded=$(manifest_field "files.$label.path") && [[ $recorded == "$expected" ]] || die "recorded path for $label is not the managed path for this home; no changes made"
+    post_hash=$(manifest_field "files.$label.post_hash") && [[ $post_hash =~ '^[0-9a-f]{64}$' ]] && existed=$(manifest_field "files.$label.existed") || die "installation manifest entry for $label is invalid; no changes made"
+    # cp -pR keeps a library link as a link, which may not resolve from the backup directory. File backups are never links.
+    [[ $existed == true && ( -e $backup/$backup_name || $label == library && -L $backup/$backup_name ) || $existed == false && ! -e $backup/$backup_name ]] || die "backup of $label does not match the manifest; no changes made"
+    # The library is restored with cp -pR and has no modes entry.
+    [[ $label == library || $existed == false ]] || /usr/bin/grep -Eqs "^$backup_name [0-7]{1,4}$" "$backup/modes" || die "backup of $label has no recorded mode; no changes made"
+  done
 }
 
 classify_file() {
@@ -376,12 +389,12 @@ install() {
   print -- "  excerpt settings: $settings_conf_path"
   print -- "  installed hashes: notifier=$bin_post_hash library=$lib_post_hash plugin=$plugin_post_hash settings=$settings_post_hash"
   print -- "  smoke test: $install_bin smoke-test"
-  print -- "  rollback: $0 --rollback (uses post-install hashes; it restores an exact backup only when the current hash still matches, otherwise manually remove commands prefixed '$command_prefix')"
+  print -- "  rollback: $root/bin/agent-notify-install --rollback (restores only artifacts whose hashes still match this install; changed files are left in place and reported)"
 }
 
 rollback() {
   [[ -r $manifest_path ]] || die 'no installation manifest found'
-  local binary library hook hook_jxa plugin settings generation_value previous_generation backup post
+  local binary library hook hook_jxa plugin settings generation_value previous_generation backup post existed backup_name entry saved_mode
   binary=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.binary.path)
   library=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.library.path)
   hook=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.hook.path)
@@ -392,15 +405,13 @@ rollback() {
   generation_value=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" generation)
   previous_generation=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" previous_generation 2>/dev/null || true)
   for label in binary hook hook_jxa plugin; do
-    local existed backup_name
     post=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" "files.$label.post_hash")
     existed=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" "files.$label.existed")
     local target=${(P)label}
     case $label in binary) backup_name=agent-notify;; hook) backup_name=agent-notify-claude-hook;; hook_jxa) backup_name=agent-notify-claude-hook.jxa;; plugin) backup_name=agent-notify.js;; esac
-    if [[ -e $target && $(sha256 "$target") == $post ]]; then
+    if [[ -e $target && ! -L $target && $(sha256 "$target") == $post ]]; then
       if [[ $existed == true ]]; then
         /bin/cp -p "$backup/$backup_name" "$target"
-        local entry saved_mode
         while read -r entry saved_mode; do [[ $entry == $backup_name ]] && { /bin/chmod "$saved_mode" "$target"; break; }; done < "$backup/modes"
       else
         /bin/rm -f "$target"
@@ -412,22 +423,25 @@ rollback() {
   post=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.library.post_hash)
   local library_existed
   library_existed=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.library.existed)
-  if [[ -d $library && $(tree_hash "$library") == $post ]]; then
+  if [[ -d $library && ! -L $library && $(tree_hash "$library") == $post ]]; then
     /bin/rm -rf "$library"
     [[ $library_existed == true ]] && /bin/cp -pR "$backup/lib" "$library"
   else print -u2 -- 'rollback: left externally changed library in place'; fi
   local settings_existed_before
   post=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.settings.post_hash)
   settings_existed_before=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.settings.existed)
-  if [[ -e $settings && $(sha256 "$settings") == $post ]]; then
+  if [[ -e $settings && ! -L $settings && $(sha256 "$settings") == $post ]]; then
     if [[ $settings_existed_before == true ]]; then
       /bin/cp -p "$backup/settings.json" "$settings"
-      local entry saved_mode
       while read -r entry saved_mode; do [[ $entry == settings.json ]] && { /bin/chmod "$saved_mode" "$settings"; break; }; done < "$backup/modes"
     else
       /bin/rm -f "$settings"
     fi
-  else print -u2 -- 'rollback: Claude settings changed; manually remove commands beginning with the recorded notifier prefix'; fi
+  elif [[ $settings_existed_before == true && -e $hook ]]; then
+    print -u2 -- "rollback: left changed Claude settings in place; compare them with $backup/settings.json, and remove commands beginning with $command_prefix only if the notifier is no longer wanted"
+  else
+    print -u2 -- "rollback: left changed Claude settings in place; manually remove commands beginning with $command_prefix"
+  fi
   if confirm 'Also remove the Pushover credentials from Keychain?'; then
     print -rn -- "{\"generation\":\"$generation_value\",\"previous\":\"$previous_generation\"}" | "$jxa_bin" -l JavaScript "$keychain_helper" remove
   fi
@@ -435,6 +449,7 @@ rollback() {
 }
 
 while (( $# )); do case $1 in --dry-run) dry_run=1;; --rollback) rollback=1;; *) usage; exit 2;; esac; shift; done
+if (( dry_run && rollback )); then usage; exit 2; fi
 trap cleanup_attempt EXIT INT TERM
 if (( rollback )); then rollback_preflight; rollback; exit 0; fi
 preflight

@@ -18,8 +18,9 @@ if (text === null) {
 try {
   const manifest = JSON.parse(ObjC.unwrap(text));
   const value = field.split('.').reduce((object, key) => object[key], manifest);
-  if (typeof value !== 'string' && typeof value !== 'boolean') throw new Error('manifest field is not a scalar');
-  output(String(value));
+  const isFlag = field.endsWith('.existed');
+  if (isFlag ? ![0, 1, true, false].includes(value) : typeof value !== 'string') throw new Error('manifest field is invalid');
+  output(isFlag ? String(Boolean(value)) : value);
 } catch (exception) {
   throw exception;
 }

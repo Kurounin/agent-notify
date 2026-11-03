@@ -41,13 +41,17 @@ To update, use a newer trusted checkout and rerun the installer (preview with `-
 
 ```zsh
 bin/agent-notify-install
+```
 
-# Selectively restore the backup from the most recent installation.
-# The command asks whether to remove the v2 Pushover credentials as well.
+The installer writes the notifier and Claude adapter to `~/.local/bin`, the library to `~/.local/lib/agent-notify`, the single native OpenCode plugin to `~/.config/opencode/plugins/agent-notify.js`, and managed hook entries to `~/.claude/settings.json`. It does not edit unrelated OpenCode configuration or agent profiles. User-only backups live outside plugin discovery under `~/Library/Application Support/agent-notify/install-backups/`; the install manifest records owned paths and hashes. A restored V1 plugin is **not compatible with OpenCode V2**: intentionally returning to OpenCode V1 also requires a prior compatible project release, not a widened V2 installer policy.
+
+To undo the most recent installation, run this on its own. It does not ask before changing files; it only asks whether to remove the v2 Pushover credentials as well.
+
+```zsh
 bin/agent-notify-install --rollback
 ```
 
-The installer writes the notifier and Claude adapter to `~/.local/bin`, the library to `~/.local/lib/agent-notify`, the single native OpenCode plugin to `~/.config/opencode/plugins/agent-notify.js`, and managed hook entries to `~/.claude/settings.json`. It does not edit unrelated OpenCode configuration or agent profiles. User-only backups live outside plugin discovery under `~/Library/Application Support/agent-notify/install-backups/`; the install manifest records owned paths and hashes. Rollback restores only artifacts whose hashes still match the installed version, including original bytes and modes; it leaves externally changed files in place and tells you what must be removed manually. A restored V1 plugin is **not compatible with OpenCode V2**: intentionally returning to OpenCode V1 also requires a prior compatible project release, not a widened V2 installer policy.
+Rollback restores only artifacts whose hashes still match the installed version, including original bytes and modes, and removes matching artifacts the install created; it leaves externally changed files in place. Rollback undoes only the most recent install, and `--rollback` itself is the confirmation for files. After a same-version reinstall it restores the same files. A repeat run changes no further files unless an edit was reverted, and it still offers credential removal; files whose bytes differ from the install, including removed ones, are reported as changed. It leaves a symbolic link at a managed path alone. A managed file that was already a symbolic link before the install is not recreated as one, because the install replaced it: rollback restores a regular file with the target's bytes and mode, and it does not restore a dangling link. For changed Claude settings it names the hook prefix to remove when the install created the file or the hook adapter is gone, and otherwise the backup to compare with. It refuses with no changes when the manifest is unreadable or invalid or belongs to another home, or when a backup or recorded mode it needs is missing or contradicts the manifest, and `--dry-run` cannot preview it. It does not check the contents of a backup that is present. Answering yes to credential removal after an upgrade rollback leaves no credentials until the next install. Empty directories, the manifest, backups, and `settings.conf` stay.
 
 After updating, allow OpenCode configuration reload and verify that the `agent-notify` plugin is active. If reload does not activate the replacement, restart your own OpenCode service after checking its status; the installer does not restart it. Subscription events are live-only: reload/disconnect can miss events, and the plugin does not reconstruct or replay earlier turns.
 

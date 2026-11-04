@@ -77,7 +77,7 @@ ObjC.registerSubclass({
         if (tmuxLookup.bytes + length > MAX_TMUX_OUTPUT_BYTES) {
           tmuxLookup.overflow = true;
           tmuxLookup.finished = true;
-          if (tmuxLookup.task.isRunning) tmuxLookup.task.terminate();
+          if (tmuxLookup.task.isRunning) tmuxLookup.task.terminate;
           return;
         }
 
@@ -128,7 +128,7 @@ function tmuxSessionForEvent() {
     }
     if (!tmuxLookup.finished && (task.isRunning || !tmuxLookup.eof)) {
       tmuxLookup.finished = true;
-      if (task.isRunning) task.terminate();
+      if (task.isRunning) task.terminate;
       return undefined;
     }
     if (tmuxLookup.overflow || task.terminationStatus !== 0) return undefined;
@@ -137,7 +137,7 @@ function tmuxSessionForEvent() {
     const session = typeof text === 'string' && text.endsWith('\n') ? text.slice(0, -1) : text;
     return validContext(session) ? session : undefined;
   } catch (_) {
-    if (task && task.isRunning) task.terminate();
+    if (task && task.isRunning) task.terminate;
     return undefined;
   } finally {
     if (observer) $.NSNotificationCenter.defaultCenter.removeObserver(observer);

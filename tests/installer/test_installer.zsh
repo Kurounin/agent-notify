@@ -508,6 +508,204 @@ must_rollback "$prior_library_home" no
 assert_tree "$prior_library_home" "$prior_library_tree" 'rollback did not restore the prior relative library link'
 [[ $(<"$prior_library_home/.local/lib/agent-notify/config.zsh") == '# seed library' ]] || fail_with 'the restored library link does not reach its files' "$rollback_output"
 
+# A link whose target cannot be reached looks absent to [[ -e ]], so replacing it takes the same consent as any other conflict.
+typeset link_missing="$test_root/no-such-target" link_home link_tree link_output link_path link_step
+typeset -i link_code=0 link_index=0
+typeset -a link_paths=(.local/bin/agent-notify .local/lib/agent-notify .local/bin/agent-notify-claude-hook .local/bin/agent-notify-claude-hook.jxa .config/opencode/plugins/agent-notify.js .claude/settings.json 'Library/Application Support/agent-notify/install-manifest.json')
+# link_attempt <home> <confirm sequence> [<env assignment>...]: runs one install, which may fail.
+link_attempt() {
+  local attempt_home=$1 attempt_confirm=$2
+  shift 2
+  link_code=0
+  /bin/rm -f "$keychain_state/current-generation"
+  link_output=$(print -- $'user\ntoken' | env $real_env AGENT_NOTIFY_INSTALL_HOME="$attempt_home" AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE="$attempt_confirm" AGENT_NOTIFY_INSTALL_TEST_INPUT_FD=0 "$@" "$root/bin/agent-notify-install" 2>&1) || link_code=$?
+}
+link_dry_run() { link_output=$(env $real_env AGENT_NOTIFY_INSTALL_HOME="$1" "$root/bin/agent-notify-install" --dry-run 2>&1) || fail_with "a dry run failed on an unavailable link: $1" "$link_output"; }
+add_link() { /bin/mkdir -p "$1/${2:h}"; /bin/ln -s -- "$3" "$1/$2"; }
+assert_link_text() { [[ $(/usr/bin/readlink -n "$1/$2"; print -n x) == "${3}x" ]] || fail_with "$4" "$link_output"; }
+assert_declined() {
+  (( link_code )) && [[ $link_output == *'conflicting target not replaced'* ]] || fail_with "an unavailable link did not stop a declined install: $1" "$link_output"
+  [[ ! -e "$keychain_state/current-generation" ]] || fail_with "a declined install stored credentials: $1" "$link_output"
+}
+assert_named() { [[ $link_output == *"conflict: $1/$2 is a link to an unavailable target ($3); replacing it removes the link, and neither the backups nor --rollback bring it back"* ]] || fail_with "the plan did not name the unavailable link at $2" "$link_output"; }
+
+for link_path in $link_paths; do
+  link_home="$test_root/link-declined-$(( ++link_index ))"
+  add_link "$link_home" "$link_path" "$link_missing"
+  link_tree=$(managed_tree "$link_home")
+  link_attempt "$link_home" yes:no
+  assert_named "$link_home" "$link_path" "$link_missing"
+  assert_declined "$link_path"
+  assert_tree "$link_home" "$link_tree" "a declined install changed the home: $link_path"
+  assert_link_text "$link_home" "$link_path" "$link_missing" "a declined install changed the link at $link_path"
+done
+
+link_home="$test_root/link-all-home"
+for link_path in $link_paths; do add_link "$link_home" "$link_path" "$link_missing"; done
+link_tree=$(managed_tree "$link_home")
+link_dry_run "$link_home"
+for link_path in $link_paths; do assert_named "$link_home" "$link_path" "$link_missing"; done
+[[ $link_output == *'executable: conflict'* && $link_output == *'OpenCode-plugin: conflict'* ]] || fail_with 'the plan classified an unavailable link as absent' "$link_output"
+assert_tree "$link_home" "$link_tree" 'a dry run changed unavailable links'
+
+# The conflict prompt comes before the credential prompts, so declining needs no credentials.
+link_code=0
+link_output=$(env $real_env AGENT_NOTIFY_INSTALL_HOME="$link_home" AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes:no AGENT_NOTIFY_INSTALL_TEST_INPUT_FD=0 "$root/bin/agent-notify-install" </dev/null 2>&1) || link_code=$?
+assert_declined 'no credentials available'
+assert_tree "$link_home" "$link_tree" 'declining with no credentials changed the links'
+
+# Consent changes nothing until the attempt has its credentials, so failing to read them must leave the links.
+link_code=0
+link_output=$(env $real_env AGENT_NOTIFY_INSTALL_HOME="$link_home" AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes:yes AGENT_NOTIFY_INSTALL_TEST_INPUT_FD=0 "$root/bin/agent-notify-install" </dev/null 2>&1) || link_code=$?
+(( link_code )) && [[ $link_output == *'unable to read user key'* ]] || fail_with 'consent with no credentials did not stop the install' "$link_output"
+assert_tree "$link_home" "$link_tree" 'consent with no credentials changed the links'
+assert_link_text "$link_home" "${link_paths[-1]}" "$link_missing" 'consent with no credentials changed the manifest link'
+
+# With no terminal, nothing can answer the prompts, and that counts as declining.
+link_code=0
+link_output=$(env $real_env AGENT_NOTIFY_INSTALL_HOME="$link_home" /usr/bin/perl -MPOSIX -e 'if (my $child = fork()) { waitpid($child, 0); exit($? >> 8); } POSIX::setsid(); exec(@ARGV) or die "exec failed: $!\n";' "$root/bin/agent-notify-install" </dev/null 2>&1) || link_code=$?
+(( ! link_code )) && [[ $link_output == *'Installation declined; no changes made.'* && $link_output != *'Pushover user key'* ]] || fail_with 'an install with no terminal did not count as declined' "$link_output"
+assert_tree "$link_home" "$link_tree" 'an install with no terminal changed the links'
+
+# These steps run in this order, so the failures leave none, some, or all but the manifest's link replaced.
+for link_step in keychain library binary plugin settings; do
+  link_attempt "$link_home" yes:yes AGENT_NOTIFY_INSTALL_FAIL_AT="$link_step"
+  (( link_code )) && [[ $link_output == *'installation failed; restored only unchanged attempt artifacts'* ]] || fail_with "a failed attempt at $link_step did not report" "$link_output"
+  assert_tree "$link_home" "$link_tree" "a failed attempt at $link_step did not restore the links"
+  assert_link_text "$link_home" "${link_paths[-1]}" "$link_missing" "a failed attempt at $link_step changed the manifest link"
+  [[ ! -e "$keychain_state/current-generation" ]] || fail_with "a failed attempt at $link_step kept its Keychain generation" "$link_output"
+  [[ $'\n'$link_output != *$'\n'ln:* ]] || fail_with "a failed attempt at $link_step tried to recreate a link that was still there" "$link_output"
+  [[ $link_output != *'replaced link:'* ]] || fail_with "a failed attempt at $link_step reported a replaced link" "$link_output"
+done
+
+link_attempt "$link_home" yes:yes
+(( ! link_code )) || fail_with 'consent did not let the install replace unavailable links' "$link_output"
+for link_path in $link_paths; do
+  [[ ! -L "$link_home/$link_path" && -e "$link_home/$link_path" ]] || fail_with "consent did not replace the link at $link_path" "$link_output"
+  [[ $link_output == *"replaced link: $link_home/$link_path (it pointed to $link_missing; the backups and --rollback do not restore it)"* ]] || fail_with "the report did not name the replaced link at $link_path" "$link_output"
+done
+[[ ! -e $link_missing ]] || fail_with 'the install created the target of an unavailable link' "$link_output"
+link_attempt "$link_home" yes:no
+(( ! link_code )) || fail_with 'the install after replacing the links found a conflict' "$link_output"
+
+# The plan says rollback does not bring a replaced link back.
+link_home="$test_root/link-rollback-home"
+for link_path in $link_paths; do add_link "$link_home" "$link_path" "$link_missing"; done
+link_attempt "$link_home" yes:yes
+(( ! link_code )) || fail_with 'consent did not let the install replace links before a rollback' "$link_output"
+must_rollback "$link_home" no
+for link_path in ${link_paths[1,-2]}; do
+  [[ ! -e "$link_home/$link_path" && ! -L "$link_home/$link_path" ]] || fail_with "rollback left something at $link_path" "$rollback_output"
+done
+
+# A target behind an unsearchable directory still exists, so it must survive being replaced.
+typeset link_locked="$test_root/link-locked"
+/bin/mkdir "$link_locked"
+print -r -- '{"locked":true}' > "$link_locked/settings.json"
+link_home="$test_root/link-locked-home"
+add_link "$link_home" .claude/settings.json "$link_locked/settings.json"
+link_tree=$(managed_tree "$link_home")
+/bin/chmod 000 "$link_locked"
+link_attempt "$link_home" yes:no
+/bin/chmod 700 "$link_locked"
+assert_named "$link_home" .claude/settings.json "$link_locked/settings.json"
+assert_declined 'target behind an unsearchable directory'
+assert_tree "$link_home" "$link_tree" 'a declined install changed a link to a locked target'
+/bin/chmod 000 "$link_locked"
+link_attempt "$link_home" yes:yes
+/bin/chmod 700 "$link_locked"
+(( ! link_code )) && [[ ! -L "$link_home/.claude/settings.json" && -f "$link_home/.claude/settings.json" ]] || fail_with 'consent did not replace a link to a locked target' "$link_output"
+[[ $(<"$link_locked/settings.json") == '{"locked":true}' ]] || fail_with 'replacing a link changed its locked target' "$link_output"
+
+# A relative link has to come back with its exact text.
+link_home="$test_root/link-cycle-home"
+add_link "$link_home" .claude/settings.json settings.json
+# A failed first install leaves empty parents, which this case is not about.
+/bin/mkdir -p "$link_home/.local/bin" "$link_home/.local/lib" "$link_home/.config/opencode/plugins"
+link_tree=$(managed_tree "$link_home")
+link_attempt "$link_home" yes:no
+assert_named "$link_home" .claude/settings.json settings.json
+assert_declined 'link that points at itself'
+link_attempt "$link_home" yes:yes AGENT_NOTIFY_INSTALL_FAIL_AT=settings
+(( link_code )) || fail_with 'an injected failure succeeded over a relative link' "$link_output"
+assert_tree "$link_home" "$link_tree" 'a failed attempt did not restore a relative link'
+/bin/rm -f "$link_home/.claude/settings.json"
+add_link "$link_home" .claude/settings.json -dash-target
+link_tree=$(managed_tree "$link_home")
+link_attempt "$link_home" yes:yes AGENT_NOTIFY_INSTALL_FAIL_AT=settings
+(( link_code )) || fail_with 'an injected failure succeeded over a link starting with a dash' "$link_output"
+assert_tree "$link_home" "$link_tree" 'a failed attempt did not restore a link starting with a dash'
+
+# Link text is not trusted for display, and has to come back byte for byte, trailing newline included.
+link_home="$test_root/link-escape-home"
+typeset link_hostile=$'/no-such\e[2K\r\a\ttarget\n' link_visible='/no-such^[[2K^M^G\ttarget\n'
+add_link "$link_home" .local/bin/agent-notify "$link_hostile"
+link_attempt "$link_home" yes:yes AGENT_NOTIFY_INSTALL_FAIL_AT=settings
+(( link_code )) || fail_with 'an injected failure succeeded over a link with control characters' "$link_output"
+[[ $link_output == *"is a link to an unavailable target ($link_visible);"* ]] || fail_with 'the plan did not show the control characters in a link' "$link_output"
+[[ $link_output != *$'\e'* && $link_output != *$'\r'* && $link_output != *$'\a'* ]] || fail_with 'the plan printed control characters from a link' "$link_output"
+assert_link_text "$link_home" .local/bin/agent-notify "$link_hostile" 'a failed attempt changed the text of a link'
+link_attempt "$link_home" yes:yes
+(( ! link_code )) && [[ $link_output == *"(it pointed to $link_visible;"* ]] || fail_with 'the report did not show the control characters in a link' "$link_output"
+[[ $link_output != *$'\e'* && $link_output != *$'\r'* && $link_output != *$'\a'* ]] || fail_with 'the report printed control characters from a link' "$link_output"
+
+# Without the text there is nothing to name in the plan or to recreate, so this says why it stopped.
+link_home="$test_root/link-unreadable-home"
+add_link "$link_home" .local/bin/agent-notify "$link_missing"
+/bin/chmod -h 000 "$link_home/.local/bin/agent-notify"
+link_tree=$(managed_tree "$link_home" 2>/dev/null)
+/bin/rm -f "$keychain_state/current-generation"
+link_code=0
+link_output=$(env $real_env AGENT_NOTIFY_INSTALL_HOME="$link_home" AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes:yes AGENT_NOTIFY_INSTALL_TEST_INPUT_FD=0 "$root/bin/agent-notify-install" </dev/null 2>&1) || link_code=$?
+(( link_code )) && [[ $link_output == *"unable to read the link at $link_home/.local/bin/agent-notify; no changes made"* && $link_output != *'unable to read user key'* ]] || fail_with 'an unreadable link did not stop the install before its credentials' "$link_output"
+[[ $(managed_tree "$link_home" 2>/dev/null) == "$link_tree" && -L "$link_home/.local/bin/agent-notify" && ! -e "$keychain_state/current-generation" ]] || fail_with 'an unreadable link did not leave everything unchanged' "$link_output"
+link_code=0
+link_output=$(env $real_env AGENT_NOTIFY_INSTALL_HOME="$link_home" "$root/bin/agent-notify-install" --dry-run 2>&1) || link_code=$?
+(( link_code )) && [[ $link_output == *"unable to read the link at $link_home/.local/bin/agent-notify"* ]] || fail_with 'a dry run did not stop at an unreadable link' "$link_output"
+
+# A file that took a link's path during the attempt is not the attempt's to replace.
+# occupied_attempt <path under the home> <failure step> <commands taking the path, which is $taken>: runs one attempt whose path is taken during the Keychain store.
+occupied_attempt() {
+  link_home="$test_root/link-occupied-$(( ++link_index ))"
+  add_link "$link_home" "$1" "$link_missing"
+  print -r -- "#!/bin/zsh
+taken='$link_home/$1'
+[[ \$1 == store ]] && { /bin/rm -f \"\$taken\"; $3; }
+exec '$fake/keychain-jxa' \"\$@\"" > "$fake/link-occupying-keychain-jxa"
+  /bin/chmod 700 "$fake/link-occupying-keychain-jxa"
+  link_attempt "$link_home" yes:yes AGENT_NOTIFY_INSTALL_FAIL_AT="$2" AGENT_NOTIFY_INSTALL_KEYCHAIN_HELPER="$fake/link-occupying-keychain-jxa"
+  (( link_code )) || fail_with 'an injected failure succeeded over an occupied link path' "$link_output"
+}
+occupied_attempt .local/bin/agent-notify keychain 'print -r -- occupied > "$taken"'
+[[ ! -L "$link_home/.local/bin/agent-notify" && $(<"$link_home/.local/bin/agent-notify") == occupied ]] || fail_with 'a failed attempt replaced a file that took the path of a link' "$link_output"
+occupied_attempt .local/bin/agent-notify keychain '/bin/mkdir "$taken"; print -r -- occupied > "$taken/kept"'
+[[ -d "$link_home/.local/bin/agent-notify" && ! -L "$link_home/.local/bin/agent-notify" && $(/bin/ls -A "$link_home/.local/bin/agent-notify") == kept ]] || fail_with 'a failed attempt changed a directory that took the path of a link' "$link_output"
+# The library step runs here, and must not move a file aside as if it were the link.
+occupied_attempt .local/lib/agent-notify binary 'print -r -- occupied > "$taken"'
+[[ ! -L "$link_home/.local/lib/agent-notify" && -f "$link_home/.local/lib/agent-notify" && $(<"$link_home/.local/lib/agent-notify") == occupied ]] || fail_with 'a failed attempt replaced a file that took the path of the library link' "$link_output"
+
+# Only an unreachable target counts: a link that resolves to identical bytes is not a conflict.
+link_home="$test_root/link-healthy-home"
+real_install "$link_home" yes
+/bin/mv "$link_home/.local/bin/agent-notify" "$test_root/link-healthy-target"
+/bin/ln -s "$test_root/link-healthy-target" "$link_home/.local/bin/agent-notify"
+link_attempt "$link_home" yes:no
+(( ! link_code )) && [[ $link_output != *'is a link to an unavailable target'* ]] || fail_with 'a link with a reachable target counted as unavailable' "$link_output"
+# A relative link resolves from its own directory, not from wherever the installer runs.
+/bin/rm -f "$link_home/.local/bin/agent-notify"
+/bin/mkdir "$link_home/dotfiles"
+/bin/mv "$test_root/link-healthy-target" "$link_home/dotfiles/agent-notify"
+/bin/ln -s ../../dotfiles/agent-notify "$link_home/.local/bin/agent-notify"
+link_attempt "$link_home" yes:no
+(( ! link_code )) && [[ $link_output != *'is a link to an unavailable target'* ]] || fail_with 'a relative link with a reachable target counted as unavailable' "$link_output"
+# Different bytes behind a reachable link are an ordinary conflict.
+/bin/rm -f "$link_home/.local/bin/agent-notify"
+print -r -- 'different bytes' > "$link_home/dotfiles/different"
+/bin/ln -s ../../dotfiles/different "$link_home/.local/bin/agent-notify"
+link_attempt "$link_home" yes:no
+assert_declined 'a reachable link with different bytes'
+[[ $link_output != *'is a link to an unavailable target'* ]] || fail_with 'a reachable link with different bytes counted as unavailable' "$link_output"
+
 # rollback tests: guard
 typeset guard_home="$test_root/guard-home" guard_first_home="$test_root/guard-first-home" guard_copy_home="$test_root/guard-copy-home" guard_saved_manifest="$test_root/guard-saved-manifest.json" guard_items="$test_root/guard-items"
 typeset guard_hex=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
@@ -1296,5 +1494,15 @@ for attempt_round in 1 2; do
   signal_over_link_check 'terminal interrupt just after the binary move, over a library link' INT 1
   signal_over_link_check 'hangup just after the binary move, over a library link' HUP 1
 done
+
+# A signal at any hash, with some links already replaced: every one of them has to come back.
+typeset attempt_links_home="$test_root/attempt-links-home"
+real_install "$attempt_links_home" yes
+/bin/rm -rf "$attempt_links_home/.local/lib/agent-notify" "$attempt_links_home/.local/bin/agent-notify" "$attempt_links_home/.claude/settings.json"
+/bin/ln -s "$test_root/no-such-library" "$attempt_links_home/.local/lib/agent-notify"
+/bin/ln -s "$test_root/no-such-binary" "$attempt_links_home/.local/bin/agent-notify"
+/bin/ln -s "$test_root/no-such-settings" "$attempt_links_home/.claude/settings.json"
+hash_signal_sweep 'signal with links replaced' "$attempt_links_home" TERM 0 AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes:yes
+hash_signal_sweep 'terminal interrupt with links replaced' "$attempt_links_home" INT 1 AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes:yes
 
 print -- 'installer tests passed'

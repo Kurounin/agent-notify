@@ -32,6 +32,7 @@ typeset dry_run=0 rollback=0 backup_dir='' preflight_stage='' generation='' sele
 typeset user_key='' app_token='' settings_existed=0 bin_existed=0 lib_existed=0 hook_existed=0 hook_jxa_existed=0 plugin_existed=0
 typeset bin_post_hash='' lib_post_hash='' hook_post_hash='' hook_jxa_post_hash='' plugin_post_hash='' settings_post_hash='' manifest_post_hash='' manifest_existed=0 mutation_started=0 completed=0 attempt_restored=0 secret_prompt_open=0
 typeset -a attempt_created_dirs
+typeset -A unavailable_links
 
 usage() { print -u2 -- 'usage: agent-notify-install [--dry-run|--rollback]'; }
 die() { print -u2 -- "agent-notify-install: $*"; exit 1; }
@@ -116,7 +117,7 @@ version_from() {
 preflight() {
   local macos claude_bin opencode_bin version
   [[ ${AGENT_NOTIFY_INSTALL_SKIP_PLATFORM_CHECK:-0} == 1 ]] || [[ $(/usr/bin/uname -s) == Darwin ]] || die 'macOS is required'
-  for tool in "$security_bin" "$jxa_bin" "$curl_bin" /usr/bin/shasum /usr/bin/mktemp /bin/cp /bin/mkdir /bin/chmod /bin/mv /usr/bin/find /usr/bin/sort; do
+  for tool in "$security_bin" "$jxa_bin" "$curl_bin" /usr/bin/shasum /usr/bin/mktemp /bin/cp /bin/mkdir /bin/chmod /bin/mv /bin/ln /usr/bin/readlink /usr/bin/find /usr/bin/sort; do
     [[ -x $tool ]] || die "required executable unavailable: $tool"
   done
   claude_bin=${AGENT_NOTIFY_INSTALL_CLAUDE_BIN:-$(command_path claude)}
@@ -142,6 +143,19 @@ preflight() {
   [[ $("$jxa_bin" -l JavaScript "$settings_helper" inspect "$preflight_stage/settings.json" - "$command_prefix") == valid ]] || die 'generated Claude settings failed validation'
   /bin/rm -rf "$preflight_stage" || die 'unable to clean staged artifacts'
   preflight_stage=''
+  find_unavailable_links
+}
+
+# A link whose target cannot be reached looks absent to [[ -e ]] and fileExistsAtPath, so an install would replace it with no backup and no mention.
+find_unavailable_links() {
+  local target text
+  for target in "$install_bin" "$install_lib" "$claude_hook_path" "$claude_hook_jxa_path" "$plugin_path" "$settings_path" "$manifest_path"; do
+    if [[ -L $target && ! -e $target ]]; then
+      # The x keeps trailing newlines, which $(...) would strip from the text a failed attempt has to recreate.
+      text=$(/usr/bin/readlink -n "$target" && print -n x) || die "unable to read the link at $target; no changes made"
+      unavailable_links[$target]=${text%x}
+    fi
+  done
 }
 
 cleanup_attempt() {
@@ -178,6 +192,7 @@ rollback_preflight() {
 
 classify_file() {
   local target=$1 source=$2 label=$3
+  (( ${+unavailable_links[$target]} )) && { print -- "$label: conflict"; return; }
   [[ -e $target ]] || { print -- "$label: absent"; return; }
   if [[ $(sha256 "$target") == $(sha256 "$source") ]]; then print -- "$label: installer-managed exact"; else print -- "$label: conflict"; fi
 }
@@ -192,6 +207,7 @@ plugin_is_managed() {
 }
 
 has_conflict() {
+  (( ${#unavailable_links} )) && return 0
   [[ -e $install_bin && $(sha256 "$install_bin") != $(sha256 "$root/bin/agent-notify") ]] && return 0
   [[ -e $install_lib && ! -d $install_lib ]] && return 0
   [[ -d $install_lib && $(tree_hash "$install_lib") != $(tree_hash "$root/lib/agent-notify") ]] && return 0
@@ -223,6 +239,10 @@ preview() {
   probe_keychain "$keychain_selector_service" && print -- '  existing v2 credential generation: will be replaced after confirmation' || print -- '  existing v2 credential generation: absent'
   classify_file "$install_bin" "$root/bin/agent-notify" executable
   classify_file "$plugin_path" "$root/integrations/opencode/agent-notify.js" OpenCode-plugin
+  local link
+  for link in ${(ok)unavailable_links}; do
+    print -r -- "  conflict: $link is a link to an unavailable target (${(V)unavailable_links[$link]}); replacing it removes the link, and neither the backups nor --rollback bring it back"
+  done
 }
 
 stage_plugin() {
@@ -271,6 +291,8 @@ replace_library() {
     [[ -d $previous ]] && /bin/mv "$previous" "$install_lib"
     return 1
   fi
+  # A directory cannot be moved over a link. This moves the link rather than removing it because a signal's restore can already have run and kept it: the backup directory is gone by then, so this fails and the link stays.
+  (( ${+unavailable_links[$install_lib]} )) && [[ -L $install_lib ]] && { /bin/mv "$install_lib" "$previous" || return 1; }
   if ! /bin/mv "$stage_lib" "$install_lib"; then
     [[ -d $previous ]] && /bin/mv "$previous" "$install_lib"
     return 1
@@ -317,6 +339,11 @@ rollback_attempt() {
       /bin/rm -f "$manifest_path"
     fi
   fi
+  # A replaced link has no backup, since nothing behind it could be read.
+  local link
+  for link in ${(k)unavailable_links}; do
+    [[ -e $link || -L $link ]] || /bin/ln -s -- "${unavailable_links[$link]}" "$link" || true
+  done
   [[ -n $generation ]] && print -rn -- "{\"generation\":\"$generation\",\"selector\":\"$selector_before\"}" | "$jxa_bin" -l JavaScript "$keychain_helper" rollback || true
   cleanup_attempt
   print -u2 -- 'agent-notify-install: installation failed; restored only unchanged attempt artifacts'
@@ -437,6 +464,10 @@ install() {
   print -- "  settings: $settings_path"
   print -- "  Claude hook JXA: $claude_hook_jxa_path"
   print -- "  backups: $backup_dir"
+  local link
+  for link in ${(ok)unavailable_links}; do
+    print -r -- "  replaced link: $link (it pointed to ${(V)unavailable_links[$link]}; the backups and --rollback do not restore it)"
+  done
   print -- "  manifest: $manifest_path"
   print -- "  excerpt settings: $settings_conf_path"
   print -- "  installed hashes: notifier=$bin_post_hash library=$lib_post_hash plugin=$plugin_post_hash settings=$settings_post_hash"

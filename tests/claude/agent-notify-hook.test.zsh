@@ -192,11 +192,14 @@ assert_equals "$(CLAUDE_PROJECT_DIR="$oversized_project" normalize completed '{"
   '{"source":"claude-code","kind":"completed","session_id":"session-root","session_dir":"/work/payload"}'
 assert_ignored completed '{"hook_event_name":"Stop","session_id":"session-root","session_dir":"","cwd":"bad\u0001dir","directory":"bad\u007fdir","background_tasks":[]}' 'payload with no valid directory candidates'
 
+# Reading a zero-argument bridge method already calls it, so parentheses run it and then throw. A throw here costs the event, and the catch block can hide one call site's mistake from the cases below.
+[[ $(<"$normalizer") != *'.terminate()'* ]] || { print -u2 -- 'normalizer calls terminate with parentheses'; exit 1; }
+
 # All tmux cases use an injected executable; no test contacts a live tmux server.
 typeset tmux_dir="$test_root/tmux executable"
 typeset tmux_fake="$tmux_dir/tmux"
 typeset tmux_calls="$test_root/tmux-calls"
-typeset tmux_terminated="$test_root/tmux-terminated"
+typeset unresponsive_pane="%$$"
 /bin/mkdir -p "$tmux_dir"
 cat > "$tmux_fake" <<'EOF'
 #!/usr/bin/env zsh
@@ -206,8 +209,9 @@ print -u2 -r -- "${AGENT_NOTIFY_TMUX_STDERR:-}"
 case ${AGENT_NOTIFY_TMUX_MODE:-valid} in
   valid) print -r -- "${AGENT_NOTIFY_TMUX_VALUE:-session-one}" ;;
   nonzero) print -r -- rejected-stdout; exit 7 ;;
-  timeout) trap 'print -r -- terminated > "$AGENT_NOTIFY_TMUX_TERMINATED"; exit 0' TERM; while true; do /bin/sleep 1; done ;;
-  overflow) trap 'print -r -- terminated > "$AGENT_NOTIFY_TMUX_TERMINATED"; exit 0' TERM; /usr/bin/yes x | /usr/bin/head -c 1025; while true; do /bin/sleep 1; done ;;
+  timeout) while true; do /bin/sleep 1; done ;;
+  overflow) /usr/bin/yes x | /usr/bin/head -c 1025; while true; do /bin/sleep 1; done ;;
+  overflow_ignoring_term) trap '' TERM; /usr/bin/yes x | /usr/bin/head -c 1025; /bin/sleep 2 ;;
   output_1024) /usr/bin/yes x | /usr/bin/head -c 1024 || true ;;
   descendant_holds_stdout) (/bin/sleep 2; print -r -- descendant-stdout-marker) & exit 0 ;;
   invalid_utf8) print -rn -- $'\xff' ;;
@@ -220,15 +224,60 @@ EOF
 /bin/chmod 700 "$tmux_fake"
 
 submit_tmux() {
-  AGENT_NOTIFY_TEST_CALLS="$calls" AGENT_NOTIFY_TMUX_CALLS="$tmux_calls" AGENT_NOTIFY_TMUX_TERMINATED="$tmux_terminated" \
+  AGENT_NOTIFY_TEST_CALLS="$calls" AGENT_NOTIFY_TMUX_CALLS="$tmux_calls" \
     PATH="$tmux_dir:$PATH" TMUX='private-socket-marker' TMUX_PANE="${AGENT_NOTIFY_TEST_TMUX_PANE:-%123}" "$adapter" "$1"
 }
+# A child that misses the normalizer's 0.5-second deadline is correctly left out of the event, so on a busy machine a lookup that should succeed gets a few tries. One that can never succeed still fails the assertion after this.
+submit_tmux_expecting_session() {
+  local payload attempt
+  payload=$(</dev/stdin)
+  for (( attempt = 0; attempt < 5; attempt++ )); do
+    /bin/rm -f "$calls" "$tmux_calls"
+    submit_tmux "$1" <<<"$payload"
+    [[ $(<"$calls") == *'"tmux_session"'* ]] && return 0
+  done
+}
+# A failed lookup only costs the session name: the event must still be submitted.
 assert_no_tmux_session() {
+  [[ $(<"$calls") == 'event|{"source":"claude-code",'* ]] || { print -u2 -- "expected '$1' to submit the event"; exit 1; }
   [[ $(<"$calls") != *'"tmux_session"'* ]] || { print -u2 -- "expected '$1' to have no tmux session"; exit 1; }
+}
+zmodload zsh/datetime
+# assert_lookup_bounded <name> <mode>: the child in these modes holds the lookup open for 2 seconds, so a hook that waits for it takes at least that long. Load can only add time, so the best of a few tries measures the deadline and not the machine.
+assert_lookup_bounded() {
+  local attempt output
+  local -F 6 start elapsed
+  for (( attempt = 0; attempt < 5; attempt++ )); do
+    /bin/rm -f "$calls" "$tmux_calls"
+    start=$EPOCHREALTIME
+    output=$(AGENT_NOTIFY_TMUX_MODE=$2 submit_tmux completed <<'EOF' 2>&1
+{"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
+EOF
+)
+    elapsed=$(( EPOCHREALTIME - start ))
+    (( elapsed < 1.5 )) && break
+  done
+  (( elapsed < 1.5 )) || { print -u2 -- "$1 exceeded deadline: $elapsed seconds"; exit 1; }
+  assert_equals "$output" ''
+  assert_no_tmux_session "$1"
+}
+# The timeout and overflow modes never exit on their own, so the child being gone proves it was terminated. A marker from a TERM trap cannot show this: on a busy machine the deadline can pass before the child has set the trap, and zsh runs a trap that arrives while it starts a command only once that command exits. The normalizer also signals the child and moves on, so it can briefly outlive the hook.
+assert_child_terminated() {
+  local attempt pgrep_status pattern="display-message -p -t $unresponsive_pane #S"
+  for (( attempt = 0; attempt < 100; attempt++ )); do
+    pgrep_status=0
+    /usr/bin/pgrep -f "$pattern" >/dev/null || pgrep_status=$?
+    (( pgrep_status == 1 )) && return 0
+    (( pgrep_status == 0 )) || break
+    /bin/sleep 0.1
+  done
+  /usr/bin/pkill -KILL -f "$pattern" || true
+  print -u2 -- "$1 did not request child termination"
+  exit 1
 }
 
 /bin/rm -f "$calls" "$tmux_calls"
-AGENT_NOTIFY_TMUX_MODE=valid AGENT_NOTIFY_TMUX_VALUE='renamed-session' submit_tmux completed <<'EOF'
+AGENT_NOTIFY_TMUX_MODE=valid AGENT_NOTIFY_TMUX_VALUE='renamed-session' submit_tmux_expecting_session completed <<'EOF'
 {"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
 EOF
 assert_equals "$(<"$calls")" 'event|{"source":"claude-code","kind":"completed","session_id":"session-tmux","session_dir":"/work/project","tmux_session":"renamed-session"}'
@@ -236,7 +285,7 @@ assert_equals "$(<"$tmux_calls")" 'display-message -p -t %123 #S'
 
 # The lookup is fresh per notification-producing event, not cached from the earlier name.
 /bin/rm -f "$calls" "$tmux_calls"
-AGENT_NOTIFY_TMUX_MODE=valid AGENT_NOTIFY_TMUX_VALUE='renamed-again' submit_tmux attention <<'EOF'
+AGENT_NOTIFY_TMUX_MODE=valid AGENT_NOTIFY_TMUX_VALUE='renamed-again' submit_tmux_expecting_session attention <<'EOF'
 {"notification_type":"permission_prompt","session_id":"session-tmux","cwd":"/work/project"}
 EOF
 [[ $(<"$calls") == *'"tmux_session":"renamed-again"'* ]] || { print -u2 -- 'tmux name was not refreshed per event'; exit 1; }
@@ -244,7 +293,7 @@ EOF
 typeset pane_255="%${(l:255::7:)${:-7}}"
 typeset pane_256="%${(l:256::7:)${:-7}}"
 /bin/rm -f "$calls" "$tmux_calls"
-AGENT_NOTIFY_TEST_TMUX_PANE="$pane_255" AGENT_NOTIFY_TMUX_MODE=valid AGENT_NOTIFY_TMUX_VALUE='pane-boundary' submit_tmux completed <<'EOF'
+AGENT_NOTIFY_TEST_TMUX_PANE="$pane_255" AGENT_NOTIFY_TMUX_MODE=valid AGENT_NOTIFY_TMUX_VALUE='pane-boundary' submit_tmux_expecting_session completed <<'EOF'
 {"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
 EOF
 assert_equals "$(<"$tmux_calls")" "display-message -p -t $pane_255 #S"
@@ -283,41 +332,32 @@ EOF
 assert_equals "$launch_failure_output" '{"source":"claude-code","kind":"completed","session_id":"session-tmux","session_dir":"/work/project"}'
 [[ $launch_failure_output != *'private-'* && $launch_failure_output != *'missing-tmux'* ]] || { print -u2 -- 'tmux launch failure leaked raw data'; exit 1; }
 
-/bin/rm -f "$calls" "$tmux_calls" "$tmux_terminated"
-AGENT_NOTIFY_TMUX_MODE=timeout submit_tmux completed <<'EOF'
+/bin/rm -f "$calls" "$tmux_calls"
+AGENT_NOTIFY_TEST_TMUX_PANE="$unresponsive_pane" AGENT_NOTIFY_TMUX_MODE=timeout submit_tmux completed <<'EOF'
 {"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
 EOF
 assert_no_tmux_session 'timeout'
-[[ -e $tmux_terminated ]] || { print -u2 -- 'timeout did not request child termination'; exit 1; }
+assert_child_terminated 'timeout'
 
-/bin/rm -f "$calls" "$tmux_calls" "$tmux_terminated"
-AGENT_NOTIFY_TMUX_MODE=overflow submit_tmux completed <<'EOF'
+/bin/rm -f "$calls" "$tmux_calls"
+AGENT_NOTIFY_TEST_TMUX_PANE="$unresponsive_pane" AGENT_NOTIFY_TMUX_MODE=overflow submit_tmux completed <<'EOF'
 {"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
 EOF
 assert_no_tmux_session 'overflow'
-[[ -e $tmux_terminated ]] || { print -u2 -- 'overflow did not request child termination'; exit 1; }
+assert_child_terminated 'overflow'
 
-/bin/rm -f "$calls" "$tmux_calls" "$tmux_terminated"
+# A child that ignores the signal is still running when the normalizer checks it, and must neither cost the event nor hold the hook. It exits by itself.
+assert_lookup_bounded 'overflow with a child ignoring termination' overflow_ignoring_term
+
+/bin/rm -f "$calls" "$tmux_calls"
 AGENT_NOTIFY_TMUX_MODE=output_1024 submit_tmux completed <<'EOF'
 {"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
 EOF
 assert_no_tmux_session '1024-byte tmux output'
-[[ ! -e $tmux_terminated ]] || { print -u2 -- '1024-byte tmux output requested child termination'; exit 1; }
 
 # A direct child can exit successfully while a descendant keeps the stdout pipe open. The hook
 # must treat process exit and stdout EOF as one deadline-bound operation without forwarding output.
-/bin/rm -f "$calls" "$tmux_calls"
-zmodload zsh/datetime
-typeset -F 6 descendant_start=$EPOCHREALTIME
-typeset descendant_output
-descendant_output=$(AGENT_NOTIFY_TMUX_MODE=descendant_holds_stdout submit_tmux completed <<'EOF' 2>&1
-{"session_id":"session-tmux","cwd":"/work/project","background_tasks":[]}
-EOF
-)
-typeset -F 6 descendant_elapsed=$(( EPOCHREALTIME - descendant_start ))
-(( descendant_elapsed < 1.5 )) || { print -u2 -- "descendant-held stdout exceeded deadline: $descendant_elapsed seconds"; exit 1; }
-assert_equals "$descendant_output" ''
-assert_no_tmux_session 'descendant-held stdout'
+assert_lookup_bounded 'descendant-held stdout' descendant_holds_stdout
 [[ $(<"$calls") != *'descendant-stdout-marker'* ]] || { print -u2 -- 'descendant stdout leaked to submitted event'; exit 1; }
 
 # Invalid gates do not launch the injected executable or leak their raw marker values.

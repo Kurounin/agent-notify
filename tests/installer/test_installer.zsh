@@ -6,7 +6,7 @@ typeset root=${0:A:h:h:h}
 typeset settings_fixture="$root/tests/fixtures/claude-settings/existing.json"
 typeset test_root
 test_root=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/agent-notify-installer.XXXXXX")
-trap '/bin/rm -rf "$test_root"' EXIT
+trap '/bin/chmod -R u+rwx "$test_root"; /bin/rm -rf "$test_root"' EXIT
 
 # Nothing in this suite may reach the real Keychain, a real Pushover send, or the real home.
 print -r -- '({ copyMatching: () => -25300 })' > "$test_root/no-credentials-shim.jxa"
@@ -47,7 +47,7 @@ make_keychain_helper() { print -r -- "#!/bin/zsh
 typeset state='$2' raw generation selector
 case \$1 in
   store) raw=\$(/bin/cat); [[ \$raw =~ '\\\"generation\\\":\\\"([^\\\"]+)' ]] || exit 1; generation=\$match[1]; print -- \$generation > \"\$state/selector\"; print -- \$generation > \"\$state/current-generation\" ;;
-  rollback) raw=\$(/bin/cat); [[ \$raw =~ '\\\"selector\\\":\\\"([^\\\"]*)' ]] || exit 1; selector=\$match[1]; [[ -n \$selector ]] && print -- \$selector > \"\$state/selector\" || /bin/rm -f \"\$state/selector\"; /bin/rm -f \"\$state/current-generation\" ;;
+  rollback) raw=\$(/bin/cat); [[ \$raw =~ '\\\"generation\\\":\\\"([^\\\"]+)' ]] || exit 1; generation=\$match[1]; [[ \$raw =~ '\\\"selector\\\":\\\"([^\\\"]*)' ]] || exit 1; selector=\$match[1]; [[ -n \$selector ]] && print -- \$selector > \"\$state/selector\" || /bin/rm -f \"\$state/selector\"; [[ -e \"\$state/current-generation\" && \$(<\"\$state/current-generation\") != \$generation ]] || /bin/rm -f \"\$state/current-generation\" ;;
   remove) /bin/cat > \"\$state/removed\"; /bin/rm -f \"\$state/selector\" \"\$state/current-generation\" ;;
 esac" > "$1"; /bin/chmod 700 "$1"; }
 make_security() { print -r -- '#!/bin/zsh
@@ -192,7 +192,7 @@ print -- $'user\ntoken' | env $env AGENT_NOTIFY_INSTALL_TEST_CONFIRM=yes AGENT_N
 [[ $(<"$test_root/home/.local/lib/agent-notify/config.zsh") == 'old library' ]] || { print -u2 -- 'library replacement failure did not restore prior tree'; exit 1; }
 typeset empty_home="$test_root/empty-home"
 print -- $'user\ntoken' | env $env AGENT_NOTIFY_INSTALL_HOME="$empty_home" AGENT_NOTIFY_INSTALL_TEST_CONFIRM=yes AGENT_NOTIFY_INSTALL_TEST_INPUT_FD=0 AGENT_NOTIFY_INSTALL_FAIL_AT=plugin "$root/bin/agent-notify-install" >/dev/null 2>&1 && { print -u2 -- 'first-time failure reported success'; exit 1; }
-[[ ! -d "$empty_home/.local/bin" && ! -d "$empty_home/.config/opencode/plugins" && ! -d "$empty_home/.claude" ]] || { print -u2 -- 'first-time failure left attempt-created directories'; exit 1; }
+[[ ! -d "$empty_home/.local/bin" && ! -e "$empty_home/.local/lib" && ! -d "$empty_home/.config/opencode/plugins" && ! -d "$empty_home/.claude" ]] || { print -u2 -- 'first-time failure left attempt-created directories'; exit 1; }
 print -- $'user\ntoken' | env $env AGENT_NOTIFY_INSTALL_TEST_CONFIRM=yes AGENT_NOTIFY_INSTALL_TEST_INPUT_FD=0 AGENT_NOTIFY_INSTALL_FAIL_AT=plugin "$root/bin/agent-notify-install" >/dev/null 2>&1 && { print -u2 -- 'injected failure succeeded'; exit 1; }
 [[ $(<"$test_root/home/.local/bin/agent-notify") == 'old notifier' && $(/usr/bin/stat -f '%Lp' "$test_root/home/.local/bin/agent-notify") == 755 ]] || { print -u2 -- 'partial failure did not restore the prior notifier and mode'; exit 1; }
 [[ $(<"$test_root/home/.local/lib/agent-notify/config.zsh") == 'old library' ]] || { print -u2 -- 'plugin failure did not restore prior library'; exit 1; }
@@ -679,5 +679,667 @@ done
 must_rollback "$guard_home" no
 [[ $rollback_output == 'Selective rollback complete.' ]] || fail_with 'an intact rollback did not print exactly the completion line' "$rollback_output"
 assert_tree "$guard_home" "$guard_seed_tree" 'an intact rollback did not restore exactly after the guard cases'
+
+# rollback tests: failed attempt
+typeset attempt_output attempt_code attempt_tree attempt_state attempt_manifest attempt_credentials=$'user\ntoken'
+typeset -a attempt_args=() attempt_wrapper=()
+
+# A terminal delivers Ctrl-C to the installer and to the child it is waiting for. Giving each attempt its own process group lets a case do the same without reaching the suite, and lets a hung attempt be killed whole.
+own_group() {
+  /usr/bin/perl -e '
+    setpgrp(0, 0) or die "setpgrp failed: $!\n";
+    $ENV{AGENT_NOTIFY_TEST_GROUP} = $$;
+    my $child = fork() // die "fork failed: $!\n";
+    if (!$child) {
+      $ENV{AGENT_NOTIFY_TEST_INSTALLER} = $$;
+      $SIG{$_} = "DEFAULT" for qw(HUP INT QUIT TERM);
+      exec(@ARGV) or die "exec failed: $!\n";
+    }
+    close(STDIN);
+    $SIG{$_} = "IGNORE" for qw(HUP INT QUIT TERM);
+    $SIG{ALRM} = sub { print STDERR "attempt timed out\n"; kill("KILL", -$$); };
+    alarm(120);
+    waitpid($child, 0);
+    exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
+  ' "$@"
+}
+# state_listing <home>: names are enough to show a leaked backup, without hashing every earlier backup.
+state_listing() {
+  ( cd "$1/Library/Application Support/agent-notify" && /usr/bin/find . -print | /usr/bin/sort && /usr/bin/stat -f '%Lp' install-manifest.json )
+}
+snapshot_home() {
+  attempt_tree=$(managed_tree "$1")
+  attempt_state=$(state_listing "$1")
+  attempt_manifest=$(<"$(manifest_file "$1")")
+}
+# start_attempt <home> [<env assignment>...]: runs one attempt, which may fail.
+start_attempt() {
+  local run_home=$1
+  shift
+  # The security fake always reports old-generation as the selector to restore.
+  print -- old-generation > "$keychain_state/selector"; /bin/rm -f "$keychain_state/current-generation"
+  attempt_code=0
+  attempt_output=$(print -r -- "$attempt_credentials" | own_group env $real_env AGENT_NOTIFY_INSTALL_HOME="$run_home" AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes:no AGENT_NOTIFY_INSTALL_TEST_INPUT_FD=0 "$@" $attempt_wrapper "$root/bin/agent-notify-install" $attempt_args 2>&1) || attempt_code=$?
+  [[ $attempt_output != *'attempt timed out'* ]] || fail_with 'an attempt hung' "$attempt_output"
+}
+run_attempt() {
+  snapshot_home "$1"
+  start_attempt "$@"
+}
+assert_attempt_report() {
+  [[ $(<"$keychain_state/selector") == old-generation && ! -e "$keychain_state/current-generation" ]] || fail_with "failed attempt did not restore the Keychain state: $1" "$attempt_output"
+  [[ $(print -r -- "$attempt_output" | /usr/bin/grep -c 'installation failed; restored only unchanged attempt artifacts') == 1 ]] || fail_with "failed attempt did not report exactly once: $1" "$attempt_output"
+  [[ $'\n'$attempt_output != *$'\n'cp:* ]] || fail_with "failed attempt printed a stray cp line: $1" "$attempt_output"
+}
+# assert_attempt_restored <name> <home>: the attempt left the home, state directory, and Keychain as run_attempt found them, and reported once.
+assert_attempt_restored() {
+  [[ $(managed_tree "$2") == "$attempt_tree" ]] || print -ru2 -- "$attempt_output"
+  assert_tree "$2" "$attempt_tree" "failed attempt changed the home: $1"
+  [[ $(<"$(manifest_file "$2")") == "$attempt_manifest" ]] || fail_with "failed attempt changed the manifest: $1" "$attempt_output"
+  [[ $(state_listing "$2") == "$attempt_state" ]] || fail_with "failed attempt changed the state directory: $1" "$attempt_output"
+  assert_attempt_report "$1"
+}
+# failed_attempt_check <name> <home> [<env assignment>...]: the attempt must fail, report once, and leave the home and Keychain as it found them.
+failed_attempt_check() {
+  local check_name=$1 check_home=$2
+  shift 2
+  run_attempt "$check_home" "$@"
+  (( attempt_code )) || fail_with "failed attempt reported success: $check_name" "$attempt_output"
+  assert_attempt_restored "$check_name" "$check_home"
+}
+
+# The installer has no test hook, so signals come from the two programs a test can reach: the JXA binary and, through PERL5OPT, /usr/bin/shasum.
+typeset signal_state="$test_root/attempt-signal"
+typeset -a signal_env=(AGENT_NOTIFY_INSTALL_JXA_BIN="$fake/attempt-jxa" PERL5OPT=-MAttemptSignal PERL5LIB="$fake/perl" AGENT_NOTIFY_TEST_STATE="$signal_state")
+/bin/mkdir "$fake/perl"
+print -r -- 'package AttemptSignal;
+use strict;
+my $state = $ENV{AGENT_NOTIFY_TEST_STATE};
+sub send_signal {
+  my $group = $ENV{AGENT_NOTIFY_TEST_GROUP};
+  die "the attempt does not have its own process group\n" unless getpgrp(0) == $group;
+  open(my $fired, ">", "$state.fired") or die "$!\n";
+  close($fired);
+  kill($ENV{AGENT_NOTIFY_TEST_SIGNAL}, $ENV{AGENT_NOTIFY_TEST_WHOLE_GROUP} ? -$group : $ENV{AGENT_NOTIFY_TEST_INSTALLER});
+}
+sub signal_when_changed {
+  my $path = shift;
+  my $start = (stat($path))[1] // 0;
+  my $child = fork() // die "$!\n";
+  return if $child;
+  close(STDIN); close(STDOUT); close(STDERR);
+  alarm(120);
+  1 while ((stat($path))[1] // 0) == $start;
+  send_signal();
+  exit(0);
+}
+# Stands in for someone changing files while the attempt runs, just as the staged settings are hashed.
+if ($0 =~ m{/shasum$} && $ENV{AGENT_NOTIFY_TEST_EDIT} && @ARGV && $ARGV[-1] =~ /settings\.json\.new$/) {
+  for my $path (split(/\n/, $ENV{AGENT_NOTIFY_TEST_EDIT})) {
+    open(my $edited, ">>", $path) or die "$!\n";
+    print $edited "# changed during the attempt\n";
+    close($edited);
+  }
+}
+# Hashes of a file inside a library tree are left out, so a position is one hash the installer records.
+if ($0 =~ m{/shasum$} && -e "$state.armed" && !(@ARGV && $ARGV[-1] =~ m{^\./})) {
+  my $count = 0;
+  if (open(my $in, "<", "$state.count")) { $count = <$in> + 0; close($in); }
+  $count++;
+  open(my $out, ">", "$state.count") or die "$!\n";
+  print $out "$count\n";
+  close($out);
+  if ($count == ($ENV{AGENT_NOTIFY_TEST_HASH_NTH} // 0)) {
+    my $watch = $ENV{AGENT_NOTIFY_TEST_WATCH};
+    $watch ? signal_when_changed($watch) : send_signal();
+  }
+}
+1;' > "$fake/perl/AttemptSignal.pm"
+# Stands in for osascript, as real-jxa does, and is Perl to share the signal code above.
+print -r -- '#!/usr/bin/perl
+my ($helper, $action) = @ARGV[2, 3];
+if ($helper =~ /keychain-jxa$/) {
+  if ($action eq "store") { open(my $armed, ">", "$ENV{AGENT_NOTIFY_TEST_STATE}.armed") or die "$!\n"; close($armed); }
+  AttemptSignal::send_signal() if $action eq ($ENV{AGENT_NOTIFY_TEST_SIGNAL_ON} // "");
+  exec($helper, @ARGV[3 .. $#ARGV]) or die "exec failed: $!\n";
+}
+AttemptSignal::send_signal() if $action eq ($ENV{AGENT_NOTIFY_TEST_SIGNAL_ON} // "");
+exec("/usr/bin/osascript", @ARGV) or die "exec failed: $!\n";' > "$fake/attempt-jxa"; /bin/chmod 700 "$fake/attempt-jxa"
+: > "$signal_state.armed"
+print -- probe | env PERL5OPT=-MAttemptSignal PERL5LIB="$fake/perl" AGENT_NOTIFY_TEST_STATE="$signal_state" /usr/bin/shasum -a 256 >/dev/null
+[[ -r "$signal_state.count" ]] || { print -u2 -- 'shasum did not load the signal injector; the signal cases rely on /usr/bin/shasum being a Perl script'; exit 1; }
+/bin/rm -f "$signal_state".{armed,count}
+
+# signal_attempt_check <name> <home> <signal> <1 for the whole group, 0 for the installer alone> [<env assignment>...]: as failed_attempt_check, and the signal must really have been sent.
+signal_attempt_check() {
+  local signal_name=$1 signal_home=$2 signal_kind=$3 signal_group=$4
+  shift 4
+  /bin/rm -f "$signal_state".{armed,count,fired}
+  failed_attempt_check "$signal_name" "$signal_home" $signal_env AGENT_NOTIFY_TEST_SIGNAL="$signal_kind" AGENT_NOTIFY_TEST_WHOLE_GROUP="$signal_group" "$@"
+  [[ -e "$signal_state.fired" ]] || fail_with "no signal was sent: $signal_name" "$attempt_output"
+}
+# hash_signal_sweep <name> <home> <signal> <whole group> [<env assignment>...]: one attempt per hash recorded after the Keychain store.
+hash_signal_sweep() {
+  local sweep_name=$1 sweep_home=$2 sweep_signal=$3 sweep_group=$4 sweep_count sweep_position
+  shift 4
+  # An attempt with no signal may finish installing, so the count comes from a copy of the home.
+  /bin/rm -rf "$test_root/sweep-count-home" "$signal_state".{armed,count,fired}
+  /bin/cp -pR "$sweep_home" "$test_root/sweep-count-home"
+  run_attempt "$test_root/sweep-count-home" $signal_env "$@"
+  sweep_count=$(<"$signal_state.count")
+  for (( sweep_position = 1; sweep_position <= sweep_count; sweep_position++ )); do
+    signal_attempt_check "$sweep_name at hash $sweep_position of $sweep_count" "$sweep_home" "$sweep_signal" "$sweep_group" AGENT_NOTIFY_TEST_HASH_NTH="$sweep_position" "$@"
+  done
+}
+# first_install_attempt <position>: a fresh home, with a terminal interrupt at that hash.
+typeset first_install_home="$test_root/attempt-first-install-home"
+first_install_attempt() {
+  /bin/rm -rf "$first_install_home" "$signal_state".{armed,count,fired}
+  print -- old-generation > "$keychain_state/selector"; /bin/rm -f "$keychain_state/current-generation"
+  attempt_code=0
+  attempt_output=$(print -- $'user\ntoken' | own_group env $real_env AGENT_NOTIFY_INSTALL_HOME="$first_install_home" AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes:no AGENT_NOTIFY_INSTALL_TEST_INPUT_FD=0 $signal_env AGENT_NOTIFY_TEST_SIGNAL=INT AGENT_NOTIFY_TEST_WHOLE_GROUP=1 AGENT_NOTIFY_TEST_HASH_NTH="$1" "$root/bin/agent-notify-install" 2>&1) || attempt_code=$?
+  [[ $attempt_output != *'attempt timed out'* ]] || fail_with 'an attempt hung' "$attempt_output"
+}
+# Empty parent directories may remain; files may not.
+first_install_signal_sweep() {
+  local first_count first_position first_name
+  local -a first_leftovers
+  first_install_attempt 0
+  first_count=$(<"$signal_state.count")
+  for (( first_position = 1; first_position <= first_count; first_position++ )); do
+    first_name="$1 at hash $first_position of $first_count"
+    first_install_attempt "$first_position"
+    (( attempt_code )) || fail_with "failed attempt reported success: $first_name" "$attempt_output"
+    [[ -e "$signal_state.fired" ]] || fail_with "no signal was sent: $first_name" "$attempt_output"
+    first_leftovers=("$first_install_home"/**/*(.DN))
+    (( $#first_leftovers == 0 )) || fail_with "failed attempt left files behind: $first_name" "$attempt_output"$'\n'"${(F)first_leftovers}"
+    assert_attempt_report "$first_name"
+  done
+}
+# signal_on_change_check <name> <path under the home> <signal> <whole group>: no program can be injected right after a move, so a process started at the first hash signals as soon as the path changes. It can land after the install commits, so a clean finish is allowed. Finishing after a restore is not, and neither is stopping with no restore.
+signal_on_change_check() {
+  local change_home="$test_root/attempt-change-home" change_wait=0
+  /bin/rm -rf "$change_home" "$signal_state".{armed,count,fired}
+  real_install "$change_home" yes
+  seed_prior_install "$change_home"
+  /bin/chmod 640 "$(manifest_file "$change_home")"
+  run_attempt "$change_home" $signal_env AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes AGENT_NOTIFY_TEST_HASH_NTH=1 AGENT_NOTIFY_TEST_WATCH="$change_home/$2" AGENT_NOTIFY_TEST_SIGNAL="$3" AGENT_NOTIFY_TEST_WHOLE_GROUP="$4"
+  # Writing this file is the last thing the watcher does to the disk, so waiting also keeps it from racing the suite's cleanup.
+  until [[ -e "$signal_state.fired" ]] || (( ++change_wait > 600 )); do /bin/sleep 0.1; done
+  [[ -e "$signal_state.fired" ]] || fail_with "no signal was sent: $1" "$attempt_output"
+  if [[ $attempt_output == *'installation failed'* ]]; then
+    (( attempt_code )) || fail_with "an attempt that restored finished as a success: $1" "$attempt_output"
+    assert_attempt_restored "$1" "$change_home"
+  else
+    # zsh exposes the default disposition for an instant when a trap replaces a handler, so a signal at the commit point can kill a finished install.
+    (( ! attempt_code || attempt_code > 128 )) || fail_with "an attempt stopped without restoring or reporting: $1" "$attempt_output"
+    [[ $(<"$(manifest_file "$change_home")") != "$attempt_manifest" ]] || fail_with "an attempt stopped without restoring or reporting: $1" "$attempt_output"
+  fi
+}
+# signal_over_link_check <name> <signal> <whole group>: the restore runs while a dangling library link is still in place, and the attempt then carries on to the library step.
+signal_over_link_check() {
+  local link_signal_home="$test_root/attempt-link-signal-home" change_wait=0
+  /bin/rm -rf "$link_signal_home" "$signal_state".{armed,count,fired}
+  real_install "$link_signal_home" yes
+  /bin/rm -rf "$link_signal_home/.local/lib/agent-notify"
+  /bin/ln -s "$test_root/no-such-library" "$link_signal_home/.local/lib/agent-notify"
+  run_attempt "$link_signal_home" $signal_env AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes:yes AGENT_NOTIFY_TEST_HASH_NTH=1 AGENT_NOTIFY_TEST_WATCH="$link_signal_home/.local/bin/agent-notify" AGENT_NOTIFY_TEST_SIGNAL="$2" AGENT_NOTIFY_TEST_WHOLE_GROUP="$3"
+  until [[ -e "$signal_state.fired" ]] || (( ++change_wait > 600 )); do /bin/sleep 0.1; done
+  [[ -e "$signal_state.fired" ]] || fail_with "no signal was sent: $1" "$attempt_output"
+  if [[ $attempt_output == *'installation failed'* ]]; then
+    (( attempt_code )) || fail_with "an attempt that restored finished as a success: $1" "$attempt_output"
+    assert_attempt_restored "$1" "$link_signal_home"
+  else
+    (( ! attempt_code || attempt_code > 128 )) || fail_with "an attempt stopped without restoring or reporting: $1" "$attempt_output"
+    (( attempt_code )) || [[ $(<"$(manifest_file "$link_signal_home")") != "$attempt_manifest" ]] || fail_with "an attempt finished with nothing installed: $1" "$attempt_output"
+  fi
+}
+# A signal during the retire must not stop a finished install, since nothing else would remove the prior generation.
+finished_install_signal_check() {
+  local finish_home="$test_root/attempt-finish-home"
+  real_install "$finish_home" yes
+  /bin/rm -f "$signal_state".{armed,count,fired}
+  run_attempt "$finish_home" $signal_env AGENT_NOTIFY_TEST_SIGNAL_ON=retire AGENT_NOTIFY_TEST_SIGNAL="$2" AGENT_NOTIFY_TEST_WHOLE_GROUP=1
+  (( ! attempt_code )) || fail_with "a signal stopped a finished install: $1" "$attempt_output"
+  [[ -e "$signal_state.fired" ]] || fail_with "no signal was sent: $1" "$attempt_output"
+  [[ $attempt_output == *'installation complete'* && $attempt_output != *'installation failed'* ]] || fail_with "a finished install did not report completing: $1" "$attempt_output"
+  [[ $attempt_output != *'could not be retired'* ]] || fail_with "a signal stopped the retire: $1" "$attempt_output"
+}
+# Before the first mutation a signal can only stop the installer, so these programs send one during preflight and during the selector read.
+print -r -- '#!/usr/bin/perl
+AttemptSignal::send_signal();
+print "claude 1.2.3\n";' > "$fake/signal-claude"; /bin/chmod 700 "$fake/signal-claude"
+print -r -- '#!/usr/bin/perl
+if (grep { $_ eq "-w" } @ARGV) { AttemptSignal::send_signal(); print "old-generation\n"; }' > "$fake/signal-security"; /bin/chmod 700 "$fake/signal-security"
+# Exits with the chosen status when asked for the selector, as security does when an item is missing or access is denied.
+print -r -- '#!/bin/zsh
+[[ " $* " == *" -w "* ]] && exit $AGENT_NOTIFY_TEST_SELECTOR_READ
+exit 0' > "$fake/selector-read-security"; /bin/chmod 700 "$fake/selector-read-security"
+# Runs a command with stderr on a pipe nobody reads, which is what `2>&1 | tee` leaves once a ^C has killed tee.
+print -r -- '#!/usr/bin/perl
+pipe(my $read, my $write) or die "$!\n";
+close($read);
+open(STDERR, ">&", $write) or die "$!\n";
+close($write);
+$SIG{PIPE} = "DEFAULT";
+exec(@ARGV) or die "exec failed: $!\n";' > "$fake/closed-stderr"; /bin/chmod 700 "$fake/closed-stderr"
+# assert_stopped_before_mutation <name> <home>: the attempt exited 1, and the home, state directory, and Keychain are as run_attempt found them.
+assert_stopped_before_mutation() {
+  (( attempt_code == 1 )) || fail_with "attempt did not exit 1: $1" "$attempt_output"
+  [[ $(managed_tree "$2") == "$attempt_tree" ]] || print -ru2 -- "$attempt_output"
+  assert_tree "$2" "$attempt_tree" "attempt changed the home: $1"
+  [[ $(<"$(manifest_file "$2")") == "$attempt_manifest" ]] || fail_with "attempt changed the manifest: $1" "$attempt_output"
+  [[ $(state_listing "$2") == "$attempt_state" ]] || fail_with "attempt changed the state directory: $1" "$attempt_output"
+  [[ $(<"$keychain_state/selector") == old-generation && ! -e "$keychain_state/current-generation" ]] || fail_with "attempt changed the Keychain state: $1" "$attempt_output"
+  [[ $attempt_output != *'installation failed'* ]] || fail_with "attempt reported restoring when nothing had changed: $1" "$attempt_output"
+}
+# before_mutation_signal_check <name> <home> <signal> <whole group> [<env assignment>...]: preflight stages in a temporary directory only this attempt uses, and must leave nothing there.
+before_mutation_signal_check() {
+  local stop_name=$1 stop_home=$2 stop_signal=$3 stop_group=$4 stop_tmp="$test_root/attempt-stop-tmp"
+  local -a stop_left
+  shift 4
+  /bin/rm -rf "$stop_tmp" "$signal_state".{armed,count,fired}
+  /bin/mkdir "$stop_tmp"
+  run_attempt "$stop_home" TMPDIR="$stop_tmp" $signal_env AGENT_NOTIFY_TEST_SIGNAL="$stop_signal" AGENT_NOTIFY_TEST_WHOLE_GROUP="$stop_group" "$@"
+  [[ -e "$signal_state.fired" ]] || fail_with "no signal was sent: $stop_name" "$attempt_output"
+  assert_stopped_before_mutation "$stop_name" "$stop_home"
+  (( $#attempt_wrapper )) || [[ $attempt_output == *'interrupted before installing anything'* ]] || fail_with "attempt did not say it stopped: $stop_name" "$attempt_output"
+  stop_left=("$stop_tmp"/*(ND))
+  (( ! $#stop_left )) || fail_with "attempt left its stage behind: $stop_name" "$attempt_output"
+}
+# An empty backup directory that was already there is not the attempt's to remove, and keeps its mode.
+existing_backup_root_check() {
+  local stop_backups="$first_install_home/Library/Application Support/agent-notify/install-backups"
+  /bin/rm -rf "$first_install_home"
+  /bin/mkdir -p "$stop_backups"
+  /bin/chmod 750 "$stop_backups"
+  start_attempt "$first_install_home" AGENT_NOTIFY_INSTALL_SECURITY_BIN="$fake/selector-read-security" AGENT_NOTIFY_TEST_SELECTOR_READ=51
+  (( attempt_code == 1 )) || fail_with "attempt did not exit 1: $1" "$attempt_output"
+  [[ -d $stop_backups && $(/usr/bin/stat -f '%Lp' "$stop_backups") == 750 ]] || fail_with "attempt changed an existing backup directory: $1" "$attempt_output"
+}
+# A reader that died with the ^C can no longer see the report, and must not stop the restore.
+dead_reader_restore_check() {
+  /bin/rm -f "$signal_state".{armed,count,fired}
+  attempt_wrapper=("$fake/closed-stderr")
+  run_attempt "$2" $signal_env AGENT_NOTIFY_TEST_SIGNAL=TERM AGENT_NOTIFY_TEST_WHOLE_GROUP=0 AGENT_NOTIFY_TEST_HASH_NTH=5 AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes
+  attempt_wrapper=()
+  [[ -e "$signal_state.fired" ]] || fail_with "no signal was sent: $1" "$attempt_output"
+  (( attempt_code )) || fail_with "failed attempt reported success: $1" "$attempt_output"
+  [[ $(managed_tree "$2") == "$attempt_tree" ]] || print -ru2 -- "$attempt_output"
+  assert_tree "$2" "$attempt_tree" "failed attempt changed the home: $1"
+  [[ $(<"$(manifest_file "$2")") == "$attempt_manifest" ]] || fail_with "failed attempt changed the manifest: $1" "$attempt_output"
+  [[ $(state_listing "$2") == "$attempt_state" ]] || fail_with "failed attempt changed the state directory: $1" "$attempt_output"
+  [[ $(<"$keychain_state/selector") == old-generation && ! -e "$keychain_state/current-generation" ]] || fail_with "failed attempt did not restore the Keychain state: $1" "$attempt_output"
+}
+# A read that fails for any reason but a missing item leaves the prior selector unknown, and a later rollback would delete it.
+selector_read_refused_check() {
+  run_attempt "$2" AGENT_NOTIFY_INSTALL_SECURITY_BIN="$fake/selector-read-security" AGENT_NOTIFY_TEST_SELECTOR_READ="$3"
+  assert_stopped_before_mutation "$1" "$2"
+  [[ $attempt_output == *'unable to read the current Keychain selector; nothing was installed'* ]] || fail_with "attempt did not say why it stopped: $1" "$attempt_output"
+}
+# first_install_stop_check <name> <message> [<env assignment>...]: a fresh home ends with no files and no backup directory. The empty directories above that one stay, which is why the message cannot claim that nothing changed.
+first_install_stop_check() {
+  local stop_name=$1 stop_message=$2
+  shift 2
+  /bin/rm -rf "$first_install_home" "$signal_state".{armed,count,fired}
+  start_attempt "$first_install_home" "$@"
+  (( attempt_code == 1 )) || fail_with "attempt did not exit 1: $stop_name" "$attempt_output"
+  [[ $attempt_output == *"$stop_message"* ]] || fail_with "attempt did not say why it stopped: $stop_name" "$attempt_output"
+  [[ -z $(/usr/bin/find "$first_install_home" -type f -print) ]] || fail_with "attempt left files behind: $stop_name" "$attempt_output"
+  [[ ! -e "$first_install_home/Library/Application Support/agent-notify/install-backups" ]] || fail_with "attempt left its backup directory: $stop_name" "$attempt_output"
+  [[ $(<"$keychain_state/selector") == old-generation && ! -e "$keychain_state/current-generation" ]] || fail_with "attempt changed the Keychain state: $stop_name" "$attempt_output"
+}
+# Status 44 is a missing item, which is simply a first install of v2 credentials.
+no_selector_check() {
+  local fresh_home="$test_root/attempt-no-selector-home"
+  /bin/rm -rf "$fresh_home"
+  real_install "$fresh_home" yes
+  run_attempt "$fresh_home" AGENT_NOTIFY_INSTALL_SECURITY_BIN="$fake/selector-read-security" AGENT_NOTIFY_TEST_SELECTOR_READ=44
+  (( ! attempt_code )) || fail_with "an install with no selector failed: $1" "$attempt_output"
+  [[ $attempt_output == *'installation complete'* ]] || fail_with "an install with no selector did not complete: $1" "$attempt_output"
+  run_attempt "$fresh_home" AGENT_NOTIFY_INSTALL_SECURITY_BIN="$fake/selector-read-security" AGENT_NOTIFY_TEST_SELECTOR_READ=44 AGENT_NOTIFY_INSTALL_FAIL_AT=binary
+  (( attempt_code )) || fail_with "failed attempt reported success: $1" "$attempt_output"
+  [[ ! -e "$keychain_state/selector" && ! -e "$keychain_state/current-generation" ]] || fail_with "failed attempt left a selector where there was none: $1" "$attempt_output"
+}
+# Only a real terminal exercises the prompts: they read /dev/tty, and the secret ones turn echo off. The spawned terminal copies this one's modes, so the interrupt key is set explicitly.
+print -r -- '# usage: expect -f prompt-interrupt.exp <runner> <prompts to answer before the interrupt>
+lassign $argv runner answers
+set timeout 30
+log_user 1
+set stty_init "intr ^C"
+spawn -noecho /bin/zsh -f $runner
+set replies [list "y" "user"]
+set prompts [list "Proceed with the displayed plan" "Pushover user key: " "Pushover application token: "]
+for {set i 0} {$i < $answers} {incr i} {
+  expect -ex [lindex $prompts $i] {} timeout { puts "NO-PROMPT"; exit 99 }
+  send -- "[lindex $replies $i]\r"
+}
+expect -ex [lindex $prompts $answers] {} timeout { puts "NO-PROMPT"; exit 99 }
+after 100
+send "\x03"
+expect -ex "RUNNER-DONE" {} timeout { puts "STILL-WAITING"; exit 99 }' > "$fake/prompt-interrupt.exp"
+# prompt_interrupt_check <name> <home> <prompts to answer first>
+prompt_interrupt_check() {
+  local prompt_out="$test_root/prompt-interrupt.out" prompt_code=0
+  local -a prompt_env=(${(q)real_env})
+  snapshot_home "$2"
+  print -- old-generation > "$keychain_state/selector"; /bin/rm -f "$keychain_state/current-generation"
+  # The handler keeps this shell alive through the interrupt, and resets to the default in the installer.
+  { print -r -- '#!/bin/zsh -f'
+    print -r -- 'trap : INT'
+    print -r -- "env ${prompt_env} AGENT_NOTIFY_INSTALL_HOME=${(q)2} ${(q)root}/bin/agent-notify-install"
+    print -r -- 'print -r -- "INSTALLER-STATUS=$?"'
+    print -r -- '/bin/stty -a </dev/tty'
+    print -r -- 'print -r -- RUNNER-DONE'
+  } > "$fake/prompt-runner.zsh"
+  # -n skips ~/.expect.rc. Without it expect exits 133 once HOME reaches 189 characters, which a long TMPDIR can cause.
+  /usr/bin/expect -n -f "$fake/prompt-interrupt.exp" "$fake/prompt-runner.zsh" "$3" > "$prompt_out" 2>&1 || prompt_code=$?
+  attempt_output=$(<"$prompt_out")
+  (( ! prompt_code )) || fail_with "the terminal test did not finish, status $prompt_code: $1" "$attempt_output"
+  [[ $attempt_output =~ 'INSTALLER-STATUS=([0-9]+)' ]] || fail_with "the terminal test reported no status: $1" "$attempt_output"
+  attempt_code=$match[1]
+  [[ $attempt_output == *' echo '* && $attempt_output != *' -echo '* ]] || fail_with "an interrupted installer left terminal echo off: $1" "$attempt_output"
+  [[ $attempt_output == *'interrupted before installing anything'* ]] || fail_with "an interrupted installer did not say it stopped: $1" "$attempt_output"
+  assert_stopped_before_mutation "$1" "$2"
+}
+# rollback_signal_check <name> <signal>: a rollback has changed files by then, so INT or TERM sent to the installer alone must not stop it. One sent to the whole group, or a hangup, does stop it.
+rollback_signal_check() {
+  local back_home="$test_root/attempt-rollback-signal-home" back_code=0
+  /bin/rm -rf "$back_home" "$signal_state".{armed,count,fired}
+  real_install "$back_home" yes
+  attempt_output=$(own_group env $real_env $signal_env AGENT_NOTIFY_INSTALL_HOME="$back_home" AGENT_NOTIFY_INSTALL_CLAUDE_BIN=/missing/claude AGENT_NOTIFY_INSTALL_OPENCODE_BIN=/missing/opencode AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes AGENT_NOTIFY_TEST_SIGNAL_ON=remove AGENT_NOTIFY_TEST_SIGNAL="$2" AGENT_NOTIFY_TEST_WHOLE_GROUP=0 "$root/bin/agent-notify-install" --rollback 2>&1 </dev/null) || back_code=$?
+  [[ $attempt_output != *'attempt timed out'* ]] || fail_with 'an attempt hung' "$attempt_output"
+  [[ -e "$signal_state.fired" ]] || fail_with "no signal was sent: $1" "$attempt_output"
+  (( ! back_code )) || fail_with "a signal stopped a rollback: $1" "$attempt_output"
+  [[ $attempt_output == *'Selective rollback complete.'* && $attempt_output != *'before installing anything'* ]] || fail_with "a rollback did not finish: $1" "$attempt_output"
+}
+# Changes made during the attempt belong to someone else: the restore must leave them.
+changes_during_attempt_check() {
+  local edit_home="$test_root/attempt-edit-home" edit_library edit_binary
+  edit_library="$edit_home/.local/lib/agent-notify/config.zsh" edit_binary="$edit_home/.local/bin/agent-notify"
+  real_install "$edit_home" yes
+  seed_prior_install "$edit_home"
+  /bin/rm -f "$signal_state".{armed,count,fired}
+  run_attempt "$edit_home" $signal_env AGENT_NOTIFY_INSTALL_FAIL_AT=settings AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes AGENT_NOTIFY_TEST_EDIT="$edit_library"$'\n'"$edit_binary"
+  (( attempt_code )) || fail_with "failed attempt reported success: $1" "$attempt_output"
+  [[ $(<"$edit_library") == *'# changed during the attempt'* && $(<"$edit_binary") == *'# changed during the attempt'* ]] || fail_with "failed attempt overwrote someone else's changes: $1" "$attempt_output"
+  assert_attempt_report "$1"
+}
+# The settings check must run after everything that can take time, or a change made in that time is overwritten.
+settings_change_during_attempt_check() {
+  local edit_home="$test_root/attempt-edit-settings-home" edit_settings
+  edit_settings="$edit_home/.claude/settings.json"
+  real_install "$edit_home" yes
+  /bin/rm -f "$signal_state".{armed,count,fired}
+  run_attempt "$edit_home" $signal_env AGENT_NOTIFY_TEST_EDIT="$edit_settings"
+  (( attempt_code )) || fail_with "failed attempt reported success: $1" "$attempt_output"
+  [[ $(<"$edit_settings") == *'# changed during the attempt'* ]] || fail_with "failed attempt overwrote someone else's changes: $1" "$attempt_output"
+  [[ $attempt_output == *'Claude settings changed during installation; refusing to overwrite'* ]] || fail_with "failed attempt did not refuse: $1" "$attempt_output"
+  assert_attempt_report "$1"
+}
+# read_only_check <name> <home> <directory under the home> [<env assignment>...]: a real failure, with no failure hook.
+read_only_check() {
+  local read_only_name=$1 read_only_home=$2 read_only_dir="$2/$3" read_only_mode
+  shift 3
+  read_only_mode=$(/usr/bin/stat -f '%Lp' "$read_only_dir")
+  /bin/chmod 500 "$read_only_dir"
+  failed_attempt_check "$read_only_name" "$read_only_home" "$@"
+  /bin/chmod "$read_only_mode" "$read_only_dir"
+}
+
+typeset attempt_home="$test_root/attempt-home" attempt_point
+real_install "$attempt_home" yes
+[[ $(/usr/bin/stat -f '%Lp' "$attempt_home/.claude/settings.json") == 600 && $(/usr/bin/stat -f '%Lp' "$(manifest_file "$attempt_home")") == 600 ]] || { print -u2 -- 'a successful install left settings or the manifest readable by others'; exit 1; }
+[[ $(/usr/bin/stat -f '%Lp' "$attempt_home/Library/Application Support/agent-notify/install-backups") == 700 ]] || { print -u2 -- 'a first install left its backup directory readable by others'; exit 1; }
+for attempt_point in keychain library binary plugin settings; do
+  failed_attempt_check "same checkout, failing at $attempt_point" "$attempt_home" AGENT_NOTIFY_INSTALL_FAIL_AT="$attempt_point"
+done
+
+typeset attempt_older_home="$test_root/attempt-older-plugin-home" attempt_older_plugin="$test_root/attempt-older-plugin-home/.config/opencode/plugins/agent-notify.js"
+real_install "$attempt_older_home" yes
+print -r -- $'// >>> agent-notify managed plugin >>>\n// older plugin' > "$attempt_older_plugin"
+/usr/bin/plutil -replace files.plugin.post_hash -string "$(/usr/bin/shasum -a 256 "$attempt_older_plugin" | /usr/bin/cut -d ' ' -f1)" "$(manifest_file "$attempt_older_home")"
+failed_attempt_check 'same library, older plugin, failing at plugin' "$attempt_older_home" AGENT_NOTIFY_INSTALL_FAIL_AT=plugin
+
+read_only_check 'same checkout, read-only plugins directory' "$attempt_home" .config/opencode/plugins
+read_only_check 'same checkout, read-only binary directory' "$attempt_home" .local/bin
+read_only_check 'same checkout, read-only library parent' "$attempt_home" .local/lib
+# The backup copies this mode. If that stopped the backup being removed, later steps could succeed after the restore.
+read_only_check 'same checkout, read-only library' "$attempt_home" .local/lib/agent-notify
+read_only_check 'same checkout, read-only settings directory' "$attempt_home" .claude
+# The manifest's move is the last step that can fail, and this fails it for real while the backups stay writable.
+read_only_check 'same checkout, read-only state directory' "$attempt_home" 'Library/Application Support/agent-notify'
+read_only_check 'same library, older plugin, read-only library parent' "$attempt_older_home" .local/lib
+
+# The library path is not this attempt's to remove if the attempt never replaced it.
+typeset attempt_link_home="$test_root/attempt-dangling-library-home"
+real_install "$attempt_link_home" yes
+/bin/rm -rf "$attempt_link_home/.local/lib/agent-notify"
+/bin/ln -s "$test_root/no-such-library" "$attempt_link_home/.local/lib/agent-notify"
+failed_attempt_check 'dangling link at the library path' "$attempt_link_home" AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes:yes AGENT_NOTIFY_INSTALL_FAIL_AT=library
+# This attempt fails at the library step or after it, and either way the link has to be there afterwards.
+failed_attempt_check 'dangling library link, failing at the library step or after it' "$attempt_link_home" AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes:yes AGENT_NOTIFY_INSTALL_FAIL_AT=binary
+
+# Before the trap is set, only the explicit call in the main script reports the failure. An unreadable binary fails its backup.
+typeset attempt_binary="$attempt_home/.local/bin/agent-notify" attempt_binary_mode
+attempt_binary_mode=$(/usr/bin/stat -f '%Lp' "$attempt_binary")
+snapshot_home "$attempt_home"
+/bin/chmod 000 "$attempt_binary"
+start_attempt "$attempt_home" AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes
+/bin/chmod "$attempt_binary_mode" "$attempt_binary"
+(( attempt_code )) || fail_with 'failed attempt reported success: failure before the first mutation' "$attempt_output"
+# The backup's own error is the failure here, so it is not a stray line.
+attempt_output=$(print -r -- "$attempt_output" | /usr/bin/grep -v '^cp: .*Permission denied')
+assert_attempt_restored 'failure before the first mutation' "$attempt_home"
+
+# tree_hash ignores modes, so a restore that skips identical bytes would leave these changed.
+typeset attempt_modes_home="$test_root/attempt-prior-modes-home"
+real_install "$attempt_modes_home" yes
+/bin/chmod 640 "$attempt_modes_home/.local/lib/agent-notify/config.zsh"
+/bin/chmod 750 "$attempt_modes_home/.local/lib/agent-notify" "$attempt_modes_home/.local/bin/agent-notify"
+failed_attempt_check 'same bytes, different prior modes, failing at binary' "$attempt_modes_home" AGENT_NOTIFY_INSTALL_FAIL_AT=binary
+
+typeset attempt_different_home="$test_root/attempt-different-library-home"
+real_install "$attempt_different_home" yes
+seed_prior_install "$attempt_different_home"
+failed_attempt_check 'different prior library, failing at binary' "$attempt_different_home" AGENT_NOTIFY_INSTALL_FAIL_AT=binary AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes
+
+for attempt_point in INT TERM HUP; do
+  before_mutation_signal_check "$attempt_point to the group during preflight" "$attempt_home" "$attempt_point" 1 AGENT_NOTIFY_INSTALL_CLAUDE_BIN="$fake/signal-claude"
+  before_mutation_signal_check "$attempt_point to the group during the selector read" "$attempt_home" "$attempt_point" 1 AGENT_NOTIFY_INSTALL_SECURITY_BIN="$fake/signal-security"
+  before_mutation_signal_check "$attempt_point to the installer during preflight" "$attempt_home" "$attempt_point" 0 AGENT_NOTIFY_INSTALL_CLAUDE_BIN="$fake/signal-claude"
+  before_mutation_signal_check "$attempt_point to the installer during the selector read" "$attempt_home" "$attempt_point" 0 AGENT_NOTIFY_INSTALL_SECURITY_BIN="$fake/signal-security"
+  before_mutation_signal_check "$attempt_point to the group while preflight holds its stage" "$attempt_home" "$attempt_point" 1 AGENT_NOTIFY_TEST_SIGNAL_ON=merge
+  before_mutation_signal_check "$attempt_point to the installer while preflight holds its stage" "$attempt_home" "$attempt_point" 0 AGENT_NOTIFY_TEST_SIGNAL_ON=merge
+done
+attempt_args=(--dry-run)
+before_mutation_signal_check 'INT to the group during a dry run' "$attempt_home" INT 1 AGENT_NOTIFY_TEST_SIGNAL_ON=merge
+before_mutation_signal_check 'TERM to the installer during a dry run' "$attempt_home" TERM 0 AGENT_NOTIFY_TEST_SIGNAL_ON=merge
+attempt_args=()
+attempt_wrapper=("$fake/closed-stderr")
+before_mutation_signal_check 'TERM to the installer while preflight holds its stage, reader gone' "$attempt_home" TERM 0 AGENT_NOTIFY_TEST_SIGNAL_ON=merge
+before_mutation_signal_check 'TERM to the installer during the selector read, reader gone' "$attempt_home" TERM 0 AGENT_NOTIFY_INSTALL_SECURITY_BIN="$fake/signal-security"
+attempt_wrapper=()
+dead_reader_restore_check 'signal during an upgrade, reader gone' "$attempt_different_home"
+existing_backup_root_check 'existing empty backup directory'
+# Other than 1, these are the low bytes of errSecInteractionNotAllowed, errSecAuthFailed, and errSecUserCanceled, by the truncation that makes a missing item 44, and a child killed by a signal.
+selector_read_refused_check 'selector read failed' "$attempt_home" 1
+selector_read_refused_check 'selector read not allowed' "$attempt_home" 36
+selector_read_refused_check 'selector read denied' "$attempt_home" 51
+selector_read_refused_check 'selector read cancelled' "$attempt_home" 128
+selector_read_refused_check 'selector read killed' "$attempt_home" 131
+no_selector_check 'no selector yet'
+first_install_stop_check 'first install, interrupt during the selector read' 'interrupted before installing anything' $signal_env AGENT_NOTIFY_TEST_SIGNAL=INT AGENT_NOTIFY_TEST_WHOLE_GROUP=1 AGENT_NOTIFY_INSTALL_SECURITY_BIN="$fake/signal-security"
+first_install_stop_check 'first install, selector read denied' 'unable to read the current Keychain selector; nothing was installed' AGENT_NOTIFY_INSTALL_SECURITY_BIN="$fake/selector-read-security" AGENT_NOTIFY_TEST_SELECTOR_READ=51
+prompt_interrupt_check 'interrupt at the plan confirmation' "$attempt_home" 0
+prompt_interrupt_check 'interrupt at the user key' "$attempt_home" 1
+prompt_interrupt_check 'interrupt at the application token' "$attempt_home" 2
+
+# A credential can arrive the moment its prompt appears, as a paste does on a loaded machine, so echo has to be off before the prompt is shown.
+print -r -- 'lassign $argv runner
+set timeout 30
+log_user 1
+spawn -noecho /bin/zsh -f $runner
+expect -ex "Proceed with the displayed plan" {} timeout { puts "NO-PROMPT"; exit 99 }
+send -- "y\r"
+expect -ex "Pushover user key: " {} timeout { puts "NO-PROMPT"; exit 99 }
+send -- "FAKEPASTEDKEY\r"
+expect -ex "Pushover application token: " {} timeout { puts "NO-PROMPT"; exit 99 }
+send -- "FAKEPASTEDTOKEN\r"
+expect -ex "RUNNER-DONE" {} timeout { puts "STILL-WAITING"; exit 99 }' > "$fake/prompt-paste.exp"
+typeset paste_output paste_code=0
+typeset -a paste_env=(${(q)real_env})
+{ print -r -- '#!/bin/zsh -f'
+  print -r -- "env ${paste_env} AGENT_NOTIFY_INSTALL_HOME=${(q)test_root}/attempt-paste-home ${(q)root}/bin/agent-notify-install"
+  print -r -- 'print -r -- "INSTALLER-STATUS=$?"'
+  print -r -- '/bin/stty -a </dev/tty'
+  print -r -- 'print -r -- RUNNER-DONE'
+} > "$fake/prompt-paste-runner.zsh"
+paste_output=$(/usr/bin/expect -n -f "$fake/prompt-paste.exp" "$fake/prompt-paste-runner.zsh" 2>&1) || paste_code=$?
+(( ! paste_code )) || fail_with "the paste test did not finish, status $paste_code" "$paste_output"
+[[ $paste_output != *FAKEPASTED* ]] || fail_with 'a credential sent as its prompt appeared was echoed' "$paste_output"
+[[ $paste_output =~ 'INSTALLER-STATUS=([0-9]+)' ]] && (( match[1] == 0 )) && [[ $paste_output == *'installation complete'* ]] || fail_with 'the paste test did not finish an install' "$paste_output"
+[[ $paste_output == *' echo '* && $paste_output != *' -echo '* ]] || fail_with 'a finished prompt left terminal echo off' "$paste_output"
+
+# With nobody reading stderr, as after a ^C through tee, the prompt's own print raises SIGPIPE, and echo is already off by then.
+print -r -- 'lassign $argv runner
+set timeout 30
+log_user 1
+spawn -noecho /bin/zsh -f $runner
+expect -ex "RUNNER-DONE" {} timeout { puts "STILL-WAITING"; exit 99 }' > "$fake/prompt-closed-stderr.exp"
+{ print -r -- '#!/bin/zsh -f'
+  print -r -- "env ${paste_env} AGENT_NOTIFY_INSTALL_TEST_CONFIRM=yes AGENT_NOTIFY_INSTALL_HOME=${(q)test_root}/attempt-closed-stderr-home ${(q)fake}/closed-stderr ${(q)root}/bin/agent-notify-install"
+  print -r -- 'print -r -- "INSTALLER-STATUS=$?"'
+  print -r -- '/bin/stty -a </dev/tty'
+  print -r -- 'print -r -- RUNNER-DONE'
+} > "$fake/prompt-closed-stderr-runner.zsh"
+paste_code=0
+paste_output=$(/usr/bin/expect -n -f "$fake/prompt-closed-stderr.exp" "$fake/prompt-closed-stderr-runner.zsh" 2>&1) || paste_code=$?
+(( ! paste_code )) || fail_with "the closed stderr test did not finish, status $paste_code" "$paste_output"
+[[ $paste_output =~ 'INSTALLER-STATUS=([0-9]+)' ]] && (( match[1] == 1 )) || fail_with 'a prompt nobody could read did not stop the installer' "$paste_output"
+[[ $paste_output == *' echo '* && $paste_output != *' -echo '* ]] || fail_with 'a prompt nobody could read left terminal echo off' "$paste_output"
+
+# A warning with nobody to read it must not stop the retire, since nothing else would remove the prior generation.
+typeset retire_home="$test_root/attempt-retire-home"
+real_install "$retire_home" yes
+/bin/rm -f "$retire_home/Library/Application Support/agent-notify/settings.conf"
+/bin/ln -s "$test_root/no-such-directory/settings.conf" "$retire_home/Library/Application Support/agent-notify/settings.conf"
+print -r -- "#!/bin/zsh
+[[ \$1 == retire ]] && : > '$signal_state.retired'
+exec '$fake/keychain-jxa' \"\$@\"" > "$fake/retire-recording-keychain-jxa"
+/bin/chmod 700 "$fake/retire-recording-keychain-jxa"
+/bin/rm -f "$signal_state.retired"
+attempt_wrapper=("$fake/closed-stderr")
+run_attempt "$retire_home" AGENT_NOTIFY_INSTALL_KEYCHAIN_HELPER="$fake/retire-recording-keychain-jxa"
+attempt_wrapper=()
+[[ -e "$signal_state.retired" ]] || fail_with 'a warning nobody could read stopped the retire' "$attempt_output"
+
+# The same the other way round: a failed retire's warning must not stop the excerpt settings being written.
+/bin/rm -f "$retire_home/Library/Application Support/agent-notify/settings.conf"
+print -r -- "#!/bin/zsh
+[[ \$1 == retire ]] && exit 1
+exec '$fake/keychain-jxa' \"\$@\"" > "$fake/retire-failing-keychain-jxa"
+/bin/chmod 700 "$fake/retire-failing-keychain-jxa"
+attempt_wrapper=("$fake/closed-stderr")
+run_attempt "$retire_home" AGENT_NOTIFY_INSTALL_KEYCHAIN_HELPER="$fake/retire-failing-keychain-jxa"
+attempt_wrapper=()
+[[ -f "$retire_home/Library/Application Support/agent-notify/settings.conf" ]] || fail_with 'a warning nobody could read stopped the excerpt settings' "$attempt_output"
+
+# A refusal prints before any restore, so with nobody to read it, SIGPIPE must not stop the restore from running.
+typeset refusal_home="$test_root/attempt-refusal-home"
+real_install "$refusal_home" yes
+seed_prior_install "$refusal_home"
+/bin/rm -f "$signal_state".{armed,count,fired}
+attempt_wrapper=("$fake/closed-stderr")
+run_attempt "$refusal_home" $signal_env AGENT_NOTIFY_TEST_EDIT="$refusal_home/.claude/settings.json" AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes
+attempt_wrapper=()
+(( attempt_code )) || fail_with 'a refused attempt reported success' "$attempt_output"
+[[ $(<"$keychain_state/selector") == old-generation && ! -e "$keychain_state/current-generation" ]] || fail_with 'a refusal nobody could read stopped the Keychain restore' "$attempt_output"
+[[ $(<"$refusal_home/.local/bin/agent-notify") == 'seed notifier' && $(<"$refusal_home/.local/lib/agent-notify/config.zsh") == '# seed library' ]] || fail_with 'a refusal nobody could read stopped the restore of the artifacts' "$attempt_output"
+[[ $(<"$refusal_home/.claude/settings.json") == *'# changed during the attempt'* ]] || fail_with 'a refused attempt overwrote the changed settings' "$attempt_output"
+
+# A job stopped on SIGTTOU and then resumed fails its stty -echo, and a credential must not then be read with echo on.
+print -r -- 'use POSIX qw(setpgid tcsetpgrp WUNTRACED WIFSTOPPED);
+$SIG{TTOU} = "IGNORE";
+my $child = fork() // die "fork failed: $!\n";
+if (!$child) {
+  setpgid(0, 0);
+  $SIG{TTOU} = "DEFAULT";
+  exec(@ARGV) or die "exec failed: $!\n";
+}
+setpgid($child, $child);
+open(my $tty, "+<", "/dev/tty") or die "$!\n";
+waitpid($child, WUNTRACED);
+print "INSTALLER-STOPPED\n" if WIFSTOPPED(${^CHILD_ERROR_NATIVE});
+tcsetpgrp(fileno($tty), $child);
+kill("CONT", -$child);
+waitpid($child, 0);
+tcsetpgrp(fileno($tty), getpgrp());
+print "INSTALLER-STATUS=", $? >> 8, "\n";' > "$fake/stopped-job.pl"
+print -r -- 'lassign $argv runner
+set timeout 30
+log_user 1
+spawn -noecho /bin/zsh -f $runner
+expect {
+  -ex "Pushover user key: " { send -- "FAKEPASTEDKEY\r"; exp_continue }
+  -ex "Pushover application token: " { send -- "FAKEPASTEDTOKEN\r"; exp_continue }
+  -ex "RUNNER-DONE" {}
+  timeout { puts "STILL-WAITING"; exit 99 }
+}' > "$fake/prompt-stopped.exp"
+{ print -r -- '#!/bin/zsh -f'
+  print -r -- "env ${paste_env} AGENT_NOTIFY_INSTALL_TEST_CONFIRM=yes AGENT_NOTIFY_INSTALL_HOME=${(q)test_root}/attempt-stopped-home /usr/bin/perl ${(q)fake}/stopped-job.pl ${(q)root}/bin/agent-notify-install"
+  print -r -- '/bin/stty -a </dev/tty'
+  print -r -- 'print -r -- RUNNER-DONE'
+} > "$fake/prompt-stopped-runner.zsh"
+paste_code=0
+paste_output=$(/usr/bin/expect -n -f "$fake/prompt-stopped.exp" "$fake/prompt-stopped-runner.zsh" 2>&1) || paste_code=$?
+(( ! paste_code )) || fail_with "the stopped job test did not finish, status $paste_code" "$paste_output"
+[[ $paste_output == *INSTALLER-STOPPED* ]] || fail_with 'the stopped job test did not stop the installer' "$paste_output"
+[[ $paste_output != *FAKEPASTED* ]] || fail_with 'a stopped and resumed job read a credential with echo on' "$paste_output"
+[[ $paste_output =~ 'INSTALLER-STATUS=([0-9]+)' ]] && (( match[1] == 1 )) && [[ $paste_output == *'unable to read user key'* ]] || fail_with 'a failed stty -echo did not refuse the prompt' "$paste_output"
+[[ $paste_output == *' echo '* && $paste_output != *' -echo '* ]] || fail_with 'a failed stty -echo left terminal echo off' "$paste_output"
+rollback_signal_check 'TERM during a rollback' TERM
+rollback_signal_check 'INT during a rollback' INT
+
+changes_during_attempt_check 'changes during the attempt'
+settings_change_during_attempt_check 'settings changed during the attempt'
+
+signal_attempt_check 'signal during the Keychain store' "$attempt_home" TERM 0 AGENT_NOTIFY_TEST_SIGNAL_ON=store
+signal_attempt_check 'interrupt during the Keychain store' "$attempt_home" INT 0 AGENT_NOTIFY_TEST_SIGNAL_ON=store
+signal_attempt_check 'terminal interrupt during the Keychain store' "$attempt_home" INT 1 AGENT_NOTIFY_TEST_SIGNAL_ON=store
+# A credential too long for the pipe keeps the store pipeline's forked print alive when the signal arrives, and zsh keeps the trap in that child.
+attempt_credentials=$'user\n'${(l:200000::x:)${:-}}
+signal_attempt_check 'terminal interrupt during the Keychain store, long credential' "$attempt_home" INT 1 AGENT_NOTIFY_TEST_SIGNAL_ON=store
+attempt_credentials=$'user\ntoken'
+signal_attempt_check 'signal during the Keychain restore' "$attempt_home" TERM 0 AGENT_NOTIFY_TEST_SIGNAL_ON=rollback AGENT_NOTIFY_INSTALL_FAIL_AT=binary
+for attempt_point in INT TERM HUP QUIT; do
+  signal_attempt_check "$attempt_point to the group during the Keychain restore" "$attempt_home" "$attempt_point" 1 AGENT_NOTIFY_TEST_SIGNAL_ON=rollback AGENT_NOTIFY_INSTALL_FAIL_AT=binary
+done
+signal_attempt_check 'terminal interrupt during the Keychain restore, different prior library' "$attempt_different_home" INT 1 AGENT_NOTIFY_TEST_SIGNAL_ON=rollback AGENT_NOTIFY_INSTALL_FAIL_AT=binary AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes
+
+hash_signal_sweep 'same checkout, signal' "$attempt_home" TERM 0
+hash_signal_sweep 'different prior library, signal' "$attempt_different_home" TERM 0 AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes
+hash_signal_sweep 'different prior library, terminal interrupt' "$attempt_different_home" INT 1 AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes
+hash_signal_sweep 'different prior library, failing at settings, terminal interrupt' "$attempt_different_home" INT 1 AGENT_NOTIFY_INSTALL_FAIL_AT=settings AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes
+hash_signal_sweep 'different prior library, hangup' "$attempt_different_home" HUP 1 AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes
+first_install_signal_sweep 'first install, terminal interrupt'
+
+finished_install_signal_check 'terminal interrupt during the retire' INT
+finished_install_signal_check 'hangup during the retire' HUP
+finished_install_signal_check 'termination during the retire' TERM
+
+# These land by timing, so one round can miss a regression, but none can fail a correct installer.
+typeset attempt_round
+for attempt_round in 1 2; do
+  signal_on_change_check 'signal between the two library moves' .local/lib/agent-notify TERM 0
+  signal_on_change_check 'terminal interrupt between the two library moves' .local/lib/agent-notify INT 1
+  signal_on_change_check 'signal just after the settings move' .claude/settings.json TERM 0
+  signal_on_change_check 'terminal interrupt just after the settings move' .claude/settings.json INT 1
+  signal_on_change_check 'signal just after the manifest moves' 'Library/Application Support/agent-notify/install-manifest.json' TERM 0
+  signal_on_change_check 'terminal interrupt just after the manifest moves' 'Library/Application Support/agent-notify/install-manifest.json' INT 1
+  signal_over_link_check 'signal just after the binary move, over a library link' TERM 0
+  signal_over_link_check 'terminal interrupt just after the binary move, over a library link' INT 1
+  signal_over_link_check 'hangup just after the binary move, over a library link' HUP 1
+done
 
 print -- 'installer tests passed'

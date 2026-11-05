@@ -30,7 +30,7 @@ typeset backup_root="$state_dir/install-backups"
 typeset command_prefix="$claude_hook_path"
 typeset dry_run=0 rollback=0 backup_dir='' preflight_stage='' generation='' selector_before='' backup_root_created=0 state_dir_existed=0
 typeset user_key='' app_token='' settings_existed=0 bin_existed=0 lib_existed=0 hook_existed=0 hook_jxa_existed=0 plugin_existed=0
-typeset bin_post_hash='' lib_post_hash='' hook_post_hash='' hook_jxa_post_hash='' plugin_post_hash='' settings_post_hash='' manifest_post_hash='' manifest_existed=0 mutation_started=0 completed=0
+typeset bin_post_hash='' lib_post_hash='' hook_post_hash='' hook_jxa_post_hash='' plugin_post_hash='' settings_post_hash='' manifest_post_hash='' manifest_existed=0 mutation_started=0 completed=0 attempt_restored=0 secret_prompt_open=0
 typeset -a attempt_created_dirs
 
 usage() { print -u2 -- 'usage: agent-notify-install [--dry-run|--rollback]'; }
@@ -65,12 +65,28 @@ read_secret_tty() {
     return 0
   fi
   [[ -r /dev/tty ]] || return 1
+  secret_prompt_open=1
+  # A stty killed after it applied the mode also fails, so echo is turned back on here.
+  /bin/stty -echo </dev/tty || { /bin/stty echo </dev/tty 2>/dev/null; secret_prompt_open=0; return 1; }
+  # With nobody reading the prompt, SIGPIPE would otherwise end the installer with echo off.
+  trap stop_before_mutation PIPE
   print -n -u2 -- "$prompt"
-  /bin/stty -echo </dev/tty
-  IFS= read -r value </dev/tty || { /bin/stty echo </dev/tty; return 1; }
+  trap - PIPE
+  IFS= read -r value </dev/tty || { /bin/stty echo </dev/tty; secret_prompt_open=0; return 1; }
   /bin/stty echo </dev/tty
+  secret_prompt_open=0
   print -u2 -- ''
   REPLY=$value
+}
+
+# Nothing is installed yet, so a signal can simply stop the installer, and the EXIT trap removes what the attempt staged. Two things would skip that trap: exiting with errexit on when the signal interrupted a child inside a function, and SIGPIPE from the message below, since a ^C also kills a reader such as tee.
+stop_before_mutation() {
+  set +e
+  trap '' HUP INT TERM PIPE
+  (( secret_prompt_open )) && /bin/stty echo </dev/tty 2>/dev/null
+  print -u2 -- ''
+  print -u2 -- 'agent-notify-install: interrupted before installing anything'
+  exit 1
 }
 
 tree_hash() {
@@ -131,7 +147,8 @@ preflight() {
 cleanup_attempt() {
   (( completed )) && return 0
   [[ -n $preflight_stage && -d $preflight_stage ]] && /bin/rm -rf "$preflight_stage"
-  [[ -n $backup_dir && -d $backup_dir ]] && /bin/rm -rf "$backup_dir"
+  # The backup keeps the modes it copied, and a read-only directory there would stop it being removed. The steps after a restore rely on it being gone.
+  [[ -n $backup_dir && -d $backup_dir ]] && { /bin/chmod -R u+rwx "$backup_dir" || true; /bin/rm -rf "$backup_dir"; }
   (( backup_root_created )) && [[ -d $backup_root ]] && /bin/rmdir "$backup_root" 2>/dev/null || true
   local directory
   for directory in ${(Oa)attempt_created_dirs}; do /bin/rmdir "$directory" 2>/dev/null || true; done
@@ -240,13 +257,16 @@ write_manifest() {
   local staged="$backup_dir/install-manifest.json.new"
   print -r -- "{\"backup\":\"$backup_dir\",\"generation\":\"$generation\",\"files\":{\"binary\":{\"path\":\"$install_bin\",\"post_hash\":\"$bin_post_hash\",\"existed\":$bin_existed},\"library\":{\"path\":\"$install_lib\",\"post_hash\":\"$lib_post_hash\",\"existed\":$lib_existed},\"hook\":{\"path\":\"$claude_hook_path\",\"post_hash\":\"$hook_post_hash\",\"existed\":$hook_existed},\"hook_jxa\":{\"path\":\"$claude_hook_jxa_path\",\"post_hash\":\"$hook_jxa_post_hash\",\"existed\":$hook_jxa_existed},\"plugin\":{\"path\":\"$plugin_path\",\"post_hash\":\"$plugin_post_hash\",\"existed\":$plugin_existed},\"settings\":{\"path\":\"$settings_path\",\"post_hash\":\"$settings_post_hash\",\"existed\":$settings_existed}}}" > "$staged" || return 1
   /bin/chmod 600 "$staged" || return 1
+  manifest_post_hash=$(sha256 "$staged") || return 1
   /bin/mv "$staged" "$manifest_path" || return 1
-  manifest_post_hash=$(sha256 "$manifest_path") || return 1
 }
 
 replace_library() {
-  local previous="$backup_dir/lib.previous"
+  local previous="$backup_dir/lib.previous" stage_hash
+  stage_hash=$(tree_hash "$stage_lib") || return 1
   if [[ -d $install_lib ]]; then /bin/mv "$install_lib" "$previous" || return 1; fi
+  # Recorded only now, because the restore replaces a library matching this hash, and a failed move above leaves an identical prior library that it must not touch.
+  lib_post_hash=$stage_hash
   if [[ ${AGENT_NOTIFY_INSTALL_FAIL_AT:-} == library ]]; then
     [[ -d $previous ]] && /bin/mv "$previous" "$install_lib"
     return 1
@@ -255,7 +275,6 @@ replace_library() {
     [[ -d $previous ]] && /bin/mv "$previous" "$install_lib"
     return 1
   fi
-  lib_post_hash=$(tree_hash "$install_lib") || return 1
 }
 
 restore_if_unchanged() {
@@ -272,11 +291,18 @@ restore_if_unchanged() {
 }
 
 rollback_attempt() {
-  (( completed )) && return 0
+  # A terminal interrupt also reaches the running child, so nothing may stop the restore. Without POSIX_TRAPS, zsh resets this ignore inside $(...), where the restore takes its hashes.
+  setopt local_options posix_traps
+  trap '' HUP INT TERM QUIT
+  # zsh keeps the trap in the forked left side of a pipeline, where this flag is not shared with the main shell.
+  (( completed || attempt_restored || ZSH_SUBSHELL )) && return 0
+  attempt_restored=1
   [[ -n $backup_dir ]] || { cleanup_attempt; return 0; }
   restore_if_unchanged "$settings_path" "$backup_dir/settings.json" "$settings_post_hash" "$settings_existed"
   restore_if_unchanged "$plugin_path" "$backup_dir/agent-notify.js" "$plugin_post_hash" "$plugin_existed"
-  if [[ -d $install_lib && $(tree_hash "$install_lib") == $lib_post_hash ]]; then
+  if (( lib_existed )) && [[ ! -e $install_lib ]]; then
+    /bin/cp -pR "$backup_dir/lib" "$install_lib"
+  elif [[ -n $lib_post_hash && -d $install_lib && $(tree_hash "$install_lib") == $lib_post_hash ]]; then
     if (( lib_existed )); then /bin/rm -rf "$install_lib"; /bin/cp -pR "$backup_dir/lib" "$install_lib"; else /bin/rm -rf "$install_lib"; fi
   fi
   restore_if_unchanged "$claude_hook_jxa_path" "$backup_dir/agent-notify-claude-hook.jxa" "$hook_jxa_post_hash" "$hook_jxa_existed"
@@ -305,11 +331,12 @@ install() {
   read_secret_tty 'Pushover application token: ' || die 'unable to read application token from /dev/tty'
   app_token=$REPLY
   [[ -n $user_key && -n $app_token ]] || die 'both credentials are required'
-  local backup_root_existed=0
-  [[ -d $backup_root ]] && backup_root_existed=1
-  /bin/mkdir -p "$backup_root" || return 1
-  [[ -d $backup_root ]] || return 1
-  if (( ! backup_root_existed )); then /bin/chmod 700 "$backup_root" || return 1; backup_root_created=1; fi
+  if [[ ! -d $backup_root ]]; then
+    # A signal can stop the installer after any line here, and only this flag lets the cleanup remove the directory. Later installs never change its mode, so it is created private.
+    backup_root_created=1
+    /bin/mkdir -p "${backup_root:h}" || return 1
+    /bin/mkdir -m 700 "$backup_root" || return 1
+  fi
   backup_dir=$(/usr/bin/mktemp -d "$backup_root/install.XXXXXX") || return 1
   /bin/chmod 700 "$backup_dir" || return 1
   [[ -e $manifest_path ]] && { manifest_existed=1; backup_file "$manifest_path" install-manifest.json || return 1; }
@@ -330,10 +357,25 @@ install() {
   generation="$(/bin/date +%s)-$RANDOM"
   # The v2 selector is non-secret generation metadata. Reading it is required
   # only to restore a previous v2 selector if a later file mutation fails.
-  selector_before=$("$security_bin" find-generic-password -a "$keychain_account" -s "$keychain_selector_service" -w 2>/dev/null || true)
+  # security exits 44 when the item is missing. Any other failure leaves the prior selector unknown, and a rollback that restores an empty one deletes it.
+  selector_before=$("$security_bin" find-generic-password -a "$keychain_account" -s "$keychain_selector_service" -w 2>/dev/null) || {
+    (( $? == 44 )) || die 'unable to read the current Keychain selector; nothing was installed'
+    selector_before=''
+  }
   mutation_started=1
-  trap rollback_attempt EXIT INT TERM
-  print -rn -- "{\"generation\":\"$generation\",\"user\":\"$user_key\",\"token\":\"$app_token\"}" | "$jxa_bin" -l JavaScript "$keychain_helper" store || return 1
+  # A refusal below prints before any restore, and with nobody to read it, SIGPIPE would otherwise leave the attempt half done.
+  trap '' PIPE
+  trap rollback_attempt EXIT HUP INT TERM
+  # A signal right after the trap has already restored, so the store below would never be rolled back.
+  (( attempt_restored )) && return 1
+  local store_status=0
+  print -rn -- "{\"generation\":\"$generation\",\"user\":\"$user_key\",\"token\":\"$app_token\"}" | "$jxa_bin" -l JavaScript "$keychain_helper" store || store_status=$?
+  # A signal after the check above restores before the store has run, which leaves the store with nothing to undo it. Rolling back again removes nothing that should stay, and is merely redundant after a signal during the store, whose trap runs once the store has finished.
+  if (( attempt_restored )); then
+    print -rn -- "{\"generation\":\"$generation\",\"selector\":\"$selector_before\"}" | "$jxa_bin" -l JavaScript "$keychain_helper" rollback || true
+    return 1
+  fi
+  (( ! store_status )) || return 1
   [[ ${AGENT_NOTIFY_INSTALL_FAIL_AT:-} == keychain ]] && return 1
   local bin_dir_existed=0 plugin_dir_existed=0
   mark_new_directory "${install_bin:h}"
@@ -346,13 +388,17 @@ install() {
   (( bin_dir_existed )) || /bin/chmod 700 "${install_bin:h}" || return 1
   (( plugin_dir_existed )) || /bin/chmod 700 "${plugin_path:h}" || return 1
   [[ -e $install_bin ]] && bin_existed=1; [[ -d $install_lib ]] && lib_existed=1; [[ -e $claude_hook_path ]] && hook_existed=1; [[ -e $claude_hook_jxa_path ]] && hook_jxa_existed=1; [[ -e $plugin_path ]] && plugin_existed=1
-  /bin/mv "$stage_bin" "$install_bin" || return 1; bin_post_hash=$(sha256 "$install_bin") || return 1
+  # Each hash is recorded before its move: the restore acts only on recorded hashes, so a signal must never find an installed artifact without one.
+  bin_post_hash=$(sha256 "$stage_bin") || return 1; /bin/mv "$stage_bin" "$install_bin" || return 1
   replace_library || return 1
-  /bin/mv "$stage_hook" "$claude_hook_path" || return 1; hook_post_hash=$(sha256 "$claude_hook_path") || return 1
-  /bin/mv "$stage_hook_jxa" "$claude_hook_jxa_path" || return 1; hook_jxa_post_hash=$(sha256 "$claude_hook_jxa_path") || return 1
+  hook_post_hash=$(sha256 "$stage_hook") || return 1; /bin/mv "$stage_hook" "$claude_hook_path" || return 1
+  hook_jxa_post_hash=$(sha256 "$stage_hook_jxa") || return 1; /bin/mv "$stage_hook_jxa" "$claude_hook_jxa_path" || return 1
   [[ ${AGENT_NOTIFY_INSTALL_FAIL_AT:-} == binary ]] && return 1
-  /bin/mv "$stage_plugin_file" "$plugin_path" || return 1; plugin_post_hash=$(sha256 "$plugin_path") || return 1
+  plugin_post_hash=$(sha256 "$stage_plugin_file") || return 1; /bin/mv "$stage_plugin_file" "$plugin_path" || return 1
   [[ ${AGENT_NOTIFY_INSTALL_FAIL_AT:-} == plugin ]] && return 1
+  # Done before the check below, so a change to settings during this time is refused rather than overwritten.
+  local stage_settings_hash
+  /bin/chmod 600 "$stage_settings" || return 1; stage_settings_hash=$(sha256 "$stage_settings") || return 1
   if [[ ${AGENT_NOTIFY_INSTALL_TEST_CREATE_SETTINGS_BEFORE_RENAME:-0} == 1 && ! -e $settings_path ]]; then
     print -- '{}' > "$settings_path" || return 1
   fi
@@ -366,18 +412,24 @@ install() {
     print -u2 -- 'agent-notify-install: Claude settings appeared during installation; refusing to overwrite'
     return 1
   fi
-  /bin/mv "$stage_settings" "$settings_path" || return 1; /bin/chmod 600 "$settings_path" || return 1; settings_post_hash=$(sha256 "$settings_path") || return 1
+  settings_post_hash=$stage_settings_hash; /bin/mv "$stage_settings" "$settings_path" || return 1
   [[ ${AGENT_NOTIFY_INSTALL_FAIL_AT:-} == settings ]] && return 1
   [[ -d $state_dir ]] && state_dir_existed=1 || mark_new_directory "$state_dir"
   /bin/mkdir -p "$state_dir" || return 1
   (( state_dir_existed )) || /bin/chmod 700 "$state_dir" || return 1
   write_manifest || return 1
+  # The install commits here. A signal after this line finds it finished, and one before it has restored the home, which the check below sees.
   completed=1
-  trap - EXIT INT TERM
-  write_settings || print -u2 -- "agent-notify-install: installed successfully, but $settings_conf_path could not be created; excerpts stay enabled"
-  if [[ -n $selector_before ]] && ! print -rn -- "{\"previous\":\"$selector_before\"}" | "$jxa_bin" -l JavaScript "$keychain_helper" retire; then
-    print -u2 -- "agent-notify-install: installed successfully, but prior v2 Keychain generation $selector_before could not be retired; remove it manually after verifying delivery"
-  fi
+  (( attempt_restored )) && return 1
+  # Nothing else would remove the prior generation, so a signal must not stop the retire below.
+  trap '' HUP INT TERM QUIT
+  trap - EXIT
+  # Both steps run before either warning, because a warning with nobody to read it can stop whatever comes after it.
+  local retire_failed=0 settings_failed=0
+  if [[ -n $selector_before ]] && ! print -rn -- "{\"previous\":\"$selector_before\"}" | "$jxa_bin" -l JavaScript "$keychain_helper" retire; then retire_failed=1; fi
+  write_settings || settings_failed=1
+  (( retire_failed )) && print -u2 -- "agent-notify-install: installed successfully, but prior v2 Keychain generation $selector_before could not be retired; remove it manually after verifying delivery"
+  (( settings_failed )) && print -u2 -- "agent-notify-install: installed successfully, but $settings_conf_path could not be created; excerpts stay enabled"
   print -- 'agent-notify installation complete:'
   print -- "  notifier: $install_bin"
   print -- "  Claude hook adapter: $claude_hook_path"
@@ -452,6 +504,7 @@ while (( $# )); do case $1 in --dry-run) dry_run=1;; --rollback) rollback=1;; *)
 if (( dry_run && rollback )); then usage; exit 2; fi
 trap cleanup_attempt EXIT INT TERM
 if (( rollback )); then rollback_preflight; rollback; exit 0; fi
+trap stop_before_mutation HUP INT TERM
 preflight
 preview
 (( dry_run )) && { print -- 'Dry run complete; no credentials collected and no changes made.'; exit 0; }

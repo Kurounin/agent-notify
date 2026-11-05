@@ -19,6 +19,15 @@ function stdin() {
   return ObjC.unwrap($.NSString.alloc.initWithDataEncoding(data, $.NSUTF8StringEncoding));
 }
 
+// A parse error can quote its input, and this input holds credentials.
+function parsedInput() {
+  try {
+    return JSON.parse(stdin());
+  } catch (_) {
+    throw new Error('invalid Keychain helper input');
+  }
+}
+
 function data(value) {
   return $(value).dataUsingEncoding($.NSUTF8StringEncoding);
 }
@@ -43,7 +52,7 @@ function securityInterface() {
   const shimPath = ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey('AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM'));
   if (shimPath) {
     const shimData = $.NSData.dataWithContentsOfFile($(shimPath));
-    if (!shimData) throw new Error('Keychain security shim unavailable');
+    if (shimData.isNil()) throw new Error('Keychain security shim unavailable');
     return eval(ObjC.unwrap($.NSString.alloc.initWithDataEncoding(shimData, $.NSUTF8StringEncoding)));
   }
   return {
@@ -99,7 +108,7 @@ function state() {
 try {
   if (action === 'state') state();
   else {
-    const input = JSON.parse(stdin());
+    const input = parsedInput();
     if (action === 'store') {
       addNew(userService(input.generation), input.user);
       addNew(tokenService(input.generation), input.token);

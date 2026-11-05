@@ -13,8 +13,10 @@
     return $(ObjC.unwrap(ObjC.castRefToObject(constant)));
   }
 
+  // An absent key returns a truthy wrapped nil, which the checks below could not tell from a value.
   function value(dictionary, key) {
-    return dictionary.objectForKey(securityString(key));
+    const found = dictionary.objectForKey(securityString(key));
+    return found.isNil() ? undefined : found;
   }
 
   function service(query) {
@@ -34,10 +36,6 @@
 
   function hasReturnAttributes(dictionary) {
     if (!value(dictionary, $.kSecReturnAttributes)) throw new Error('missing Keychain return attributes');
-  }
-
-  function hasNoReturnAttributes(dictionary) {
-    if (value(dictionary, $.kSecReturnAttributes)) throw new Error('Keychain update query included return attributes');
   }
 
   return {
@@ -61,7 +59,6 @@
       if (Number(query.count) !== 3) throw new Error('malformed Keychain update query');
       hasPasswordData(attributes);
       const itemService = service(query);
-      hasNoReturnAttributes(query);
       log(`update ${itemService}`);
       return items.has(itemService) ? 0 : -25300;
     },

@@ -218,8 +218,11 @@ agent_notify_transition() {
 
   case $kind in
     began)
+      # Claude also fires began for background wake-ups and notifications folded into a running turn. Past the active lifetime, prune would delete the state this keeps.
+      if [[ $source != claude-code ]] || (( STATE_ACTIVE != 1 || now - STATE_STARTED_AT > AGENT_NOTIFY_MAX_ACTIVE_SECONDS )); then
+        STATE_STARTED_AT=$now
+      fi
       STATE_ACTIVE=1
-      STATE_STARTED_AT=$now
       STATE_ATTENTIONS=''
       STATE_LAST_ATTENTION_AT=0
       STATE_TERMINAL=''

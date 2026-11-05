@@ -83,6 +83,32 @@ assert_ignored completed \
   '{"hook_event_name":"Stop","session_id":"session-a","cwd":"/work/project","background_tasks":[{"id":"task-1","type":"shell","status":"running","description":"sleep 40","command":"sleep 40"},{"id":"task-2","type":"subagent","status":"running","description":"explore","agent_type":"Explore"}]}' \
   'completion with several in-flight background tasks'
 
+# The stubbed notifier above cannot show what a dropped Stop does, so this case runs the real one beside the adapter.
+typeset pipeline_root="$test_root/pipeline" pipeline_state="$test_root/pipeline-state" pipeline_diagnostics="$test_root/pipeline-diagnostics" pipeline_log
+/bin/mkdir -p "$pipeline_root/bin" "$pipeline_root/lib"
+/bin/cp "$adapter_source" "$pipeline_root/bin/agent-notify-claude-hook"
+/bin/cp "$normalizer" "$pipeline_root/bin/agent-notify-claude-hook.jxa"
+/bin/cp "$root/bin/agent-notify" "$pipeline_root/bin/agent-notify"
+/bin/cp -R "$root/lib/agent-notify" "$pipeline_root/lib/agent-notify"
+/bin/chmod 700 "$pipeline_root/bin/agent-notify-claude-hook" "$pipeline_root/bin/agent-notify"
+submit_pipeline() {
+  AGENT_NOTIFY_STATE_DIR="$pipeline_state" AGENT_NOTIFY_DIAGNOSTIC_DIR="$pipeline_diagnostics" AGENT_NOTIFY_KEYCHAIN_RUNTIME_HELPER=/nonexistent \
+    "$pipeline_root/bin/agent-notify-claude-hook" "$1"
+}
+submit_pipeline began <<'EOF'
+{"hook_event_name":"UserPromptSubmit","session_id":"session-dropped","cwd":"/work/project"}
+EOF
+submit_pipeline completed <<'EOF'
+{"hook_event_name":"Stop","session_id":"session-dropped","cwd":"/work/project","background_tasks":[{"id":"task-1","type":"shell","status":"running","description":"sleep 40","command":"sleep 40"}]}
+EOF
+pipeline_log=$(/bin/cat /dev/null "$pipeline_diagnostics"/*.log(N))
+[[ $pipeline_log == *'component=normalize code=adapter_ignored '* ]] || { print -u2 -- 'a dropped Stop was not recorded as adapter_ignored'; exit 1; }
+[[ $pipeline_log != *invalid_event* ]] || { print -u2 -- 'a dropped Stop was recorded as a malformed event'; exit 1; }
+typeset -a pipeline_states
+pipeline_states=("$pipeline_state"/*.state(N))
+assert_equals "${#pipeline_states}" 1
+[[ $(<"$pipeline_states[1]") == *$'ACTIVE=1\n'* && $(<"$pipeline_states[1]") == *$'\nTERMINAL=\n'* ]] || { print -u2 -- 'a dropped Stop closed the open turn'; exit 1; }
+
 typeset settled_completion
 settled_completion=$(normalize completed '{"hook_event_name":"Stop","session_id":"session-a","cwd":"/work/project","background_tasks":[]}')
 assert_equals "$settled_completion" '{"source":"claude-code","kind":"completed","session_id":"session-a","session_dir":"/work/project"}'

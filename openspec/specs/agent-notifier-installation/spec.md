@@ -38,6 +38,45 @@ The installer SHALL prompt for the Pushover user key and application token witho
 - **WHEN** the designated Keychain items already exist
 - **THEN** the installer SHALL disclose that existing credentials will be retained or replaced and require confirmation before replacing them
 
+### Requirement: Report each target the conflict prompt acts on
+The installation plan SHALL classify each target the conflict prompt checks (the notifier executable, library tree, Claude hook adapter and its JXA, and OpenCode plugin) as absent, installer-managed exact, or conflict, and the prompt SHALL act on that same classification. Classifying SHALL NOT change which installs need consent, and SHALL NOT stop the plan, change anything, or collect credentials.
+
+#### Scenario: Nothing is installed
+- **WHEN** the plan runs for a home holding none of those targets, and no managed path is an unavailable link
+- **THEN** it SHALL report each as absent, and the installer SHALL NOT show the conflict prompt
+
+#### Scenario: Reinstalling from the same checkout
+- **WHEN** the plan runs for a home where this checkout installed every target and none has changed, and no managed path is an unavailable link
+- **THEN** it SHALL report each as installer-managed exact and no conflict, and the installer SHALL NOT show the conflict prompt
+
+#### Scenario: One target has changed
+- **WHEN** exactly one target differs from what the plan expects
+- **THEN** only that target's line SHALL say conflict, and declining the conflict prompt SHALL stop the installer before it collects credentials and leave the home and Keychain unchanged
+
+#### Scenario: An older install is present
+- **WHEN** the executable, library tree, or Claude hook adapter or JXA differs from this checkout because an older checkout installed it
+- **THEN** the plan SHALL report it as a conflict and the installer SHALL ask for consent, even though the manifest records that install
+
+#### Scenario: The managed plugin matches its manifest
+- **WHEN** the plugin has the managed marker and its hash matches the hash the install manifest records, including when an older checkout generated it
+- **THEN** the plan SHALL report it as installer-managed exact, and it SHALL NOT by itself cause the conflict prompt
+
+#### Scenario: The plugin lacks its marker or a matching manifest hash
+- **WHEN** the plugin has no managed marker even though its hash matches the manifest, or has the marker but its bytes differ from the recorded hash, or the manifest is missing, unreadable, corrupt, a FIFO or a device, or records no plugin hash
+- **THEN** the plan SHALL still complete and SHALL report the plugin as a conflict, and the installer SHALL ask for consent
+
+#### Scenario: A managed path is an unavailable link
+- **WHEN** one of those targets is a link whose target cannot be reached
+- **THEN** the plan SHALL report it as a conflict rather than absent, alongside the line that names the link
+
+#### Scenario: A link at another managed path is unavailable
+- **WHEN** the Claude settings or install manifest path is a link whose target cannot be reached
+- **THEN** the plan SHALL name that link on its own conflict line, and the installer SHALL ask for consent even if every classified target is absent or exact
+
+#### Scenario: A target cannot be judged normally
+- **WHEN** a dry run or install finds an empty, unreadable, or directory plugin, a directory or unreadable file at another file target, a FIFO or a device at any file target, or a file in place of the library tree
+- **THEN** the plan SHALL still complete and SHALL report that target as a conflict, and a dry run SHALL change nothing outside its temporary stage
+
 ### Requirement: Install integrations without clobbering unrelated settings
 After all conflict and credential-replacement decisions are confirmed, the installer SHALL install the notifier executable in the user's local bin directory, stage the single native OpenCode V2 adapter from `integrations/opencode/` into the managed global path `~/.config/opencode/plugins/agent-notify.js`, and merge only the notifier's dedicated Claude Code hook entries into global settings. The generated plugin SHALL retain its managed marker and safely embedded absolute notifier executable path and SHALL expose the native V2 definition without requiring npm installation or a second installed adapter copy. It SHALL NOT edit unrelated OpenCode configuration or agent definitions. The installer SHALL preserve unrelated settings/plugins, create unique user-only recoverable backups outside auto-loaded plugin directories before modifying existing configuration, and refuse to overwrite a conflicting notifier-managed file without explicit replacement consent. An exact manifest-owned V1 artifact SHALL be updated through these existing ownership rules without retaining a second discoverable legacy plugin. On failure after mutation begins, it SHALL restore prior file bytes and modes, restore prior Keychain state, and remove only artifacts created by that attempt. The OpenCode migration SHALL NOT change the existing Keychain v2 generation/selector policy or read, change, or remove old Keychain v1 items.
 

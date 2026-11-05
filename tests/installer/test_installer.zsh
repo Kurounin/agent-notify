@@ -330,6 +330,7 @@ managed_tree() {
       /usr/bin/find "$top" -print | /usr/bin/sort | while IFS= read -r entry; do
         if [[ -L $entry ]]; then print -r -- "link $entry -> $(/usr/bin/readlink "$entry")"
         elif [[ -d $entry ]]; then print -r -- "dir $(/usr/bin/stat -f '%Lp' "$entry") $entry"
+        elif [[ -p $entry ]]; then print -r -- "fifo $(/usr/bin/stat -f '%Lp' "$entry") $entry"
         else print -r -- "file $(/usr/bin/stat -f '%Lp' "$entry") $(/usr/bin/shasum -a 256 "$entry" | /usr/bin/cut -d ' ' -f1) $entry"; fi
       done
     done
@@ -750,6 +751,224 @@ print -r -- 'different bytes' > "$link_home/dotfiles/different"
 link_attempt "$link_home" yes:no
 assert_declined 'a reachable link with different bytes'
 [[ $link_output != *'is a link to an unavailable target'* ]] || fail_with 'a reachable link with different bytes counted as unavailable' "$link_output"
+
+# The plan classifies every target the conflict prompt checks, and the prompt acts on that same answer.
+typeset plan_home plan_exact_home="$test_root/plan-home" plan_older="$test_root/plan-older-checkout" plan_label plan_path
+typeset plan_bin=.local/bin/agent-notify plan_lib=.local/lib/agent-notify plan_plugin=.config/opencode/plugins/agent-notify.js
+typeset -i plan_index=0
+typeset -a plan_targets=(executable $plan_bin notifier-library $plan_lib Claude-hook .local/bin/agent-notify-claude-hook Claude-hook-JXA .local/bin/agent-notify-claude-hook.jxa OpenCode-plugin $plan_plugin)
+typeset plan_all_absent=$'executable: absent\nnotifier-library: absent\nClaude-hook: absent\nClaude-hook-JXA: absent\nOpenCode-plugin: absent'
+typeset plan_all_exact=$'executable: installer-managed exact\nnotifier-library: installer-managed exact\nClaude-hook: installer-managed exact\nClaude-hook-JXA: installer-managed exact\nOpenCode-plugin: installer-managed exact'
+typeset plan_older_lines=$'executable: conflict\nnotifier-library: conflict\nClaude-hook: conflict\nClaude-hook-JXA: conflict\nOpenCode-plugin: installer-managed exact'
+# assert_plan <expected lines> <message>: the classification lines of the last run, in order.
+assert_plan() {
+  local actual
+  actual=$(print -r -- "$link_output" | /usr/bin/grep -E '^[^ ]+: (absent|installer-managed exact|conflict)$') || true
+  [[ $actual == "$1" ]] && return 0
+  /usr/bin/diff <(print -r -- "$1") <(print -r -- "$actual") >&2 || true
+  fail_with "$2" "$link_output"
+}
+# Unreadable entries make managed_tree fail partway, identically each time, so this compares what it reached.
+plan_snapshot() { { managed_tree "$1"; /usr/bin/find "$1/Library" -ls | /usr/bin/sort; } 2>/dev/null || true; }
+# A plan that opens a FIFO blocks for good, so each run gets its own process group, killed whole at the deadline.
+plan_bounded() {
+  /usr/bin/perl -e '
+    setpgrp(0, 0) or die "setpgrp failed: $!\n";
+    my $child = fork() // die "fork failed: $!\n";
+    if (!$child) { exec(@ARGV) or die "exec failed: $!\n"; }
+    $SIG{ALRM} = sub { print STDERR "the run did not finish in time\n"; kill("KILL", -$$); };
+    alarm(60);
+    waitpid($child, 0);
+    exit($? & 127 ? 128 + ($? & 127) : $? >> 8);
+  ' "$@"
+}
+# plan_dry_run <home> <case>: the plan runs under errexit, so it must reach its end whatever it finds, and change nothing.
+plan_dry_run() {
+  local before
+  before=$(plan_snapshot "$1")
+  /bin/rm -f "$keychain_state/current-generation"
+  link_output=$(plan_bounded env $real_env AGENT_NOTIFY_INSTALL_HOME="$1" "$root/bin/agent-notify-install" --dry-run </dev/null 2>&1) || fail_with "a dry run stopped early: $2" "$link_output"
+  [[ $link_output == *'Dry run complete; no credentials collected and no changes made.'* ]] || fail_with "a dry run did not finish its plan: $2" "$link_output"
+  [[ $(plan_snapshot "$1") == "$before" && ! -e "$keychain_state/current-generation" ]] || fail_with "a dry run changed something: $2" "$link_output"
+}
+# plan_declined <home> <case>: stdin holds no credentials, so reaching their prompt would report that it could not read them.
+plan_declined() {
+  local before
+  before=$(plan_snapshot "$1")
+  /bin/rm -f "$keychain_state/current-generation"
+  link_code=0
+  link_output=$(plan_bounded env $real_env AGENT_NOTIFY_INSTALL_HOME="$1" AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes:no AGENT_NOTIFY_INSTALL_TEST_INPUT_FD=0 "$root/bin/agent-notify-install" </dev/null 2>&1) || link_code=$?
+  (( link_code )) && [[ $link_output == *'conflicting target not replaced'* && $link_output != *'unable to read user key'* ]] || fail_with "declining the conflict prompt did not stop before credentials: $2" "$link_output"
+  [[ $(plan_snapshot "$1") == "$before" && ! -e "$keychain_state/current-generation" ]] || fail_with "a declined install changed something: $2" "$link_output"
+}
+# assert_no_prompt <case>: the last run was an install that a yes:no sequence did not stop.
+assert_no_prompt() {
+  (( ! link_code )) && [[ $link_output != *'conflicting target not replaced'* && $link_output != *'  conflict: '* ]] || fail_with "the install asked to replace a target: $1" "$link_output"
+}
+# plan_case: a copy of an exact install. Classifying does not depend on the home it was installed into.
+plan_case() { plan_home="$test_root/plan-case-$(( ++plan_index ))"; /bin/cp -pR "$plan_exact_home" "$plan_home"; }
+# plan_only_conflict <label> <case>: a dry run and a declined install both report that one conflict.
+plan_only_conflict() {
+  local expected=${plan_all_exact/$1: installer-managed exact/$1: conflict}
+  plan_dry_run "$plan_home" "$2"
+  assert_plan "$expected" "the dry-run plan did not report one conflict: $2"
+  plan_declined "$plan_home" "$2"
+  assert_plan "$expected" "the install plan did not report one conflict: $2"
+  [[ $link_output != *'  conflict: '* ]] || fail_with "the plan named a link that is not there: $2" "$link_output"
+}
+# plan_no_conflict <case>: a dry run and an install both report every target exact, and the install does not ask.
+plan_no_conflict() {
+  plan_dry_run "$plan_home" "$1"
+  assert_plan "$plan_all_exact" "the dry-run plan did not report every target as installer-managed exact: $1"
+  link_attempt "$plan_home" yes:no
+  assert_no_prompt "$1"
+  assert_plan "$plan_all_exact" "the install plan did not report every target as installer-managed exact: $1"
+}
+
+plan_dry_run "$plan_exact_home" 'fresh home'
+assert_plan "$plan_all_absent" 'a fresh home did not report every target absent'
+[[ ! -e $plan_exact_home ]] || fail_with 'a dry run created the fresh home' "$link_output"
+link_attempt "$plan_exact_home" yes:no
+assert_no_prompt 'fresh home'
+assert_plan "$plan_all_absent" 'a first install did not report every target absent'
+
+plan_dry_run "$plan_exact_home" 'exact reinstall'
+assert_plan "$plan_all_exact" 'an exact install did not report every target as installer-managed exact'
+link_attempt "$plan_exact_home" yes:no
+assert_no_prompt 'exact reinstall'
+assert_plan "$plan_all_exact" 'an exact reinstall did not report every target as installer-managed exact'
+
+for plan_label plan_path in $plan_targets; do
+  plan_case
+  [[ -d $plan_home/$plan_path ]] && plan_path+=/config.zsh
+  print -r -- '# changed by hand' >> "$plan_home/$plan_path"
+  plan_only_conflict "$plan_label" "$plan_label changed by hand"
+done
+
+# A link that reaches identical bytes is judged by those bytes, as a dotfiles setup would have it.
+for plan_label plan_path in $plan_targets; do
+  plan_case
+  /bin/mkdir "$plan_home/dotfiles"
+  /bin/mv "$plan_home/$plan_path" "$plan_home/dotfiles/${plan_path:t}"
+  /bin/ln -s "$plan_home/dotfiles/${plan_path:t}" "$plan_home/$plan_path"
+  plan_no_conflict "a link to identical bytes at the $plan_label path"
+done
+
+# A marker alone does not make a plugin the installer's: only the manifest can vouch for its bytes.
+plan_case; print -r -- $'// >>> agent-notify managed plugin >>>\n// edited by hand' > "$plan_home/$plan_plugin"
+plan_only_conflict OpenCode-plugin 'a plugin with the marker and different bytes'
+plan_case; /bin/rm -f "$(manifest_file "$plan_home")"
+plan_only_conflict OpenCode-plugin 'a managed plugin with the manifest removed'
+plan_case; print -r -- 'not json' > "$(manifest_file "$plan_home")"
+plan_only_conflict OpenCode-plugin 'a managed plugin with a corrupt manifest'
+plan_case; manifest_tamper "$(manifest_file "$plan_home")" files.plugin.post_hash
+plan_only_conflict OpenCode-plugin 'a managed plugin with no recorded hash'
+plan_case; /bin/chmod 000 "$(manifest_file "$plan_home")"
+plan_only_conflict OpenCode-plugin 'a managed plugin with an unreadable manifest'
+
+# A generated plugin has no checkout bytes to match, so one from an older install is still exact if its manifest says so.
+plan_record_plugin() { /usr/bin/plutil -replace files.plugin.post_hash -string "$(/usr/bin/shasum -a 256 "$plan_home/$plan_plugin" | /usr/bin/cut -d ' ' -f1)" "$(manifest_file "$plan_home")"; }
+plan_case; print -r -- '// no marker' > "$plan_home/$plan_plugin"; plan_record_plugin
+plan_only_conflict OpenCode-plugin 'a plugin with no marker that matches its manifest'
+plan_case; print -r -- $'// >>> agent-notify managed plugin >>>\n// older plugin' > "$plan_home/$plan_plugin"; plan_record_plugin
+plan_no_conflict 'an older plugin matching its manifest'
+
+# An older install has a manifest too, and everything but the plugin still needs consent to be replaced.
+/bin/mkdir "$plan_older"
+/bin/cp -R "$root/bin" "$root/lib" "$root/integrations" "$root/installer" "$plan_older/"
+for plan_path in bin/agent-notify lib/agent-notify/config.zsh integrations/claude/agent-notify-hook.zsh; do print -r -- '# older checkout' >> "$plan_older/$plan_path"; done
+for plan_path in integrations/claude/agent-notify-hook.jxa integrations/opencode/agent-notify.js; do print -r -- '// older checkout' >> "$plan_older/$plan_path"; done
+plan_home="$test_root/plan-older-home"
+link_output=$(print -- $'user\ntoken' | env $real_env AGENT_NOTIFY_INSTALL_HOME="$plan_home" AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes AGENT_NOTIFY_INSTALL_TEST_INPUT_FD=0 "$plan_older/bin/agent-notify-install" 2>&1) || fail_with 'the older checkout did not install' "$link_output"
+plan_dry_run "$plan_home" 'an install from an older checkout'
+assert_plan "$plan_older_lines" 'the dry-run plan of an older install was wrong'
+plan_declined "$plan_home" 'an install from an older checkout'
+assert_plan "$plan_older_lines" 'the install plan of an older install was wrong'
+
+# A dangling link looks absent to [[ -e ]]. The settings and manifest have no line of their own, so the link's line is what the prompt answers to there.
+for plan_label plan_path in $plan_targets; do
+  plan_home="$test_root/plan-case-$(( ++plan_index ))"
+  add_link "$plan_home" "$plan_path" "$link_missing"
+  plan_dry_run "$plan_home" "a link at the $plan_label path"
+  assert_plan "${plan_all_absent/$plan_label: absent/$plan_label: conflict}" "the plan did not report a link at the $plan_label path as a conflict"
+  plan_declined "$plan_home" "a link at the $plan_label path"
+done
+for plan_path in .claude/settings.json 'Library/Application Support/agent-notify/install-manifest.json'; do
+  plan_home="$test_root/plan-case-$(( ++plan_index ))"
+  add_link "$plan_home" "$plan_path" "$link_missing"
+  plan_dry_run "$plan_home" "a link at $plan_path"
+  assert_plan "$plan_all_absent" "a link at $plan_path changed a classification line"
+  [[ $link_output == *"  conflict: $plan_home/$plan_path is a link to an unavailable target"* ]] || fail_with "the plan did not name the link at $plan_path" "$link_output"
+  plan_declined "$plan_home" "a link at $plan_path"
+done
+
+# None of these can be hashed or read as usual, and errexit must not turn that into a missing plan.
+plan_case; : > "$plan_home/$plan_plugin"
+plan_only_conflict OpenCode-plugin 'an empty plugin'
+plan_case; /bin/chmod 000 "$plan_home/$plan_plugin"
+plan_only_conflict OpenCode-plugin 'an unreadable plugin'
+plan_case; /bin/rm -f "$plan_home/$plan_plugin"; /bin/mkdir "$plan_home/$plan_plugin"
+plan_only_conflict OpenCode-plugin 'a directory at the plugin path'
+# read fails on a last line with no newline, though it still sets the marker it read, so the manifest decides.
+plan_case; print -rn -- '// >>> agent-notify managed plugin >>>' > "$plan_home/$plan_plugin"
+plan_only_conflict OpenCode-plugin 'a plugin that is only an unterminated marker'
+plan_case; print -rn -- '// >>> agent-notify managed plugin >>>' > "$plan_home/$plan_plugin"; plan_record_plugin
+plan_no_conflict 'an unterminated marker matching its manifest'
+plan_case; /bin/rm -f "$plan_home/$plan_bin"; /bin/mkdir "$plan_home/$plan_bin"
+plan_only_conflict executable 'a directory at the executable path'
+plan_case; /bin/chmod 000 "$plan_home/$plan_bin"
+plan_only_conflict executable 'an unreadable executable'
+plan_case; /bin/mv "$plan_home/$plan_lib" "$plan_home/library-aside"; print -r -- 'a file' > "$plan_home/$plan_lib"
+plan_only_conflict notifier-library 'a file in place of the library'
+plan_case; /bin/chmod 000 "$plan_home/$plan_lib"
+plan_only_conflict notifier-library 'an unreadable library'
+/bin/chmod 700 "$plan_home/$plan_lib"
+plan_case; /bin/chmod 000 "$plan_home/$plan_lib/config.zsh"
+plan_only_conflict notifier-library 'an unreadable file in the library'
+plan_case; print -r -- '# an extra file' > "$plan_home/$plan_lib/extra.zsh"
+plan_only_conflict notifier-library 'an extra file in the library'
+plan_case; /bin/rm -f "$plan_home/$plan_lib/config.zsh"
+plan_only_conflict notifier-library 'a file missing from the library'
+# Opening a FIFO blocks until something writes to it, and /dev/zero never ends, so neither can be read to judge a target.
+for plan_label plan_path in $plan_targets; do
+  [[ $plan_label == notifier-library ]] && continue
+  plan_case; /bin/rm -f "$plan_home/$plan_path"; /usr/bin/mkfifo "$plan_home/$plan_path"
+  plan_only_conflict "$plan_label" "a FIFO at the $plan_label path"
+done
+plan_case; /bin/rm -f "$plan_home/.local/bin/agent-notify-claude-hook"; /bin/ln -s /dev/zero "$plan_home/.local/bin/agent-notify-claude-hook"
+plan_only_conflict Claude-hook 'a link to /dev/zero at the Claude-hook path'
+plan_case; /bin/rm -f "$(manifest_file "$plan_home")"; /usr/bin/mkfifo "$(manifest_file "$plan_home")"
+plan_only_conflict OpenCode-plugin 'a FIFO at the manifest path'
+
+# The prompt classifies again, so it acts on the home as it is then, not on what the plan printed. The plan reads the manifest after it has classified the executable, which is when this replaces it.
+print -r -- '#!/bin/zsh
+[[ $3 == *manifest.jxa ]] && /bin/cp "$AGENT_NOTIFY_TEST_REPLACEMENT" "$AGENT_NOTIFY_TEST_EDIT"
+exec "$AGENT_NOTIFY_TEST_JXA" "$@"' > "$fake/plan-editing-jxa"; /bin/chmod 700 "$fake/plan-editing-jxa"
+# plan_replaced <replacement>: an install with no credentials that declines a conflict prompt, whose executable becomes the replacement once the plan has classified it.
+plan_replaced() {
+  link_code=0
+  link_output=$(env $real_env AGENT_NOTIFY_INSTALL_JXA_BIN="$fake/plan-editing-jxa" AGENT_NOTIFY_TEST_JXA="$fake/real-jxa" AGENT_NOTIFY_TEST_REPLACEMENT="$1" AGENT_NOTIFY_TEST_EDIT="$plan_home/$plan_bin" AGENT_NOTIFY_INSTALL_HOME="$plan_home" AGENT_NOTIFY_INSTALL_TEST_CONFIRM_SEQUENCE=yes:no AGENT_NOTIFY_INSTALL_TEST_INPUT_FD=0 "$root/bin/agent-notify-install" </dev/null 2>&1) || link_code=$?
+}
+plan_case
+{ /bin/cat "$plan_home/$plan_bin"; print -r -- '# changed after the plan'; } > "$test_root/plan-changed-executable"
+plan_replaced "$test_root/plan-changed-executable"
+assert_plan "$plan_all_exact" 'the executable changed before the plan classified it'
+(( link_code )) && [[ $link_output == *'conflicting target not replaced'* ]] || fail_with 'the prompt did not notice a target changed after the plan' "$link_output"
+# A conflict the plan printed that is gone by the prompt is not asked about, so the install goes on to the credentials it cannot read.
+plan_case
+/bin/cp "$plan_home/$plan_bin" "$test_root/plan-exact-executable"
+print -r -- '# changed before the plan' >> "$plan_home/$plan_bin"
+plan_replaced "$test_root/plan-exact-executable"
+assert_plan "${plan_all_exact/executable: installer-managed exact/executable: conflict}" 'the executable was restored before the plan classified it'
+(( link_code )) && [[ $link_output == *'unable to read user key'* && $link_output != *'conflicting target not replaced'* ]] || fail_with 'the prompt asked about a conflict that was gone' "$link_output"
+
+# Nothing is there to replace when a target is simply gone.
+plan_case; /bin/rm -f "$plan_home/$plan_plugin"
+plan_dry_run "$plan_home" 'a removed plugin'
+assert_plan "${plan_all_exact/OpenCode-plugin: installer-managed exact/OpenCode-plugin: absent}" 'a removed plugin was not reported as absent'
+link_attempt "$plan_home" yes:no
+assert_no_prompt 'a removed plugin'
+/bin/rm -f "$keychain_state/current-generation"
 
 # rollback tests: guard
 typeset guard_home="$test_root/guard-home" guard_first_home="$test_root/guard-first-home" guard_copy_home="$test_root/guard-copy-home" guard_saved_manifest="$test_root/guard-saved-manifest.json" guard_items="$test_root/guard-items"

@@ -37,7 +37,7 @@ bin/agent-notify-install
 ~/.local/bin/agent-notify smoke-test
 ```
 
-To update, use a newer trusted checkout and rerun the installer (preview with `--dry-run` first). It recognizes exact installer-managed artifacts; conflicts require confirmation and are not silently overwritten. An exact manifest-owned V1 plugin is backed up and replaced at the same managed path, without leaving a second discoverable adapter. A marker alone does not authorize replacing an unmanaged or externally changed file.
+To update, use a newer trusted checkout and rerun the installer (preview with `--dry-run` first). It recognizes exact installer-managed artifacts; conflicts require confirmation and are not silently overwritten. The plan classifies each replaceable target, and one that differs from this checkout counts as a conflict; the generated OpenCode plugin is instead judged by the hash its last install recorded. An exact manifest-owned V1 plugin is backed up and replaced at the same managed path, without leaving a second discoverable adapter. A marker alone does not authorize replacing an unmanaged or externally changed file.
 
 ```zsh
 bin/agent-notify-install

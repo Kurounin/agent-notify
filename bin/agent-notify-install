@@ -31,7 +31,7 @@ typeset command_prefix="$claude_hook_path"
 typeset dry_run=0 rollback=0 backup_dir='' preflight_stage='' generation='' selector_before='' backup_root_created=0 state_dir_existed=0
 typeset user_key='' app_token='' settings_existed=0 bin_existed=0 lib_existed=0 hook_existed=0 hook_jxa_existed=0 plugin_existed=0
 typeset bin_post_hash='' lib_post_hash='' hook_post_hash='' hook_jxa_post_hash='' plugin_post_hash='' settings_post_hash='' manifest_post_hash='' manifest_existed=0 mutation_started=0 completed=0 attempt_restored=0 secret_prompt_open=0
-typeset -a attempt_created_dirs
+typeset -a attempt_created_dirs target_lines
 typeset -A unavailable_links
 
 usage() { print -u2 -- 'usage: agent-notify-install [--dry-run|--rollback]'; }
@@ -190,16 +190,32 @@ rollback_preflight() {
   done
 }
 
-classify_file() {
-  local target=$1 source=$2 label=$3
-  (( ${+unavailable_links[$target]} )) && { print -- "$label: conflict"; return; }
-  [[ -e $target ]] || { print -- "$label: absent"; return; }
-  if [[ $(sha256 "$target") == $(sha256 "$source") ]]; then print -- "$label: installer-managed exact"; else print -- "$label: conflict"; fi
+# Only a regular file is read: opening a FIFO blocks until something writes to it, and a device such as /dev/zero never ends.
+same_bytes() { [[ -f $1 && $(sha256 "$1") == $(sha256 "$2") ]]; }
+same_tree() { [[ $(tree_hash "$1") == $(tree_hash "$2") ]]; }
+
+# The check runs as a condition because the plan runs under errexit, and reading an empty or unreadable plugin fails.
+classify_target() {
+  local label=$1 target=$2 check=$3 source=${4:-}
+  if (( ${+unavailable_links[$target]} )); then target_lines+=("$label: conflict")
+  elif [[ ! -e $target ]]; then target_lines+=("$label: absent")
+  elif "$check" "$target" "$source"; then target_lines+=("$label: installer-managed exact")
+  else target_lines+=("$label: conflict"); fi
+}
+
+# The plan prints these lines and has_conflict decides from them, so the plan names what the prompt acts on. An older install differs from this checkout and so needs consent, except the plugin, which is generated and can only be judged by its manifest.
+classify_targets() {
+  target_lines=()
+  classify_target executable "$install_bin" same_bytes "$root/bin/agent-notify"
+  classify_target notifier-library "$install_lib" same_tree "$root/lib/agent-notify"
+  classify_target Claude-hook "$claude_hook_path" same_bytes "$root/integrations/claude/agent-notify-hook.zsh"
+  classify_target Claude-hook-JXA "$claude_hook_jxa_path" same_bytes "$root/integrations/claude/agent-notify-hook.jxa"
+  classify_target OpenCode-plugin "$plugin_path" plugin_is_managed
 }
 
 plugin_is_managed() {
   local first_line recorded_hash
-  [[ -e $plugin_path ]] || return 1
+  [[ -f $plugin_path ]] || return 1
   IFS= read -r first_line < "$plugin_path"
   [[ $first_line == '// >>> agent-notify managed plugin >>>' && -r $manifest_path ]] || return 1
   recorded_hash=$("$jxa_bin" -l JavaScript "$manifest_helper" "$manifest_path" files.plugin.post_hash 2>/dev/null) || return 1
@@ -207,14 +223,10 @@ plugin_is_managed() {
 }
 
 has_conflict() {
+  # A link at the settings or manifest path has no classification line, only its own line in the plan.
   (( ${#unavailable_links} )) && return 0
-  [[ -e $install_bin && $(sha256 "$install_bin") != $(sha256 "$root/bin/agent-notify") ]] && return 0
-  [[ -e $install_lib && ! -d $install_lib ]] && return 0
-  [[ -d $install_lib && $(tree_hash "$install_lib") != $(tree_hash "$root/lib/agent-notify") ]] && return 0
-  [[ -e $claude_hook_path && $(sha256 "$claude_hook_path") != $(sha256 "$root/integrations/claude/agent-notify-hook.zsh") ]] && return 0
-  [[ -e $claude_hook_jxa_path && $(sha256 "$claude_hook_jxa_path") != $(sha256 "$root/integrations/claude/agent-notify-hook.jxa") ]] && return 0
-  [[ -e $plugin_path ]] && ! plugin_is_managed && return 0
-  return 1
+  classify_targets
+  (( ${target_lines[(I)*: conflict]} ))
 }
 
 preview() {
@@ -237,8 +249,8 @@ preview() {
   print -- "  Claude completion excerpts use final assistant output; Claude failure excerpts use the categorical error identifier, never free-text error detail. OpenCode completion excerpts use relevant root-session assistant text available through native context; OpenCode failure excerpts use structured error message when present or error type otherwise, never response bodies. Excerpts are sanitized and bounded: the selected source is sent in full when it already fits the bound and truncated when longer; model output or OpenCode error messages can repeat sensitive content such as secrets or paths."
   print -- "  Message excerpts are enabled by default; set EXCERPT=0 in $settings_conf_path to stop sending them."
   probe_keychain "$keychain_selector_service" && print -- '  existing v2 credential generation: will be replaced after confirmation' || print -- '  existing v2 credential generation: absent'
-  classify_file "$install_bin" "$root/bin/agent-notify" executable
-  classify_file "$plugin_path" "$root/integrations/opencode/agent-notify.js" OpenCode-plugin
+  classify_targets
+  print -rl -- "${target_lines[@]}"
   local link
   for link in ${(ok)unavailable_links}; do
     print -r -- "  conflict: $link is a link to an unavailable target (${(V)unavailable_links[$link]}); replacing it removes the link, and neither the backups nor --rollback bring it back"

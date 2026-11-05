@@ -28,8 +28,10 @@
     return ObjC.castRefToObject(constant);
   }
 
+  // An absent key returns a truthy wrapped nil, which the checks below could not tell from a value.
   function value(dictionary, key) {
-    return dictionary.objectForKey(securityString(key));
+    const found = dictionary.objectForKey(securityString(key));
+    return found.isNil() ? undefined : found;
   }
 
   function service(query) {

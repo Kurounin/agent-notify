@@ -18,13 +18,19 @@ agent_notify_process_normalized() {
   delivery_kind=$REPLY
   if [[ -n $delivery_kind ]]; then
     display_context=$(agent_notify_display_context "$tmux_session" "$session_dir")
-    agent_notify_deliver "$delivery_kind" "$source" "$display_context" "$excerpt" || true
+    if agent_notify_deliver "$delivery_kind" "$source" "$display_context" "$excerpt"; then
+      agent_notify_diag transport "delivered_${source}_${delivery_kind}" "$AGENT_NOTIFY_TRANSPORT_HTTP_STATUS" "$AGENT_NOTIFY_TRANSPORT_REQUEST_ID"
+    fi
   fi
 }
 
 agent_notify_event() {
   local raw normalized
   raw=$(/bin/cat) || return 0
+  if [[ -z $raw ]]; then
+    agent_notify_diag normalize adapter_ignored 0 -
+    return 0
+  fi
   normalized=$(agent_notify_normalize_json "$raw") || {
     agent_notify_diag normalize invalid_event 0 -
     return 0

@@ -42,6 +42,37 @@ The system SHALL maintain short-lived local state keyed by a non-reversible deri
 - **WHEN** a session has already processed a terminal `failed` event for its active turn
 - **THEN** the system SHALL NOT deliver a later completion notification for that turn
 
+### Requirement: Keep an open Claude turn's start across began
+The notifier SHALL keep the existing start time when a Claude Code `began` event arrives while that session's turn is active with no terminal event and its start is within the maximum active lifetime, so the minimum runtime is measured from the turn's first `began`. That event SHALL still clear the session's attention state. Any other Claude `began` SHALL start a new turn. An OpenCode `began` SHALL always set the start time.
+
+#### Scenario: A background wake-up closes a long turn
+- **WHEN** a Claude turn begins, its `Stop` is dropped because background work is registered, the session wakes with another `began`, and a later `Stop` reports no background work after a short closing stretch, all within the maximum active lifetime
+- **THEN** the system SHALL measure runtime from the turn's first `began` and SHALL deliver one completion when that runtime reaches the minimum
+
+#### Scenario: A notification folds into a running turn
+- **WHEN** a `began` arrives during a running Claude turn with no `Stop` between them
+- **THEN** the system SHALL keep the original start time and SHALL clear that session's attention state
+
+#### Scenario: A new turn follows a closed turn
+- **WHEN** a Claude `began` arrives after a `completed` or `failed` event has closed the previous turn
+- **THEN** the system SHALL start a new turn, and a completion below the minimum runtime SHALL stay silent
+
+#### Scenario: An open turn has outlived the maximum active lifetime
+- **WHEN** a Claude `began` arrives and the open turn's start is older than the maximum active lifetime
+- **THEN** the system SHALL start a new turn from that event, so retention cleanup does not remove the new turn's state
+
+#### Scenario: An interrupted Claude turn is followed by another prompt
+- **WHEN** a Claude turn ends through an interrupt or a killed process with no terminal event, and a later `began` arrives for that session within the maximum active lifetime
+- **THEN** the system SHALL treat it as the same open turn, because the hook payload does not distinguish it from a running turn
+
+#### Scenario: A short reply follows a Stop with registered background work
+- **WHEN** a Claude `began` arrives after a dropped `Stop`, because the user replied while background work remained registered
+- **THEN** the system SHALL treat it as the same open turn, and the `Stop` that closes it SHALL be measured from the turn's first `began`
+
+#### Scenario: An OpenCode session reports another began
+- **WHEN** an OpenCode `began` arrives while that session's turn is active with no terminal event
+- **THEN** the system SHALL set the start time to the time of that event
+
 ### Requirement: Preserve Claude session-start project context
 The Claude Code adapter SHALL evaluate `CLAUDE_PROJECT_DIR`, then the hook payload's `session_dir`, `cwd`, and `directory` fields in that order, and SHALL use the first candidate that is a non-empty string of at most 256 UTF-16 code units containing no C0 or DEL control as the normalized session directory. It SHALL ignore the event only when none of those candidates is valid. A later change to the hook payload's current working directory SHALL NOT change the project fallback label while a valid session-start project root remains available.
 
@@ -256,7 +287,9 @@ The system SHALL enable message excerpts by default and SHALL provide a user-edi
 - **THEN** the system SHALL leave excerpts enabled and SHALL NOT fail the notification
 
 ### Requirement: Fail open without exposing secrets
-The system SHALL return success to adapter-invoked lifecycle processing when credential lookup, state handling, or Pushover delivery fails. It SHALL NOT write secrets, prompt content, assistant messages, tool input/output, source code, raw events, session identifiers, paths, Pushover request bodies, or third-party response bodies to state or diagnostic logs. It SHALL NOT place Pushover credentials in process arguments, environment variables, temporary files, or persistent curl configuration. State and diagnostic directories SHALL be user-only, and diagnostics SHALL contain only timestamp, component, categorical error code, HTTP status, and Pushover request identifier with bounded retention.
+The system SHALL return success to adapter-invoked lifecycle processing when credential lookup, state handling, or Pushover delivery fails. It SHALL NOT write secrets, prompt content, assistant messages, tool input/output, source code, raw events, session identifiers, paths, Pushover request bodies, or third-party response bodies to state or diagnostic logs. It SHALL NOT place Pushover credentials in process arguments, environment variables, temporary files, or persistent curl configuration. State and diagnostic directories SHALL be user-only, and diagnostics SHALL contain only timestamp, component, categorical code, HTTP status, and Pushover request identifier with bounded retention.
+
+After Pushover accepts a lifecycle message, the system SHALL record a diagnostic whose categorical code names the source and message kind. It SHALL NOT record one for a rejected send or for the smoke test. When the notifier receives empty input, the system SHALL record a categorical code distinct from the code for a malformed event.
 
 #### Scenario: Pushover is unavailable
 - **WHEN** the Pushover request times out or returns an error
@@ -265,6 +298,23 @@ The system SHALL return success to adapter-invoked lifecycle processing when cre
 #### Scenario: A user runs the smoke test
 - **WHEN** the user explicitly invokes the notifier smoke-test command
 - **THEN** it SHALL return nonzero with a sanitized diagnostic unless Pushover returns an HTTP success response with `status: 1`
+- **AND** a successful smoke test SHALL NOT record a lifecycle delivery diagnostic
+
+#### Scenario: Pushover accepts a lifecycle message
+- **WHEN** Pushover returns an HTTP success response with `status: 1` for a lifecycle message
+- **THEN** the system SHALL record a diagnostic naming the source and message kind, with the HTTP status and Pushover request identifier, and no event-derived values
+
+#### Scenario: Pushover rejects a lifecycle message
+- **WHEN** Pushover rejects a lifecycle message
+- **THEN** the system SHALL record its existing rejection diagnostic and SHALL NOT record a delivery diagnostic
+
+#### Scenario: The Claude adapter drops an event
+- **WHEN** the Claude Code adapter runs the notifier with empty input, for example because a `Stop` reports registered background work
+- **THEN** the system SHALL record the empty-input code, SHALL NOT record the malformed-event code, and SHALL leave the turn open
+
+#### Scenario: An adapter submits a malformed event
+- **WHEN** the notifier receives non-empty input that is not a valid normalized event
+- **THEN** the system SHALL record the malformed-event code
 
 ### Requirement: Integrate supported Claude Code and OpenCode events
 The system SHALL map Claude Code main-agent attention, completion, and failure hooks to normalized events. Claude attention SHALL be limited to `permission_prompt`, `elicitation_dialog`, and `elicitation_url_dialog`; all other notification types, including background-agent and subagent events, SHALL be ignored. Claude `began` events SHALL clear stale Claude attention; the adapter SHALL NOT claim a request-specific clear when Claude does not expose one.

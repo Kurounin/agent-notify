@@ -100,6 +100,98 @@ send_event 200 began.json
 send_event 231 completed.json
 assert_equals "$deliveries" 1
 
+turn_event() {
+  local source=$1 now=$2 kind=$3 session=$4
+  print -rn -- "{\"source\":\"$source\",\"kind\":\"$kind\",\"session_id\":\"$session\",\"session_dir\":\"/tmp/turn-project\"}" | AGENT_NOTIFY_NOW=$now agent_notify_event
+}
+# The Claude adapter sends the notifier nothing when it discards a Stop that reports registered background work.
+dropped_stop() {
+  print -rn -- '' | AGENT_NOTIFY_NOW=$1 agent_notify_event
+}
+assert_turn_start() {
+  local source=$1 session=$2 expected=$3 failure=$4
+  agent_notify_load_state "$AGENT_NOTIFY_STATE_DIR/$(agent_notify_session_key "$source" "$session").state"
+  [[ $STATE_STARTED_AT == "$expected" ]] || { print -u2 -- "$failure: start is '$STATE_STARTED_AT'"; exit 1; }
+}
+
+typeset deliveries_before_turn_retention=$deliveries
+
+# Only the short closing stretch follows the last began, so restarting the timer here loses the alert.
+deliveries=0
+turn_event claude-code 1000 began wake-up
+dropped_stop 1040
+turn_event claude-code 1100 began wake-up
+assert_turn_start claude-code wake-up 1000 'a wake-up began restarted an open turn'
+turn_event claude-code 1105 completed wake-up
+assert_equals "$deliveries" 1
+
+# The repeated request alerts again inside the debounce window only if the began really cleared attention.
+deliveries=0
+typeset mid_turn_attention='{"source":"claude-code","kind":"attention","session_id":"mid-turn","session_dir":"/tmp/turn-project","request_id":"mid-turn-request"}'
+turn_event claude-code 1000 began mid-turn
+print -rn -- "$mid_turn_attention" | AGENT_NOTIFY_NOW=1010 agent_notify_event
+assert_equals "$deliveries" 1
+turn_event claude-code 1020 began mid-turn
+assert_turn_start claude-code mid-turn 1000 'a mid-turn began restarted an open turn'
+[[ $STATE_ACTIVE == 1 && -z $STATE_ATTENTIONS && $STATE_LAST_ATTENTION_AT == 0 && -z $STATE_TERMINAL ]] || { print -u2 -- 'a mid-turn began did not clear attention'; exit 1; }
+print -rn -- "$mid_turn_attention" | AGENT_NOTIFY_NOW=1021 agent_notify_event
+assert_equals "$deliveries" 2
+
+for terminal_kind in completed failed; do
+  deliveries=0
+  turn_event claude-code 1000 began "closed-$terminal_kind"
+  turn_event claude-code 1040 "$terminal_kind" "closed-$terminal_kind"
+  assert_equals "$deliveries" 1
+  turn_event claude-code 1050 began "closed-$terminal_kind"
+  assert_turn_start claude-code "closed-$terminal_kind" 1050 "a began after $terminal_kind kept the closed turn's start"
+  turn_event claude-code 1055 completed "closed-$terminal_kind"
+  assert_equals "$deliveries" 1
+done
+
+# Accepted false alert: the hook payload cannot tell an interrupted turn from a running one, so a short next turn alerts.
+deliveries=0
+turn_event claude-code 1000 began interrupted
+turn_event claude-code 1600 began interrupted
+assert_turn_start claude-code interrupted 1000 "an interrupted turn's next began restarted the turn"
+turn_event claude-code 1605 completed interrupted
+assert_equals "$deliveries" 1
+
+# Accepted false alert: every exchange is under the minimum runtime, but the closing Stop is measured from the first began.
+deliveries=0
+turn_event claude-code 1000 began short-reply
+dropped_stop 1010
+turn_event claude-code 1015 began short-reply
+assert_turn_start claude-code short-reply 1000 'a short reply after a dropped Stop restarted the turn'
+turn_event claude-code 1031 completed short-reply
+assert_equals "$deliveries" 1
+
+# Each lifetime case has its own directory, so the prune in its second event is due and covers the state under test.
+typeset turn_state_dir=$AGENT_NOTIFY_STATE_DIR
+AGENT_NOTIFY_STATE_DIR="$test_root/turn-lifetime-boundary"
+turn_event claude-code 1000 began lifetime-boundary
+turn_event claude-code $(( 1000 + AGENT_NOTIFY_MAX_ACTIVE_SECONDS )) began lifetime-boundary
+assert_turn_start claude-code lifetime-boundary 1000 'a began at the maximum active lifetime restarted an open turn'
+
+deliveries=0
+AGENT_NOTIFY_STATE_DIR="$test_root/turn-lifetime-expired"
+typeset expired_turn_began=$(( 1001 + AGENT_NOTIFY_MAX_ACTIVE_SECONDS ))
+turn_event claude-code 1000 began lifetime-expired
+turn_event claude-code "$expired_turn_began" began lifetime-expired
+assert_equals "$(<"$(agent_notify_prune_marker_path)")" "$expired_turn_began"
+assert_turn_start claude-code lifetime-expired "$expired_turn_began" 'a began past the maximum active lifetime did not start a new turn that survives prune'
+turn_event claude-code $(( expired_turn_began + 31 )) completed lifetime-expired
+assert_equals "$deliveries" 1
+AGENT_NOTIFY_STATE_DIR=$turn_state_dir
+
+deliveries=0
+turn_event opencode 1000 began opencode-turn
+turn_event opencode 1100 began opencode-turn
+assert_turn_start opencode opencode-turn 1100 'an OpenCode began kept the earlier start'
+turn_event opencode 1105 completed opencode-turn
+assert_equals "$deliveries" 0
+
+deliveries=$deliveries_before_turn_retention
+
 typeset deliveries_before_tmux_titles=$deliveries
 AGENT_NOTIFY_NOW=250 agent_notify_event <<'EOF'
 {"source":"claude-code","kind":"began","session_id":"tmux-title","session_dir":"/tmp/project"}
@@ -704,6 +796,72 @@ if ! agent_notify_deliver completed claude-code project; then
   print -u2 -- 'generation-selected credentials did not deliver'
   exit 1
 fi
+
+typeset shared_diagnostic_dir=$AGENT_NOTIFY_DIAGNOSTIC_DIR lifecycle_diagnostics
+# Each marker in these events would be a privacy leak if it reached a diagnostic line.
+send_marked_outcome() {
+  local source=$1 kind=$2 session=$3
+  print -rn -- "{\"source\":\"$source\",\"kind\":\"began\",\"session_id\":\"$session\",\"session_dir\":\"/tmp/path-marker\"}" | AGENT_NOTIFY_NOW=650 agent_notify_event
+  print -rn -- "{\"source\":\"$source\",\"kind\":\"$kind\",\"session_id\":\"$session\",\"session_dir\":\"/tmp/path-marker\",\"excerpt\":\"excerpt-marker\",\"tmux_session\":\"tmux-marker\"}" | AGENT_NOTIFY_NOW=690 agent_notify_event
+}
+assert_no_event_values() {
+  [[ $1 != *session-marker* && $1 != *path-marker* && $1 != *excerpt-marker* && $1 != *tmux-marker* ]] || { print -u2 -- 'a lifecycle diagnostic exposed event data'; exit 1; }
+}
+
+agent_notify_curl_request() {
+  while IFS= read -r _; do :; done
+  print -rn -- $'{"status":1,"request":"accepted-send"}\nAGENT_NOTIFY_META:200:{}'
+}
+AGENT_NOTIFY_DIAGNOSTIC_DIR="$test_root/accepted-diagnostics"
+send_marked_outcome claude-code completed accepted-session-marker
+lifecycle_diagnostics=$(/bin/cat /dev/null "$AGENT_NOTIFY_DIAGNOSTIC_DIR"/*.log(N))
+[[ $lifecycle_diagnostics == *'component=transport code=delivered_claude-code_completed http_status=200 request_id=accepted-send'* ]] || { print -u2 -- 'an accepted Claude completion was not recorded'; exit 1; }
+assert_no_event_values "$lifecycle_diagnostics"
+
+AGENT_NOTIFY_DIAGNOSTIC_DIR="$test_root/accepted-opencode-diagnostics"
+send_marked_outcome opencode failed accepted-opencode-session-marker
+lifecycle_diagnostics=$(/bin/cat /dev/null "$AGENT_NOTIFY_DIAGNOSTIC_DIR"/*.log(N))
+[[ $lifecycle_diagnostics == *'component=transport code=delivered_opencode_failed http_status=200 request_id=accepted-send'* ]] || { print -u2 -- 'an accepted OpenCode failure was not recorded by source and kind'; exit 1; }
+assert_no_event_values "$lifecycle_diagnostics"
+
+agent_notify_curl_request() {
+  while IFS= read -r _; do :; done
+  print -rn -- $'{"status":0,"request":"rejected-send"}\nAGENT_NOTIFY_META:400:{}'
+}
+AGENT_NOTIFY_DIAGNOSTIC_DIR="$test_root/rejected-diagnostics"
+send_marked_outcome claude-code completed rejected-session-marker
+lifecycle_diagnostics=$(/bin/cat /dev/null "$AGENT_NOTIFY_DIAGNOSTIC_DIR"/*.log(N))
+[[ $lifecycle_diagnostics == *'component=transport code=rejected http_status=400 request_id=rejected-send'* ]] || { print -u2 -- 'a rejected send lost its rejected line'; exit 1; }
+[[ $lifecycle_diagnostics != *delivered_* ]] || { print -u2 -- 'a rejected send was recorded as delivered'; exit 1; }
+[[ $lifecycle_diagnostics != *processing_failed* ]] || { print -u2 -- 'a rejected send did not fail open'; exit 1; }
+assert_no_event_values "$lifecycle_diagnostics"
+
+agent_notify_curl_request() {
+  while IFS= read -r _; do :; done
+  return 28
+}
+AGENT_NOTIFY_DIAGNOSTIC_DIR="$test_root/unavailable-diagnostics"
+send_marked_outcome claude-code completed unavailable-session-marker
+lifecycle_diagnostics=$(/bin/cat /dev/null "$AGENT_NOTIFY_DIAGNOSTIC_DIR"/*.log(N))
+[[ $lifecycle_diagnostics == *'component=transport code=curl_failed http_status=0 request_id=-'* ]] || { print -u2 -- 'a timed-out send was not recorded as curl_failed'; exit 1; }
+[[ $lifecycle_diagnostics != *delivered_* ]] || { print -u2 -- 'a timed-out send was recorded as delivered'; exit 1; }
+[[ $lifecycle_diagnostics != *processing_failed* ]] || { print -u2 -- 'a timed-out send did not fail open'; exit 1; }
+assert_no_event_values "$lifecycle_diagnostics"
+
+typeset validator_marker="$test_root/validator-ran"
+agent_notify_normalize_json() { : > "$validator_marker"; return 1; }
+AGENT_NOTIFY_DIAGNOSTIC_DIR="$test_root/empty-input-diagnostics"
+print -rn -- '' | AGENT_NOTIFY_NOW=660 agent_notify_event
+source "$root/lib/agent-notify/json.zsh"
+[[ ! -e $validator_marker ]] || { print -u2 -- 'empty input ran the validator'; exit 1; }
+lifecycle_diagnostics=$(/bin/cat /dev/null "$AGENT_NOTIFY_DIAGNOSTIC_DIR"/*.log(N))
+[[ $lifecycle_diagnostics == *'component=normalize code=adapter_ignored http_status=0 request_id=-'* && $lifecycle_diagnostics != *invalid_event* ]] || { print -u2 -- 'empty input was not recorded as adapter_ignored'; exit 1; }
+
+AGENT_NOTIFY_DIAGNOSTIC_DIR="$test_root/invalid-input-diagnostics"
+send_event 661 invalid.json
+lifecycle_diagnostics=$(/bin/cat /dev/null "$AGENT_NOTIFY_DIAGNOSTIC_DIR"/*.log(N))
+[[ $lifecycle_diagnostics == *'component=normalize code=invalid_event http_status=0 request_id=-'* && $lifecycle_diagnostics != *adapter_ignored* ]] || { print -u2 -- 'malformed input was not recorded as invalid_event'; exit 1; }
+AGENT_NOTIFY_DIAGNOSTIC_DIR=$shared_diagnostic_dir
 agent_notify_curl_request() {
   while IFS= read -r _; do :; done
   print -rn -- $'{"status":0,"request":"test-failure"}\nAGENT_NOTIFY_META:503:{}'
@@ -839,6 +997,19 @@ AGENT_NOTIFY_HOME="$test_root/untrusted" "$installed_bin" supported-versions >/d
   export PATH="$install_root/.local/bin:/usr/bin:/bin"
   agent-notify supported-versions >/dev/null
 )
+
+# The smoke test calls the same delivery function, but is not a lifecycle send. The stubs keep it from the real Keychain and Pushover.
+/bin/cat >> "$install_root/.local/lib/agent-notify/delivery.zsh" <<'EOF'
+agent_notify_keychain_read() { print -rn -- $'ok\t1720000000-54321\tuserkey012345678901234567890123\tapptoken01234567890123456789012'; }
+agent_notify_curl_request() {
+  while IFS= read -r _; do :; done
+  print -rn -- $'{"status":1,"request":"smoke-success"}\nAGENT_NOTIFY_META:200:{}'
+}
+EOF
+typeset smoke_success_dir="$test_root/smoke-success-diagnostics" smoke_success_output="$test_root/smoke-success-output"
+AGENT_NOTIFY_DIAGNOSTIC_DIR="$smoke_success_dir" "$installed_bin" smoke-test > "$smoke_success_output" 2>&1 || { print -u2 -- 'an accepted smoke test failed'; exit 1; }
+[[ $(<"$smoke_success_output") == *'smoke test delivered'* ]] || { print -u2 -- 'an accepted smoke test did not report delivery'; exit 1; }
+[[ $(/bin/cat /dev/null "$smoke_success_dir"/*.log(N)) != *delivered_* ]] || { print -u2 -- 'a smoke test was recorded as a lifecycle delivery'; exit 1; }
 
 print -r -- 'agent_notify_deliver() { /bin/sh -c '\''echo "$PPID"'\'' > "$AGENT_NOTIFY_SMOKE_PID_MARKER"; /bin/sleep 5; }' >> "$install_root/.local/lib/agent-notify/delivery.zsh"
 typeset smoke_output smoke_output_file smoke_pid_marker smoke_pid smoke_started smoke_elapsed

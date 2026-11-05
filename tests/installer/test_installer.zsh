@@ -107,6 +107,41 @@ typeset staged_plugin="$test_root/agent-notify.js"
 /usr/bin/osascript -l JavaScript "$root/installer/opencode-plugin.jxa" "$root/integrations/opencode/agent-notify.js" "$staged_plugin" '/tmp/agent-notify'
 typeset plugin_content=$(<"$staged_plugin")
 [[ $plugin_content == *'spawn(["/tmp/agent-notify", "event"], {'* && $plugin_content == *session_dir* && $plugin_content == *request_id* ]] || { print -u2 -- 'OpenCode template is not normalized or its absolute notifier path was not embedded'; exit 1; }
+# helper_failure_check <name> <expected message> <helper and arguments>: a helper that cannot read or write fails with its own message. Reading an NSError out-parameter after a failed Foundation call crashes osascript with exit 139.
+helper_failure_check() {
+  local check_name=$1 check_message=$2 check_output check_code=0
+  shift 2
+  check_output=$(/usr/bin/osascript -l JavaScript "$@" 2>&1 </dev/null) || check_code=$?
+  (( check_code == 1 )) || { print -ru2 -- "$check_output"; print -u2 -- "$check_name: expected exit 1, got $check_code"; exit 1; }
+  [[ $check_output == *"$check_message"* ]] || { print -ru2 -- "$check_output"; print -u2 -- "$check_name: expected '$check_message'"; exit 1; }
+}
+typeset missing_path="$test_root/no-such-file" missing_parent="$test_root/no-such-directory/output"
+# A directory exists but cannot be read as a file.
+helper_failure_check 'settings merge from an unreadable path' 'unable to read Claude settings' "$root/installer/claude-settings.jxa" merge "$test_root" "$test_root/ignored.json" '/tmp/agent-notify event'
+[[ $(/usr/bin/osascript -l JavaScript "$root/installer/claude-settings.jxa" inspect "$test_root" - '/tmp/agent-notify event') == unparseable ]] || { print -u2 -- 'settings inspection accepted an unreadable path'; exit 1; }
+helper_failure_check 'plugin generation from a missing source' 'unable to read the OpenCode plugin source' "$root/installer/opencode-plugin.jxa" "$missing_path" "$test_root/ignored.js" '/tmp/agent-notify'
+helper_failure_check 'manifest read of a missing file' 'unable to read the installation manifest' "$root/installer/manifest.jxa" "$missing_path" backup
+AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM="$missing_path" helper_failure_check 'installer Keychain helper with a missing shim' 'Keychain security shim unavailable' "$root/installer/keychain.jxa" state
+AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM="$missing_path" helper_failure_check 'runtime Keychain helper with a missing shim' 'Keychain security shim unavailable' "$root/lib/agent-notify/keychain.jxa"
+helper_failure_check 'settings merge to an unwritable path' 'unable to write Claude settings' "$root/installer/claude-settings.jxa" merge "$merged_settings" "$missing_parent" '/tmp/agent-notify event'
+helper_failure_check 'managed settings removal to an unwritable path' 'unable to write Claude settings' "$root/installer/claude-settings.jxa" remove-managed "$merged_settings" "$missing_parent" '/tmp/agent-notify event'
+helper_failure_check 'plugin generation to an unwritable path' 'unable to write the OpenCode plugin' "$root/installer/opencode-plugin.jxa" "$root/integrations/opencode/agent-notify.js" "$missing_parent" '/tmp/agent-notify'
+# A directory is readable by a permission check and a missing parent is not a permission failure, so neither stands in for these.
+typeset denied_settings="$test_root/denied-settings.json" read_only_output="$test_root/read-only-output"
+print -r -- '{"keep":true}' > "$denied_settings"
+/bin/chmod 000 "$denied_settings"
+helper_failure_check 'settings merge from a permission-denied file' 'unable to read Claude settings' "$root/installer/claude-settings.jxa" merge "$denied_settings" "$test_root/ignored.json" '/tmp/agent-notify event'
+[[ $(/usr/bin/osascript -l JavaScript "$root/installer/claude-settings.jxa" inspect "$denied_settings" - '/tmp/agent-notify event') == unparseable ]] || { print -u2 -- 'settings inspection accepted a permission-denied file'; exit 1; }
+/bin/mkdir "$read_only_output"
+/bin/chmod 555 "$read_only_output"
+helper_failure_check 'settings merge into a read-only directory' 'unable to write Claude settings' "$root/installer/claude-settings.jxa" merge "$merged_settings" "$read_only_output/settings.json" '/tmp/agent-notify event'
+helper_failure_check 'plugin generation into a read-only directory' 'unable to write the OpenCode plugin' "$root/installer/opencode-plugin.jxa" "$root/integrations/opencode/agent-notify.js" "$read_only_output/agent-notify.js" '/tmp/agent-notify'
+/bin/chmod 755 "$read_only_output"
+# A parse error can quote its input, and this input holds credentials. The value here is made up.
+typeset malformed_store_output malformed_store_code=0
+malformed_store_output=$(print -rn -- '{"generation":"1-2","user":"x","y":FAKEUSERKEY","token":"t"}' | AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM="$root/tests/installer/fixtures/keychain-security-shim.jxa" AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM_LOG="$keychain_shim_log" /usr/bin/osascript -l JavaScript "$root/installer/keychain.jxa" store 2>&1) || malformed_store_code=$?
+(( malformed_store_code == 1 )) || { print -ru2 -- "$malformed_store_output"; print -u2 -- "a malformed Keychain store did not fail: exit $malformed_store_code"; exit 1; }
+[[ $malformed_store_output == *'invalid Keychain helper input'* && $malformed_store_output != *FAKEUSERKEY* ]] || { print -ru2 -- "$malformed_store_output"; print -u2 -- 'a malformed Keychain store echoed its input'; exit 1; }
 typeset claude_event=$(print -rn -- '{"agent_type":"main","session_id":"session","cwd":"/tmp/project","notification_type":"permission_prompt","request_id":"request"}' | /usr/bin/osascript -l JavaScript "$root/integrations/claude/agent-notify-hook.jxa" attention)
 [[ $claude_event == *'"session_dir":"/tmp/project"'* && $claude_event == *'"request_id":"request"'* ]] || { print -u2 -- 'Claude template is not normalized'; exit 1; }
 typeset fallback_event=$(print -rn -- '{"agent_type":"main_agent","session_id":"session","cwd":"/tmp/project","notification_type":"permission_prompt"}' | /usr/bin/osascript -l JavaScript "$root/integrations/claude/agent-notify-hook.jxa" attention)
@@ -355,6 +390,16 @@ print -r -- "${first_shim_source/'new Set()'/$first_shim_items}" > "$first_shim"
 /usr/bin/touch "$first_shim_log"
 print -rn -- '{"generation":"test-generation","previous":""}' | AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM="$first_shim" AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM_LOG="$first_shim_log" /usr/bin/osascript -l JavaScript "$root/installer/keychain.jxa" remove
 [[ $(<"$first_shim_log") == $'lookup agent-notify.pushover.v2.active-generation\nremove agent-notify.pushover.v2.active-generation\nlookup agent-notify.pushover.v2.user-key.test-generation\nremove agent-notify.pushover.v2.user-key.test-generation\nlookup agent-notify.pushover.v2.app-token.test-generation\nremove agent-notify.pushover.v2.app-token.test-generation' ]] || fail_with 'Keychain removal did not touch exactly the selector and the recorded generation' "$(<"$first_shim_log")"
+
+# An existing selector takes the update branch, on a reinstall and on a rollback. A fresh shim never reaches it.
+typeset update_shim="$test_root/update-keychain-shim.jxa" update_shim_log="$test_root/update-keychain-shim.log" update_shim_items="new Set(['agent-notify.pushover.v2.active-generation'])"
+print -r -- "${first_shim_source/'new Set()'/$update_shim_items}" > "$update_shim"
+/usr/bin/touch "$update_shim_log"
+print -rn -- '{"generation":"next-generation","user":"test-user","token":"test-token"}' | AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM="$update_shim" AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM_LOG="$update_shim_log" /usr/bin/osascript -l JavaScript "$root/installer/keychain.jxa" store
+[[ $(<"$update_shim_log") == $'add agent-notify.pushover.v2.user-key.next-generation\nadd agent-notify.pushover.v2.app-token.next-generation\nlookup agent-notify.pushover.v2.active-generation\nupdate agent-notify.pushover.v2.active-generation' ]] || { print -u2 -- 'a store with an existing selector did not update it'; exit 1; }
+: > "$update_shim_log"
+print -rn -- '{"generation":"next-generation","selector":"prior-generation"}' | AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM="$update_shim" AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM_LOG="$update_shim_log" /usr/bin/osascript -l JavaScript "$root/installer/keychain.jxa" rollback
+[[ $(<"$update_shim_log") == *$'update agent-notify.pushover.v2.active-generation\n'* ]] || { print -u2 -- 'a rollback with an existing selector did not update it'; exit 1; }
 
 typeset first_edited_home="$test_root/first-edited-home" first_settings_home="$test_root/first-settings-home"
 real_install "$first_edited_home" yes

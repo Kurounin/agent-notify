@@ -38,7 +38,7 @@ function securityInterface() {
   const shimPath = ObjC.unwrap($.NSProcessInfo.processInfo.environment.objectForKey('AGENT_NOTIFY_KEYCHAIN_SECURITY_SHIM'));
   if (shimPath) {
     const shimData = $.NSData.dataWithContentsOfFile($(shimPath));
-    if (!shimData) throw new Error('Keychain security shim unavailable');
+    if (shimData.isNil()) throw new Error('Keychain security shim unavailable');
     return eval(ObjC.unwrap($.NSString.alloc.initWithDataEncoding(shimData, $.NSUTF8StringEncoding)));
   }
   return { copyMatching: (query, result) => $.SecItemCopyMatching(query, result) };

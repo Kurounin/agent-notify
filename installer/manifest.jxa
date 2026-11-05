@@ -7,16 +7,15 @@ const args = [];
 for (let index = 0; index < processArguments.count; index += 1) args.push(ObjC.unwrap(processArguments.objectAtIndex(index)));
 const path = args[4];
 const field = args[5];
-const error = Ref();
 function output(value) {
   $.NSFileHandle.fileHandleWithStandardOutput.writeData($(value + '\n').dataUsingEncoding($.NSUTF8StringEncoding));
 }
-const text = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, error);
-if (text === null) {
-  throw new Error(ObjC.unwrap(error[0].localizedDescription));
-}
+// Reading an NSError out-parameter after a failed Foundation call crashes osascript, so this passes
+// null and reports the failure itself. A failed read also returns a truthy wrapped nil.
+const text = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null));
+if (typeof text !== 'string') throw new Error('unable to read the installation manifest');
 try {
-  const manifest = JSON.parse(ObjC.unwrap(text));
+  const manifest = JSON.parse(text);
   const value = field.split('.').reduce((object, key) => object[key], manifest);
   const isFlag = field.endsWith('.existed');
   if (isFlag ? ![0, 1, true, false].includes(value) : typeof value !== 'string') throw new Error('manifest field is invalid');

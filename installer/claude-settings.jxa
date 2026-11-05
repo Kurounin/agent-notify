@@ -10,17 +10,16 @@ const settingsPath = args[5];
 const outputPath = args[6];
 const commandPrefix = args[7];
 
+// Reading an NSError out-parameter after a failed Foundation call crashes osascript, so these pass
+// null and report the failure themselves. A failed read also returns a truthy wrapped nil.
 function readText(path) {
-  const error = Ref();
-  const value = $.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, error);
-  if (value === null) throw new Error(ObjC.unwrap(error[0].localizedDescription));
-  return ObjC.unwrap(value);
+  const value = ObjC.unwrap($.NSString.stringWithContentsOfFileEncodingError(path, $.NSUTF8StringEncoding, null));
+  if (typeof value !== 'string') throw new Error('unable to read Claude settings');
+  return value;
 }
 
 function writeText(path, value) {
-  const error = Ref();
-  const ok = $(value).writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, error);
-  if (!ok) throw new Error(ObjC.unwrap(error[0].localizedDescription));
+  if (!$(value).writeToFileAtomicallyEncodingError(path, true, $.NSUTF8StringEncoding, null)) throw new Error('unable to write Claude settings');
 }
 
 function output(value) {

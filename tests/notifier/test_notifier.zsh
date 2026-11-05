@@ -1032,6 +1032,95 @@ typeset smoke_diagnostics
 smoke_diagnostics=$(/bin/cat "$AGENT_NOTIFY_DIAGNOSTIC_DIR"/*.log(N))
 [[ $smoke_diagnostics == *'component=transport code=smoke_timeout http_status=0 request_id=-'* ]] || { print -u2 -- 'smoke timeout diagnostic was not recorded'; exit 1; }
 
+# The delivery in $install_root now stalls, so this block has its own tree. The stub's other actions wait for the watchdog's sleep to start. kill-sleep and kill-watchdog then force the two races that a plain run can only lose by timing, and reject and curl-fail set how the delivery ends.
+typeset watchdog_root="$test_root/watchdog-tree" watchdog_bin="$test_root/watchdog-tree/bin/agent-notify"
+typeset watchdog_diagnostics="$test_root/watchdog-diagnostics" watchdog_output="$test_root/watchdog-output" watchdog_errors="$test_root/watchdog-errors"
+typeset smoke_delivered='agent-notify: smoke test delivered'
+typeset smoke_failed='agent-notify: smoke test delivery failed (see sanitized diagnostics)'
+typeset smoke_timed_out='agent-notify: smoke test timed out (see sanitized diagnostics)'
+/bin/mkdir -p "$watchdog_root/bin" "$watchdog_root/lib"
+/bin/cp "$root/bin/agent-notify" "$watchdog_bin"
+/bin/cp -R "$root/lib/agent-notify" "$watchdog_root/lib/"
+/bin/chmod 700 "$watchdog_bin"
+/bin/cat >> "$watchdog_root/lib/agent-notify/delivery.zsh" <<'EOF'
+agent_notify_keychain_read() { print -rn -- $'ok\t1720000000-54321\tuserkey012345678901234567890123\tapptoken01234567890123456789012'; }
+agent_notify_curl_request() {
+  local attempt
+  # Ignoring TERM holds the stall until the watchdog reaches the smoke test itself. A delivery that ended first would race the smoke test's own completion.
+  [[ ${AGENT_NOTIFY_TEST_WATCHDOG_ACTION:-} == stall ]] && { trap '' TERM; /bin/sleep 20; return 28; }
+  while IFS= read -r _; do :; done
+  if [[ -n ${AGENT_NOTIFY_TEST_WATCHDOG_ACTION:-} ]]; then
+    for (( attempt = 0; attempt < 100; attempt++ )); do
+      /usr/bin/pgrep -P "$watchdog_pid" -f '^/bin/sleep ' >/dev/null && break
+      /bin/sleep 0.02
+    done
+    case $AGENT_NOTIFY_TEST_WATCHDOG_ACTION in
+      kill-sleep) /usr/bin/pkill -TERM -P "$watchdog_pid" -f '^/bin/sleep '; /bin/sleep 0.5 ;;
+      kill-watchdog) /bin/kill -TERM "$watchdog_pid" ;;
+      reject) print -rn -- $'{"status":0,"request":"smoke-rejected"}\nAGENT_NOTIFY_META:400:{}'; return 0 ;;
+      curl-fail) return 28 ;;
+    esac
+  fi
+  print -rn -- $'{"status":1,"request":"smoke-watchdog"}\nAGENT_NOTIFY_META:200:{}'
+}
+EOF
+watchdog_smoke_test() {
+  AGENT_NOTIFY_SMOKE_TEST_TIMEOUT_SECONDS=$1 AGENT_NOTIFY_TEST_WATCHDOG_ACTION=${2:-} AGENT_NOTIFY_DIAGNOSTIC_DIR="$watchdog_diagnostics" "$watchdog_bin" smoke-test
+}
+# Merging the streams makes a hold on either one show: it delays the capture until the 8-second watchdog. A slow machine can do the same and can expire that watchdog, but load only adds time, so only a slow try is retried. A real hold fails all three tries, at about 8 seconds each.
+assert_smoke_capture_returns() {
+  local label=$1 action=$2 expected_status=$3 expected_output=$4 expected_diagnostics=$5 started elapsed capture capture_status attempt
+  for (( attempt = 0; attempt < 3; attempt++ )); do
+    /bin/rm -f "$watchdog_diagnostics"/*.log(N)
+    capture_status=0
+    started=$(/bin/date +%s)
+    capture=$(watchdog_smoke_test 8 "$action" 2>&1) || capture_status=$?
+    elapsed=$(( $(/bin/date +%s) - started ))
+    (( elapsed >= 7 )) && continue
+    (( capture_status == expected_status )) || { print -u2 -- "$label: a captured smoke test exited $capture_status"; exit 1; }
+    [[ $capture == "$expected_output" ]] || { print -u2 -- "$label: a captured smoke test reported the wrong outcome"; exit 1; }
+    [[ $(/bin/cat /dev/null "$watchdog_diagnostics"/*.log(N)) == ${~expected_diagnostics} ]] || { print -u2 -- "$label: a captured smoke test recorded the wrong diagnostics"; exit 1; }
+    return 0
+  done
+  print -u2 -- "$label: capturing a smoke test waited for its watchdog"
+  exit 1
+}
+assert_smoke_capture_returns 'plain run' '' 0 "$smoke_delivered" ''
+# Completion terminates the sleep a moment before the watchdog, which must not take that for expiry.
+assert_smoke_capture_returns 'sleep terminated first' kill-sleep 0 "$smoke_delivered" ''
+# The end state of a lost race: the watchdog is gone and its sleep survives.
+assert_smoke_capture_returns 'sleep outlives the watchdog' kill-watchdog 0 "$smoke_delivered" ''
+assert_smoke_capture_returns 'rejected send' reject 1 "$smoke_failed" '*component=transport code=rejected http_status=400 *'
+assert_smoke_capture_returns 'curl failure' curl-fail 1 "$smoke_failed" '*component=transport code=curl_failed http_status=0 *'
+
+# The merged capture cannot tell the streams apart, and each message has its own. A slow machine cannot expire the 60-second watchdog, and the stall's short one has to.
+assert_smoke_streams() {
+  local label=$1 timeout=$2 action=$3 expected_status=$4 expected_stdout=$5 expected_stderr=$6 actual_status=0
+  watchdog_smoke_test "$timeout" "$action" > "$watchdog_output" 2> "$watchdog_errors" || actual_status=$?
+  (( actual_status == expected_status )) || { print -u2 -- "$label: a smoke test exited $actual_status"; exit 1; }
+  [[ $(<"$watchdog_output") == "$expected_stdout" ]] || { print -u2 -- "$label: a smoke test wrote the wrong stdout"; exit 1; }
+  [[ $(<"$watchdog_errors") == "$expected_stderr" ]] || { print -u2 -- "$label: a smoke test wrote the wrong stderr"; exit 1; }
+}
+assert_smoke_streams 'delivered' 60 wait-for-sleep 0 "$smoke_delivered" ''
+assert_smoke_streams 'rejected send' 60 reject 1 '' "$smoke_failed"
+assert_smoke_streams 'curl failure' 60 curl-fail 1 '' "$smoke_failed"
+assert_smoke_streams 'stalled delivery' 2 stall 143 '' "$smoke_timed_out"
+
+# Waiting for the sleep means completion finds it, so a sleep left behind is the fix failing and not a lost race. The tries only allow for a sleep that is still dying. The timeout is unique to this run, as unresponsive_pane is in the Claude suite, so concurrent suites cannot collide, and each sleep found is killed because it would otherwise last a day.
+typeset watchdog_timeout=$(( 100000 + $$ )) watchdog_sleep_pattern watchdog_attempt watchdog_pgrep_status watchdog_sleep_gone=0
+watchdog_sleep_pattern="^/bin/sleep $watchdog_timeout\$"
+for (( watchdog_attempt = 0; watchdog_attempt < 5; watchdog_attempt++ )); do
+  watchdog_smoke_test "$watchdog_timeout" wait-for-sleep > "$watchdog_output" 2>&1 || { print -u2 -- 'a delivered smoke test failed with its output in a file'; exit 1; }
+  watchdog_pgrep_status=0
+  /usr/bin/pgrep -f "$watchdog_sleep_pattern" >/dev/null || watchdog_pgrep_status=$?
+  if (( watchdog_pgrep_status == 1 )); then
+    watchdog_sleep_gone=1
+    break
+  fi
+  /usr/bin/pkill -KILL -f "$watchdog_sleep_pattern" || true
+done
+(( watchdog_sleep_gone )) || { print -u2 -- 'a delivered smoke test left its watchdog sleep running'; exit 1; }
+
 [[ $(/usr/bin/stat -f '%Lp' "$AGENT_NOTIFY_STATE_DIR") == 700 ]] || { print -u2 -- 'state directory is not user-only'; exit 1; }
 
 print -- 'notifier tests passed'

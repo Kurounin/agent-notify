@@ -92,6 +92,29 @@ The installer SHALL provide a local notifier smoke-test command and report the i
 - **WHEN** all confirmed installation steps complete successfully
 - **THEN** the installer SHALL display the notifier command path, managed configuration locations, and the command to send a test notification
 
+### Requirement: Finish the smoke test without leaving its watchdog behind
+A notifier smoke test that completes before its watchdog timeout SHALL stop the watchdog and its timer, SHALL NOT hold its caller's output open after it exits, and SHALL NOT report a timeout. A delivered run SHALL exit with status 0 and print its delivery message on stdout, and a failed delivery SHALL exit with a nonzero status and print its failure message on stderr.
+
+#### Scenario: A caller captures the output
+- **WHEN** a caller captures the output of a successful smoke test through a pipe or command substitution
+- **THEN** the capture SHALL end when the command exits, without waiting for the watchdog timeout, and SHALL contain the delivery message
+
+#### Scenario: The smoke test completes
+- **WHEN** the smoke test completes before the watchdog timeout
+- **THEN** the watchdog's timer process SHALL NOT remain running, unless completion overlaps the watchdog starting that process
+
+#### Scenario: A timer process survives the watchdog
+- **WHEN** completion overlaps the watchdog starting its timer process and that process survives
+- **THEN** the process SHALL hold none of the caller's output open and SHALL exit by itself at the timeout
+
+#### Scenario: The timer is stopped early
+- **WHEN** the watchdog's timer process is terminated before it has run its full time
+- **THEN** the system SHALL NOT report a timeout, record a smoke timeout diagnostic, or terminate the smoke test
+
+#### Scenario: Delivery stalls past the timeout
+- **WHEN** delivery is still running when the watchdog timeout expires
+- **THEN** the system SHALL print its timeout message to stderr, record the smoke timeout diagnostic, and end the smoke test with a nonzero status
+
 ### Requirement: Undo the most recent installation from its manifest
 Rollback SHALL change only managed artifacts, acting on one only when it is still a regular file or directory matching its recorded post-install hash: it SHALL restore the exact prior bytes and mode if the artifact existed before the install, and remove it otherwise. It SHALL report and leave any other artifact while processing the rest. The rollback option confirms file changes, in place of installation's preview and prompt; deleting credentials SHALL require separate confirmation.
 

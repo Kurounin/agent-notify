@@ -165,3 +165,34 @@ Before changing anything, rollback SHALL validate the manifest and backups. It S
 #### Scenario: Rollback is combined with dry-run
 - **WHEN** the installer receives both the dry-run and rollback options, in either order
 - **THEN** it SHALL report a usage error and make no changes
+
+### Requirement: Ask before replacing a link with an unavailable target
+A managed path (the notifier executable, library tree, Claude hook adapter and its JXA, OpenCode plugin, Claude settings, or install manifest) that is a symbolic link whose target cannot be reached SHALL count as a conflicting target and SHALL be replaced only with explicit consent. It has no bytes to back up, so the backup rule for existing configuration SHALL NOT apply to it.
+
+#### Scenario: The plan names the link
+- **WHEN** the installer shows its plan, including in a dry run, and a managed path is a link whose target is missing, is behind a directory it cannot search, or loops
+- **THEN** the plan SHALL classify that path as a conflict, name it and the link's text with any control characters made visible, and state that replacing it removes the link and that neither the backups nor rollback bring it back
+
+#### Scenario: Replacement is declined or cannot be asked
+- **WHEN** such a link exists and the user does not consent, whether by declining the conflict prompt or because no terminal is available to answer the prompts
+- **THEN** the installer SHALL stop before collecting credentials and leave the link, every other managed artifact, and Keychain state unchanged, and declining the conflict prompt SHALL exit with failure
+
+#### Scenario: Replacement is confirmed
+- **WHEN** the user consents and the installation completes
+- **THEN** the installed artifact SHALL replace the link, nothing SHALL be created or changed at the link's target, and the final report SHALL name the replaced link and its text and state that the backups and rollback do not restore it
+
+#### Scenario: Installation fails after consent
+- **WHEN** the user consents and the attempt then fails or is interrupted before the install commits
+- **THEN** every recorded link whose path is empty after the restore SHALL be recreated with its exact text, a file or directory now at that path SHALL be left alone, and the failure SHALL be reported as for any failed attempt
+
+#### Scenario: Rollback follows a replaced link
+- **WHEN** rollback runs after an installation that replaced such a link
+- **THEN** it SHALL treat the artifact as one that did not exist before the install, removing it if unchanged unless it is the manifest, which rollback always leaves, and SHALL NOT recreate the link
+
+#### Scenario: The link still resolves
+- **WHEN** a managed path is a link whose target can be reached
+- **THEN** this requirement SHALL NOT apply, and the path SHALL be judged by its contents as any other existing target is
+
+#### Scenario: The link's text cannot be read
+- **WHEN** a managed path is such a link and its text cannot be read
+- **THEN** the installer SHALL stop before collecting credentials, name the path, leave everything unchanged, and exit with failure

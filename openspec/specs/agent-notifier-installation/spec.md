@@ -53,6 +53,26 @@ After all conflict and credential-replacement decisions are confirmed, the insta
 - **WHEN** a confirmed installation step fails after writing a Keychain item or managed file
 - **THEN** the installer SHALL restore the pre-install environment and report that installation did not complete
 
+#### Scenario: A failed reinstall installed the same bytes it replaced
+- **WHEN** a confirmed installation fails after the first mutation and an artifact it installed has the same bytes as the version it replaced, as when reinstalling from the same checkout
+- **THEN** the installer SHALL leave that artifact, including the library tree, with its prior bytes and mode, report once that installation did not complete, and exit with failure
+
+#### Scenario: Installation is interrupted after the first mutation
+- **WHEN** the installer receives an interrupt, hangup, or termination signal after the first mutation and before the new manifest is in place, including while it is already restoring, and including one that also reaches its running child as a terminal interrupt does
+- **THEN** it SHALL restore every artifact to its prior bytes and mode, including one it had begun to replace, remove any artifact it created, restore prior Keychain state, report once that installation did not complete, and exit with failure
+
+#### Scenario: Installation is interrupted before the first mutation
+- **WHEN** the installer receives an interrupt, hangup, or termination signal before the first mutation, including at a prompt
+- **THEN** it SHALL stop without changing managed artifacts or Keychain state, remove what it staged, restore terminal echo if it had turned it off, report that nothing was installed, and exit with failure
+
+#### Scenario: The prior Keychain selector cannot be read
+- **WHEN** reading the prior v2 selector fails for any reason other than the item being absent
+- **THEN** the installer SHALL stop before the first mutation without changing managed artifacts or Keychain state, report that it could not read the selector, and exit with failure
+
+#### Scenario: Installation is interrupted after it has committed
+- **WHEN** the installer receives an interrupt, hangup, or termination signal after the install has committed
+- **THEN** it SHALL finish the install, including retiring the prior credential generation, and report that installation completed
+
 #### Scenario: A manifest-owned V1 plugin is updated
 - **WHEN** installation on supported V2 finds a prior plugin whose bytes match its managed manifest hash
 - **THEN** it SHALL back up that artifact outside discovery directories and replace it at the same managed path with one native V2 definition without changing unrelated OpenCode files

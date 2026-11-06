@@ -1,4 +1,4 @@
-# Isolated OpenCode 2.0.27 smoke check
+# Isolated OpenCode 2.2.5 smoke check
 
 Run from the repository root on an Apple Silicon Mac with the existing Node test runtime:
 
@@ -7,10 +7,10 @@ node --check tests/opencode/real-v2-smoke.mjs
 node tests/opencode/real-v2-smoke.mjs --download
 ```
 
-`--download` obtains only the official `@opencode/cli-darwin-arm64@2.0.27`
+`--download` obtains only the official `@opencode/cli-darwin-arm64@2.2.5`
 binary archive, checks its pinned SHA-512 integrity, and extracts the binary into
 a private temporary fixture. It does not run npm, package scripts, or an installer.
-Alternatively, `--binary` accepts an absolute path to a previously obtained
+It has not yet been run at 2.2.5. Alternatively, `--binary` accepts an absolute path to a previously obtained
 binary and checks its exact version before startup. Other platforms and versions
 are deliberately rejected.
 
@@ -20,28 +20,35 @@ are deliberately rejected.
   parent, with a clean child environment and separate HOME, XDG config/data/
   state/cache, and TMPDIR. Checks the host's reported paths before startup.
 - Checks only presence of machine configuration directories, machine/user
-  managed preferences, and every ancestor's discoverable configuration,
-  definitions, and instruction files. Refuses startup if any is present or an
+  managed preferences, and the discoverable configuration, definitions, and
+  instruction files of the project, each additional location directory, and
+  every ancestor. Refuses startup if any is present or an
   existence check is uncertain. Never reads those files.
 - Sets `OPENCODE_CONFIG_PROJECT_DISABLE=1` and disables models catalog fetching.
   This flag reaches both configuration and instruction discovery in the pinned
   server. `OPENCODE_PURE` is not an isolation mechanism and is not used.
 - Starts only `serve --stdio --hostname 127.0.0.1 --port 0`. Never invokes
   `opencode api`, service discovery, registration, restart, or the managed service.
+  Additional locations start inside that server when the private API is asked
+  for their plugin inventory.
 - Generates the actual managed artifact with `installer/opencode-plugin.jxa`.
   The substituted absolute notifier is a fixture-only stdin collector, not the
   notifier executable. It never reads Keychain or delivers a notification.
-- Allows only the fixture provider, its native subagent tool, and one exact
-  fixture-only shell command (`/bin/cat` reading a private FIFO in the fixture
-  project). The FIFO is created mode 0600 and released with one fixed output
-  write; there is no shell polling, arbitrary command input, or process scan. The
+- Allows only the fixture provider, its native subagent tool, and three exact
+  fixture-only shell commands, each `/bin/cat` reading its own private FIFO in
+  the fixture project. Each FIFO is created mode 0600 and released with one fixed
+  output write; there is no shell polling, arbitrary command input, or process scan. The
   scripted provider is a loopback OpenAI-compatible chat stream with no model
   credentials or external model calls. The private API password is a public,
   fixed fixture string, never an inherited credential.
 - Keeps bounded normalized fixture submissions privately; reduces native
   events to lifecycle counts in memory. Prints only categorical outcomes.
-  Removes observed fixture shells through the private native API, shuts down
-  its own processes, and removes only its unique fixture tree.
+  Removes observed fixture shells through the private native API, attempting
+  each even after one fails, and shuts down its own processes. Before removing
+  only its unique fixture tree, it opens each fixture FIFO for writing, without
+  writing, until no reader remains, so a `/bin/cat` already blocked on its FIFO
+  when the server exits or is killed without cleanup gets end-of-file instead
+  of outliving the run.
 
 Pinned contracts used: `packages/cli/src/server-process.ts`,
 `packages/util/src/global-roots.ts`, `packages/core/src/config/discovery.ts`,
@@ -49,7 +56,7 @@ Pinned contracts used: `packages/cli/src/server-process.ts`,
 `packages/core/src/tool/plugin/subagent.ts`, and
 `packages/core/src/session/subagent-completion.ts`,
 `packages/schema/src/shell.ts`, and `packages/core/src/tool/plugin/shell.ts`
-at tag `v2.0.27`.
+at tag `v2.2.5`.
 
 ## Evidence and interpretation
 
@@ -76,6 +83,19 @@ The event observer retains only shell/session IDs and lifecycle status, never
 commands, output, PID, or capture paths. No shell lifecycle, execution, idle, or
 inbox events are injected. This checks live observation, not pre-subscription
 recovery, every accepted patch, or exhaustive process detection.
+
+The multi-location scenarios start three more locations by asking the private
+API for each directory's plugin inventory, and wait until each reports the
+generated plugin active. One prompt at the project location then runs one
+native foreground child. With four live locations it must produce exactly one
+root begin, one child reset, and one root completion, and no other submission.
+Next, a root starts two native background shells, each blocked on its own FIFO,
+and a fifth location starts after both are running. Releasing the first shell
+wakes the root while the second still runs. After native wakeup, output
+consumption, and a further 300 ms, no location may have submitted a completion.
+Releasing the second shell must then give one root begin and one completion in
+total, after three parent executions. These check one observed routing sequence
+in one server process, not workspaces, TUI clients, or several server processes.
 
 Initial execution on 2026-10-13, using exact 2.0.27:
 
@@ -157,3 +177,74 @@ validation, tree-local association, settlement, cancellation during delayed
 work, bounded ancestry resolution, ownership changes, and inbox/outcome rules.
 The native result establishes only these exercised 2.0.27 sequences; it does
 not recover missed shell starts or guarantee exhaustive process detection.
+
+## Multi-location execution — 2026-11-05
+
+Run with `--binary /opt/homebrew/bin/opencode`, the Homebrew-installed
+`opencode v2.2.5` at `/opt/homebrew/Cellar/opencode-v2/2.2.5/bin/opencode`, on
+adapter SHA-256
+`a037ffe7de04dcf48eff26a3f9e4c693da79dcd50c9dfa796c9ca4d4d8ec95ce`. The check
+passed in each of 3 consecutive runs:
+
+- Private isolation; generated-plugin loading/source, native subscription,
+  silent unload, and single active reload: **passed**.
+- Native background children: **2**; parent executions: **3**; results consumed:
+  **2**; root begin/completion **1 / 1**; child completions **0**.
+- Native background shell: **1**; root completions while held **0**; parent
+  executions **2**; root begin/completion **1 / 1**.
+- Four live locations, one prompt with one foreground child: root begin **1**,
+  child reset **1**, root completion **1**, and **3** submissions in total.
+- Two background shells, with a fifth location started after both: **0** root
+  completions after the first shell woke the root while the second ran; then
+  **3** parent executions, **2** outputs consumed, and root begin/completion
+  **1 / 1**.
+- All five categorical PASS checks succeeded. The command exited zero, and no
+  fixture tree, server, or shell process remained afterwards.
+
+`--download` has not been run at 2.2.5, so the pinned 2.2.5 archive, its
+integrity, the size cap, and the archive listing check remain unexercised.
+
+The same script, run against the previous adapter (SHA-256 `a2f1ffcb…`, the one
+used on 2026-10-29), failed at `multi-location-single-submission`. With four
+live locations it recorded root begin **4**, child reset **4**, root completion
+**4**, and **12** submissions. In a scratch copy with only those count checks
+disabled, it failed at `late-location-first-shell-wakeup`. While the second
+shell still ran, the late location had submitted an early root completion
+(**1**), and the root had **5** begins.
+
+A scratch copy with a separate instrumentation plugin passed the same checks
+while recording only the key names and value types of real plugin events and
+`session.get`/`session.context` results. Every event type it produced carried
+every field the adapter reads. `session.execution.*` and `session.deleted`
+carried no location. No `session.status` event reached the plugin; a provider
+retry arrived as `session.retry.scheduled`, which the adapter does not consume.
+`form.replied` and `session.inbox.cancelled` were not produced. The contract
+files listed above exist at tag `v2.2.5`. This run exercised them, but their
+source was not re-read.
+
+## Re-run after the late-event and cleanup fixes — 2026-11-06
+
+The 2026-11-05 run above used an older adapter and an older script. Since then,
+a late invalidating event for an already deleted session no longer cancels the
+root completions that the same location has armed for its other sessions. The
+script now sends the DELETE for every observed shell, even after one fails,
+stops waiting for a server that was killed by a signal, and releases each
+fixture FIFO before it removes the tree.
+
+Run with the same `--binary /opt/homebrew/bin/opencode` (`opencode v2.2.5`) on
+adapter SHA-256
+`2fbcd91d0ac24441f388a1686393a62b4a2363ad45858b5ed4009a83175ac5ff` and script
+SHA-256 `38c8b7cce042f8ab81e28bf8f9d59b41863c8734288a42e1d58b47c72cfe8303`, the
+check passed in each of 2 consecutive runs. Two earlier runs on the same
+adapter, before the signal case was added to the script, also passed:
+
+- All five categorical PASS checks succeeded, and every count listed for
+  2026-11-05 was unchanged.
+- Each run exited zero. Afterwards no `agent-notify-v2-smoke.*` tree remained
+  under the temporary root, and no fixture server or `/bin/cat` process from
+  the run was still running.
+- No scenario deletes a session, so these runs do not exercise the adapter fix.
+  The controlled adapter suite (126 tests) covers it. Nor did they exercise the
+  release of a reader left blocked by a server that exited or was killed
+  without cleanup; scratch reproductions with a fake server covered both. The
+  notifier, Claude hook, and installer suites also passed.

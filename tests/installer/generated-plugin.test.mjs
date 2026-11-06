@@ -30,7 +30,7 @@ const stream = {
 let subscriptions = 0;
 let contextCalls = 0;
 const ctx = {
-  location: { directory: "/tmp/not-the-event-project" },
+  location: { directory: "/tmp/generated-plugin" },
   event: {
     subscribe() { subscriptions += 1; return stream; },
   },

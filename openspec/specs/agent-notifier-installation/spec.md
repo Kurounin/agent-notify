@@ -24,7 +24,7 @@ The installer SHALL detect the required macOS tools, supported client versions, 
 - **THEN** it SHALL report an unsupported version before credential collection or managed-file mutation and SHALL NOT generate a V1 fallback
 
 #### Scenario: OpenCode version output has an unsupported suffix
-- **WHEN** preflight or dry-run receives a malformed/additionally suffixed OpenCode version token such as `opencode v2.0.27.1` or `opencode v2.0.27-rc.1`
+- **WHEN** preflight or dry-run receives a malformed/additionally suffixed OpenCode version token such as `opencode v2.2.5.1` or `opencode v2.2.5-rc.1`
 - **THEN** it SHALL reject the complete token before credential collection or mutation rather than accept a supported numeric prefix
 
 ### Requirement: Collect and protect Pushover credentials

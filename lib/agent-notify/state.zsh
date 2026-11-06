@@ -566,6 +566,9 @@ agent_notify_recover_stale_lock() {
     agent_notify_external_cleanup_one_fence "$lock_path" || true
     return 1
   fi
+  # A gate also fences a live holder, so only a lock that already looks stale may raise one; the check under the gate stays authoritative.
+  agent_notify_lock_snapshot "$lock_path" || return 1
+  agent_notify_lock_snapshot_is_recoverable "$AGENT_NOTIFY_LOCK_SNAPSHOT_FALLBACK_MODIFIED" || return 1
   gate=$(agent_notify_external_gate_path "$lock_path") || return 1
   (umask 077; /bin/mkdir "$gate") 2>/dev/null || return 1
   local now gate_token gate_inode

@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import plugin, * as pluginModule from "../../integrations/opencode/agent-notify.js";
-import { assistant, createHarness, deferred, execution, flush, inbox, LocationRouter, native, session,
+import { assistant, createHarness, createHost, deferred, execution, flush, inbox, LocationRouter, native, session,
   shellCreated, shellDeleted, shellExited, status, text } from "./native-harness.js";
 
 const directory = await mkdtemp(join(tmpdir(), "agent-notify-native-"));
@@ -788,8 +788,9 @@ test("same-owner movement preserves a new turn's queued begin behind submitted c
 test("same-owner child movement preserves the queued reset needed after a stalled prior failure", async (t) => {
   const delivery = deferred();
   let failures = 0;
-  const location = { directory: "/work/child" };
-  const h = createHarness(t, { sessions: tree, location, delivery(event) {
+  const location = { directory: "/work/project" };
+  const sessions = { root: session("root", undefined, location.directory), child: session("child", "root", location.directory) };
+  const h = createHarness(t, { sessions, location, delivery(event) {
     return event.event === "failed" && ++failures === 1 ? delivery.promise : Promise.resolve(0);
   } });
   await h.emit(execution("root", "started"), execution("child", "started"), failure("child"),
@@ -804,14 +805,13 @@ test("same-owner child movement preserves the queued reset needed after a stalle
 });
 
 test("a same-owner move invalidates old candidates and queued events, resolving display from session metadata", async (t) => {
-  const sessions = { root: session("root") };
+  const sessions = { root: session("root", undefined, "/work/moved-project") };
   const delivery = deferred();
   const h = createHarness(t, { sessions, location: { directory: "/work/moved-project" },
     delivery(event) { return event.event === "attention" ? delivery.promise : Promise.resolve(0); } });
   await h.emit(execution("root", "started"), permission("root", "asked"), permission("root", "asked", "queued"));
   await h.settle("root");
   await h.scheduler.advanceBy(50);
-  sessions.root = session("root", undefined, "/work/moved-project");
   await h.emit(native("session.moved", "root", { location: { directory: "/work/moved-project" }, projectID: "project" }));
   delivery.resolve(0);
   await flush();
@@ -986,6 +986,276 @@ test("same-owner moves retain live shells and re-resolve pending lookup under cu
   await h.scheduler.advanceBy(50);
   assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
   assert.equal(h.events.at(-1).session_dir, location.directory);
+});
+
+const at = (directory) => ({ location: { directory } });
+const moved = (directory) => native("session.moved", "root", { location: { directory }, projectID: "project" });
+
+test("with several live locations only the session's owner submits each execution", async (t) => {
+  const sessions = { root: session("root", undefined, "/work/a"), child: session("child", "root", "/work/a") };
+  const host = createHost(t, { sessions });
+  const [a, b, c] = ["/work/a", "/work/b", "/work/c"].map((directory) => host.start(at(directory)));
+  await host.emit(execution("root", "started"), native("session.created", "child", { parentID: "root", ...at("/work/a") }),
+    execution("child", "started"), execution("child", "succeeded"), execution("root", "succeeded"));
+  await host.scheduler.advanceBy(50);
+  assert.deepEqual(a.kinds, ["began:root", "reset:child", "completed:root"]);
+  assert.ok(a.events.every((event) => event.session_dir === "/work/a"));
+  assert.deepEqual(b.events, []);
+  assert.deepEqual(c.events, []);
+});
+
+test("attention, clears and failures reaching every instance are submitted only by the owner", async (t) => {
+  const host = createHost(t, { sessions: { root: session("root", undefined, "/work/a") } });
+  const a = host.start(at("/work/a"));
+  const b = host.start(at("/work/b"));
+  await host.emit(execution("root", "started"), permission("root", "asked"), permission("root", "replied"),
+    form("root", "created", "form"), form("root", "cancelled", "form"), failure("root"));
+  assert.deepEqual(a.kinds, ["began:root", "attention:root", "attention-cleared:root", "attention:root",
+    "attention-cleared:root", "failed:root"]);
+  assert.deepEqual(b.events, []);
+});
+
+test("a location started while the owner's second shell runs reports no early completion", async (t) => {
+  const host = createHost(t, { sessions: { root: session("root", undefined, "/work/a") } });
+  const a = host.start(at("/work/a"));
+  await host.emit(execution("root", "started"), shellCreated("sh_one", "root"), shellCreated("sh_two", "root"),
+    execution("root", "succeeded"));
+  const b = host.start(at("/work/b"));
+  await host.emit(shellExited("sh_one"), execution("root", "started"), execution("root", "succeeded"));
+  await host.scheduler.advanceBy(1000);
+  assert.deepEqual(a.kinds, ["began:root"]);
+  assert.deepEqual(b.events, []);
+  await host.emit(shellExited("sh_two"));
+  await host.scheduler.advanceBy(50);
+  assert.deepEqual(a.kinds, ["began:root", "completed:root"]);
+  assert.deepEqual(b.events, []);
+});
+
+test("a shell of a session at another location does not hold completion for a root here", async (t) => {
+  const sessions = { root: session("root", undefined, "/work/a"), child: session("child", "root", "/work/b"),
+    other: session("other", undefined, "/work/b") };
+  const host = createHost(t, { sessions });
+  const a = host.start(at("/work/a"));
+  const b = host.start(at("/work/b"));
+  await host.emit(execution("root", "started"), shellCreated("sh_child", "child"), shellCreated("sh_other", "other"),
+    execution("root", "succeeded"));
+  await host.scheduler.advanceBy(50);
+  assert.deepEqual(a.kinds, ["began:root", "completed:root"]);
+  assert.deepEqual(b.events, []);
+});
+
+test("an idle move hands later turns to the destination; other instances stay silent without new lookups", async (t) => {
+  const sessions = { root: session("root", undefined, "/work/a") };
+  const host = createHost(t, { sessions });
+  const [a, b, c] = ["/work/a", "/work/b", "/work/c"].map((directory) => host.start(at(directory)));
+  await host.emit(execution("root", "started"), execution("root", "succeeded"));
+  await host.scheduler.advanceBy(50);
+  sessions.root = session("root", undefined, "/work/b");
+  await host.emit(moved("/work/b"), execution("root", "started"), execution("root", "succeeded"));
+  await host.scheduler.advanceBy(50);
+  assert.deepEqual(a.kinds, ["began:root", "completed:root"]);
+  assert.deepEqual(b.kinds, ["began:root", "completed:root"]);
+  assert.ok(b.events.every((event) => event.session_dir === "/work/b"));
+  assert.deepEqual(c.events, []);
+  assert.equal(c.getRequests.length, 1);
+});
+
+test("a move during a running turn completes that turn nowhere; the next turn notifies from the destination", async (t) => {
+  const sessions = { root: session("root", undefined, "/work/a") };
+  const host = createHost(t, { sessions });
+  const a = host.start(at("/work/a"));
+  const b = host.start(at("/work/b"));
+  await host.emit(execution("root", "started"));
+  sessions.root = session("root", undefined, "/work/b");
+  await host.emit(moved("/work/b"), execution("root", "succeeded"));
+  await host.scheduler.advanceBy(1000);
+  assert.deepEqual(a.kinds, ["began:root"]);
+  assert.deepEqual(b.events, []);
+  await host.emit(execution("root", "started"), execution("root", "succeeded"));
+  await host.scheduler.advanceBy(50);
+  assert.deepEqual(a.kinds, ["began:root"]);
+  assert.deepEqual(b.kinds, ["began:root", "completed:root"]);
+  assert.ok(b.events.every((event) => event.session_dir === "/work/b"));
+});
+
+test("a move that reaches the destination before its first lookup resolves lets the destination complete that turn", async (t) => {
+  let where = "/work/a";
+  const lookup = deferred();
+  let stall = true;
+  const host = createHost(t);
+  const a = host.start({ ...at("/work/a"), getSession: (id) => session(id, undefined, where) });
+  const b = host.start({ ...at("/work/b"), getSession: async (id) => {
+    if (stall) { stall = false; await lookup.promise; }
+    return session(id, undefined, where);
+  } });
+  await host.emit(execution("root", "started"));
+  where = "/work/b";
+  await host.emit(moved("/work/b"));
+  lookup.resolve();
+  await flush();
+  await host.emit(execution("root", "succeeded"));
+  await host.scheduler.advanceBy(1000);
+  assert.deepEqual(a.kinds, ["began:root"]);
+  assert.deepEqual(b.kinds, ["began:root", "completed:root"]);
+  assert.ok(b.events.every((event) => event.session_dir === "/work/b"));
+});
+
+test("disposing the owning location mid-turn completes that turn nowhere; the next turn notifies normally", async (t) => {
+  const host = createHost(t, { sessions: { root: session("root", undefined, "/work/a") } });
+  const a = host.start(at("/work/a"));
+  const b = host.start(at("/work/b"));
+  await host.emit(execution("root", "started"));
+  a.cleanup();
+  await host.emit(execution("root", "succeeded"));
+  await host.scheduler.advanceBy(1000);
+  assert.deepEqual(a.kinds, ["began:root"]);
+  assert.deepEqual(b.events, []);
+  const restarted = host.start(at("/work/a"));
+  await host.emit(execution("root", "started"), execution("root", "succeeded"));
+  await host.scheduler.advanceBy(50);
+  assert.deepEqual(restarted.kinds, ["began:root", "completed:root"]);
+  assert.deepEqual(a.kinds, ["began:root"]);
+  assert.deepEqual(b.events, []);
+});
+
+test("a child at another location notifies from there and does not hold its root's completion", async (t) => {
+  const sessions = { root: session("root", undefined, "/work/a"), child: session("child", "root", "/work/b") };
+  const host = createHost(t, { sessions });
+  const a = host.start(at("/work/a"));
+  const b = host.start(at("/work/b"));
+  await host.emit(execution("root", "started"), execution("child", "started"), permission("child", "asked"),
+    execution("root", "succeeded"));
+  await host.scheduler.advanceBy(50);
+  await host.emit(failure("child"));
+  assert.deepEqual(a.kinds, ["began:root", "completed:root"]);
+  assert.deepEqual(b.kinds, ["reset:child", "attention:child", "failed:child"]);
+  assert.ok(b.events.every((event) => event.session_dir === "/work/b"));
+});
+
+for (const [label, location] of [["none", undefined], ["a relative directory", { directory: "work/a" }]]) {
+  test(`an instance without usable location identity (${label}) acts on every session and relinquishes a move`, async (t) => {
+    const sessions = { root: session("root", undefined, "/work/a") };
+    const h = createHarness(t, { sessions, location });
+    await h.complete("root");
+    assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+    sessions.root = session("root", undefined, "/work/b");
+    await h.emit(moved("/work/b"));
+    await h.complete("root");
+    assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+  });
+}
+
+for (const [label, getSession] of [["fails", () => { throw new Error("private lookup error"); }],
+  ["has no usable location", (id) => ({ id, location: {} })]]) {
+  test(`when a lookup ${label} after a location-bearing event, every instance submits by fallback`, async (t) => {
+    const host = createHost(t, { getSession });
+    const a = host.start(at("/work/a"));
+    const b = host.start(at("/work/b"));
+    await host.emit(native("session.status", "root", { status: { type: "busy" } }, at("/work/a")),
+      execution("root", "started"), execution("root", "succeeded"));
+    await host.scheduler.advanceBy(50);
+    for (const h of [a, b]) {
+      assert.deepEqual(h.kinds, ["began:root", "completed:root"]);
+      assert.ok(h.events.every((event) => event.session_dir === "/work/a"));
+    }
+  });
+
+  test(`when a lookup ${label} with no known location, no instance submits or uses its own location`, async (t) => {
+    const host = createHost(t, { getSession });
+    const a = host.start(at("/work/a"));
+    const b = host.start(at("/work/b"));
+    await host.emit(execution("root", "started"), permission("root", "asked"), execution("root", "succeeded"),
+      status("root", "idle"));
+    await host.scheduler.advanceBy(50);
+    assert.deepEqual(a.events, []);
+    assert.deepEqual(b.events, []);
+  });
+}
+
+test("instances sharing a directory each act when lookups do not identify a workspace", async (t) => {
+  const host = createHost(t, { sessions: { root: session("root", undefined, "/work/shared") } });
+  const a = host.start({ location: { directory: "/work/shared", workspaceID: "wrk_a" } });
+  const b = host.start({ location: { directory: "/work/shared", workspaceID: "wrk_b" } });
+  await host.emit(execution("root", "started"), execution("root", "succeeded"));
+  await host.scheduler.advanceBy(50);
+  assert.deepEqual(a.kinds, ["began:root", "completed:root"]);
+  assert.deepEqual(b.kinds, ["began:root", "completed:root"]);
+});
+
+test("a foreign session costs one lookup until deletion, and its late events after deletion are ignored", async (t) => {
+  const sessions = { root: session("root", undefined, "/work/a") };
+  const host = createHost(t, { getSession(id) {
+    if (!sessions[id]) throw new Error("deleted session");
+    return sessions[id];
+  } });
+  const a = host.start(at("/work/a"));
+  const b = host.start(at("/work/b"));
+  await host.emit(execution("root", "started"), status("root", "busy"), permission("root", "asked"),
+    permission("root", "replied"), shellCreated("sh_one", "root"), shellExited("sh_one"), execution("root", "succeeded"),
+    status("root", "idle"));
+  await host.scheduler.advanceBy(50);
+  assert.equal(b.getRequests.length, 1);
+  delete sessions.root;
+  await host.emit(native("session.deleted", "root"), { ...failure("root"), ...at("/work/a") });
+  await host.scheduler.advanceBy(50);
+  assert.equal(b.getRequests.length, 1);
+  assert.deepEqual(b.events, []);
+  assert.deepEqual(a.kinds, ["began:root", "attention:root", "attention-cleared:root", "completed:root", "reset:root"]);
+  // Reusing the ID shows deletion cleared the negative cache: one fresh lookup, then none.
+  sessions.root = session("root", undefined, "/work/a");
+  await host.emit(native("session.created", "root", at("/work/a")), execution("root", "started"));
+  assert.equal(b.getRequests.length, 2);
+  assert.deepEqual(b.events, []);
+  assert.equal(a.kinds.at(-1), "began:root");
+});
+
+for (const [label, late] of [["started", (id) => execution(id, "started")], ["interrupted", (id) => execution(id, "interrupted")],
+  ["failed", (id) => failure(id)], ["busy", (id) => status(id, "busy")], ["enqueued", (id) => inbox(id, "enqueued", "inb_late")]]) {
+  test(`a late ${label} after deletion leaves every instance's pending root completion armed`, async (t) => {
+    const sessions = { moving: session("moving", undefined, "/work/a"), foreign: session("foreign", undefined, "/work/c"),
+      ra: session("ra", undefined, "/work/a"), rc: session("rc", undefined, "/work/c") };
+    const host = createHost(t, { getSession(id) {
+      if (!sessions[id]) throw new Error("deleted session");
+      return sessions[id];
+    } });
+    const a = host.start(at("/work/a"));
+    const c = host.start(at("/work/c"));
+    await host.emit(execution("moving", "started"), execution("moving", "succeeded"),
+      execution("foreign", "started"), execution("foreign", "succeeded"));
+    await host.scheduler.advanceBy(50);
+    sessions.moving = session("moving", undefined, "/work/c");
+    await host.emit(native("session.moved", "moving", { location: { directory: "/work/c" }, projectID: "project" }));
+    // A has relinquished both sessions (one moved away, one never local); C owns both.
+    for (const id of ["moving", "foreign"]) {
+      await host.emit(execution("ra", "started"), execution("ra", "succeeded"),
+        execution("rc", "started"), execution("rc", "succeeded"));
+      delete sessions[id];
+      await host.emit(native("session.deleted", id), late(id));
+      await host.scheduler.advanceBy(50);
+    }
+    assert.deepEqual(a.kinds, ["began:moving", "completed:moving", "began:ra", "completed:ra", "began:ra", "completed:ra"]);
+    assert.deepEqual(c.kinds, ["began:foreign", "completed:foreign", "began:rc", "reset:moving", "completed:rc",
+      "began:rc", "reset:foreign", "completed:rc"]);
+  });
+}
+
+test("a begin queued before a lookup relinquished its session is not revived when the session moves here", async (t) => {
+  let lookups = 0;
+  const stalled = deferred();
+  const h = createHarness(t, { location: { directory: "/work/b" },
+    getSession(id) {
+      lookups += 1;
+      if (lookups <= 2) throw new Error("lookup unavailable");
+      return session(id, undefined, lookups === 3 ? "/work/a" : "/work/b");
+    },
+    delivery: (event) => event.event === "attention" ? stalled.promise : Promise.resolve(0) });
+  await h.emit({ ...permission("root", "asked", "r1"), ...at("/work/a") }, execution("root", "started"));
+  await h.emit(permission("root", "replied", "r1"));
+  await h.emit(moved("/work/b"));
+  stalled.resolve(0);
+  await h.scheduler.advanceBy(50);
+  assert.equal(lookups, 4);
+  assert.deepEqual(h.kinds, ["attention:root"]);
 });
 
 for (const stop of ["cleanup", "end", "error"]) {

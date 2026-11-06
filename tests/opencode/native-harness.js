@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
 import plugin from "../../integrations/opencode/agent-notify.js";
 
-// Sanitized structural fixtures pinned to OpenCode v2.0.27 packages/schema/src/
+// Sanitized structural fixtures written from OpenCode v2.0.27 packages/schema/src/
 // {event,session-event,session-status-event,session,permission,form,session-message,session-error,shell}.ts.
+// On 2026-11-05 their key shapes were compared with a real 2.2.5 run's events and session.get/context
+// results: each event type the run produced had every field the adapter reads. The run emitted no
+// session.status, form.replied, or session.inbox.cancelled, and its session.execution.* and
+// session.deleted events carried no location.
 let nextEventID = 0;
 export function native(type, sessionID, data = {}, extra = {}) {
   return { id: `evt_fixture_${++nextEventID}`, created: 0, type,
@@ -95,8 +99,9 @@ export class EventStream {
   };
 }
 
-// The pinned bus snapshots routes: a move reaches both owners, later events only
-// the destination. The public envelope may still carry the old location.
+// Narrower routing than OpenCode 2.2.5, which delivers every session's events to every
+// live instance: here a move reaches both owners and later events only the destination.
+// The public envelope may still carry the old location.
 export class LocationRouter {
   observers = [];
   owners = new Map();
@@ -124,8 +129,7 @@ export class LocationRouter {
 }
 
 export function createHarness(t, { sessions = {}, getSession, contexts = {}, getContext, delivery,
-  definition = plugin, scheduler = new FakeScheduler(), stream = new EventStream(),
-  location = { directory: "/wrong/plugin-instance" } } = {}) {
+  definition = plugin, scheduler = new FakeScheduler(), stream = new EventStream(), location } = {}) {
   const calls = [];
   const getRequests = [];
   const contextRequests = [];
@@ -146,7 +150,7 @@ export function createHarness(t, { sessions = {}, getSession, contexts = {}, get
   globalThis.setTimeout = scheduler.schedule;
   globalThis.clearTimeout = scheduler.clear;
   const ctx = {
-    app: { version: "2.0.27" }, location, options: {},
+    app: { version: "2.2.5" }, location, options: {},
     event: { subscribe: stream.subscribe },
     session: {
       get(input) {
@@ -179,5 +183,25 @@ export function createHarness(t, { sessions = {}, getSession, contexts = {}, get
     async emit(...events) { for (const event of events) { stream.push(event); await flush(); } },
     async settle(id) { await this.emit(execution(id, "succeeded")); },
     async complete(id) { await this.emit(execution(id, "started")); await this.settle(id); await scheduler.advanceBy(50); },
+  };
+}
+
+// OpenCode 2.2.5 delivers every session's events, including location-free
+// session.execution.*, to every live plugin instance.
+export function createHost(t, shared = {}) {
+  const scheduler = new FakeScheduler();
+  const instances = [];
+  return { scheduler, instances,
+    start(options = {}) {
+      const instance = createHarness(t, { ...shared, ...options, scheduler });
+      instances.push(instance);
+      return instance;
+    },
+    async emit(...events) {
+      for (const event of events) {
+        for (const instance of instances) instance.stream.push(event);
+        await flush();
+      }
+    },
   };
 }

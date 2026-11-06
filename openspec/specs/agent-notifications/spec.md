@@ -126,7 +126,7 @@ Neither accepted nor rejected raw tmux names, `TMUX` or `TMUX_PANE`, pane or soc
 ### Requirement: Keep notifier event processing live under abandoned housekeeping locks
 The notifier SHALL process the current event before retention cleanup and SHALL treat cleanup as best-effort work that does not wait for a global prune lock or a locked session record. It SHALL rate-limit and batch full retention scans, SHALL rotate bounded passes so persistently locked records cannot permanently starve later records, and SHALL preserve the existing retention and maximum-active-age rules. Every lock mutation SHALL be restricted to a validated non-symlink lock directly under the canonical state directory.
 
-Each acquired lock SHALL carry a unique ownership token. Stale-lock recovery SHALL derive a canonical recovery gate directly in that state directory, acquire a unique reaper token for that gate before the stale-lock snapshot, and use unique gate- or lock-quarantine containers as hard fences. Before and after moving a canonical gate or lock, recovery SHALL verify owned-container and moved-object identity, including the applicable inode and owner/reaper snapshot. A process SHALL NOT remove a replacement gate, quarantine, or lock with mismatched identity. Normal acquisition, callback execution, and owned-lock cleanup SHALL honor canonical gates and quarantine fences.
+Each acquired lock SHALL carry a unique ownership token. Stale-lock recovery SHALL raise a recovery gate only after a read-only check finds the lock recoverable under the rules below, so a lock that check finds young or live does not raise one. It SHALL then derive a canonical recovery gate directly in that state directory, acquire a unique reaper token for that gate before the authoritative stale-lock snapshot, and use unique gate- or lock-quarantine containers as hard fences. Before and after moving a canonical gate or lock, recovery SHALL verify owned-container and moved-object identity, including the applicable inode and owner/reaper snapshot. A process SHALL NOT remove a replacement gate, quarantine, or lock with mismatched identity. Normal acquisition, callback execution, and owned-lock cleanup SHALL honor canonical gates and quarantine fences.
 
 Recovery cleanup SHALL handle no more than one stale gate or quarantine per attempt. It SHALL preserve a valid live gate or quarantine reaper regardless of its age. A dead, ownerless, malformed, unreadable, or empty gate or quarantine container SHALL be recoverable only when its newest relevant filesystem metadata is older than the configured stale-lock interval. A valid lock owner remains authoritative while its process is live; absent or malformed lock ownership uses the same conservative age rule. These guarantees apply to cooperative `agent-notify` processes that treat owned unique quarantines as immutable.
 
@@ -147,6 +147,14 @@ The notifier SHALL serialize the current session's read, eligibility decision, d
 #### Scenario: A newly-created lock has not published its owner
 - **WHEN** a lock directory has no readable valid owner metadata but is younger than the configured stale-lock interval
 - **THEN** the notifier SHALL NOT remove it
+
+#### Scenario: A contender finds a lock that is not stale
+- **WHEN** a process fails to acquire a session lock that is younger than the configured stale-lock interval or has valid live ownership
+- **THEN** it SHALL NOT raise a recovery gate, and the holder SHALL keep its lock, finish its callback, and remove its lock
+
+#### Scenario: Processes contend for one session
+- **WHEN** several notifier processes submit events for one session at the same time, within the current-session lock bound
+- **THEN** each event SHALL be applied and no lock directory SHALL remain
 
 #### Scenario: A live recovery gate is present
 - **WHEN** a stale lock has a canonical recovery gate with a valid reaper whose process is live
@@ -563,18 +571,18 @@ The adapter SHALL track observed `session.inbox.enqueued` items by `data.session
 - **AND** after relevant shells and other observed work settle it SHALL reconsider one completion through the normal quiescence path
 
 ### Requirement: Declare supported integration compatibility
-The repository SHALL declare supported macOS, Claude Code, and OpenCode ranges, identify the exact version used for real OpenCode verification, and declare the native permission/form event family. OpenCode support SHALL be `>= 2.0.27, < 2.3.0`, with 2.0.27 as the runtime-verified baseline; V1 and earlier V2 releases SHALL NOT be supported. Accepting a version range SHALL NOT be described as runtime-testing every accepted release, and a verification baseline SHALL NOT be described as runtime-verified before successful real-host checks. macOS and Claude compatibility parsing/policy SHALL remain unchanged. Before collecting credentials or performing mutation, the installer SHALL verify clients satisfy this policy and abort without changes for unsupported or unparseable versions. OpenCode preflight SHALL validate the complete announced version token, accepting the normal label and optional `v` prefix, and SHALL NOT accept malformed or unsupported suffixes/additional components by extracting a numeric prefix. Prerelease/build suffixes unsupported by the existing numeric version policy SHALL be rejected.
+The repository SHALL declare supported macOS, Claude Code, and OpenCode ranges, identify the exact version used for real OpenCode verification, and declare the native permission/form event family. OpenCode support SHALL be `>= 2.2.5, < 2.3.0`, with 2.2.5 as the runtime-verified baseline; V1 and earlier V2 releases SHALL NOT be supported. Accepting a version range SHALL NOT be described as runtime-testing every accepted release, and a verification baseline SHALL NOT be described as runtime-verified before successful real-host checks. macOS and Claude compatibility parsing/policy SHALL remain unchanged. Before collecting credentials or performing mutation, the installer SHALL verify clients satisfy this policy and abort without changes for unsupported or unparseable versions. OpenCode preflight SHALL validate the complete announced version token, accepting the normal label and optional `v` prefix, and SHALL NOT accept malformed or unsupported suffixes/additional components by extracting a numeric prefix. Prerelease/build suffixes unsupported by the existing numeric version policy SHALL be rejected.
 
 #### Scenario: An installed client is unsupported
 - **WHEN** the installer cannot verify a supported Claude Code or OpenCode version
 - **THEN** it SHALL report incompatibility and SHALL NOT collect credentials or modify the environment
 
 #### Scenario: OpenCode V1 or an earlier V2 release is present
-- **WHEN** the installed OpenCode is below 2.0.27
+- **WHEN** the installed OpenCode is below 2.2.5
 - **THEN** compatibility validation and installation SHALL reject it without offering a legacy adapter fallback
 
 #### Scenario: OpenCode is in the supported patch line
-- **WHEN** a parseable OpenCode version is at least 2.0.27 and less than 2.3.0, including 2.1.0 and 2.2.1
+- **WHEN** a parseable OpenCode version is at least 2.2.5 and less than 2.3.0, including 2.2.5 and 2.2.9
 - **THEN** version-policy validation SHALL accept it while documentation separately identifies the version actually runtime-verified
 
 #### Scenario: OpenCode is in a later minor line
@@ -582,15 +590,15 @@ The repository SHALL declare supported macOS, Claude Code, and OpenCode ranges, 
 - **THEN** the compatibility policy SHALL reject it until support is deliberately expanded with evidence
 
 #### Scenario: OpenCode reports its installed version with a label
-- **WHEN** the installed client reports `opencode v2.0.27` or `opencode v2.2.1`
+- **WHEN** the installed client reports `opencode v2.2.5` or `opencode v2.2.9`
 - **THEN** preflight SHALL validate the complete version token and accept it under the supported range
 
 #### Scenario: OpenCode reports its installed version without a label
-- **WHEN** the installed client reports `v2.2.1` or `2.2.1`
+- **WHEN** the installed client reports `v2.2.9` or `2.2.9`
 - **THEN** preflight, including dry-run, SHALL accept it under the supported range
 
 #### Scenario: OpenCode reports an unsupported version token suffix
-- **WHEN** OpenCode reports `opencode v2.0.27.1`, `opencode v2.0.27-rc.1`, `opencode v2.2.1.1`, `opencode v2.2.1-rc.1`, or a version token with build metadata
+- **WHEN** OpenCode reports `opencode v2.2.5.1`, `opencode v2.2.5-rc.1`, `opencode v2.2.9.1`, `opencode v2.2.9-rc.1`, or a version token with build metadata
 - **THEN** preflight, including dry-run, SHALL reject that complete token before credential collection or mutation rather than accept its numeric prefix
 
 ### Requirement: Normalize native OpenCode permission and form attention
@@ -626,3 +634,62 @@ Native setup SHALL return cleanup without awaiting the event stream's lifetime. 
 #### Scenario: Plugin setup observes malformed data
 - **WHEN** an event has invalid native identifiers, wrong nesting, or unusable session context
 - **THEN** the adapter SHALL ignore or safely omit that event while continuing valid observation without exposing its raw payload
+
+### Requirement: Route OpenCode session handling to the owning location
+When a session lookup returns a location whose directory differs from the plugin instance's own, that instance SHALL take no lifecycle action for the session and SHALL submit no notifier events for it, so one host event produces one submission from the owning location. A moved session SHALL change owner with its location. When ownership cannot be determined, the existing per-session rules SHALL apply.
+
+#### Scenario: Several locations are live
+- **WHEN** two or more live locations' plugin instances receive the same session's execution events
+- **THEN** only the instance at that session's location SHALL submit, producing one `began`, one child `reset`, and one `completed` for each corresponding execution
+
+#### Scenario: Attention and terminal events reach every instance
+- **WHEN** permission, form, or terminal events for a session reach several live instances
+- **THEN** only the instance at that session's location SHALL submit attention, attention-cleared, or failed events
+
+#### Scenario: A location starts during a running turn
+- **WHEN** a plugin instance starts at a different location while a session's turn is running and that session's owner has a shell keeping completion deferred
+- **THEN** the new instance SHALL submit nothing and SHALL NOT report an early completion
+
+#### Scenario: Another location's shell is running
+- **WHEN** a session at another location has a running shell
+- **THEN** that shell SHALL NOT hold completion for a root at this instance's location
+
+#### Scenario: An idle session moves
+- **WHEN** an idle session moves from one location to another and later runs a turn
+- **THEN** the destination instance SHALL submit that turn's events and the outgoing and other instances SHALL submit none
+
+#### Scenario: A session moves during a running turn
+- **WHEN** a session moves during a running turn while two or more locations are live, and the destination instance has already determined that the session belonged to another location
+- **THEN** no instance SHALL submit `completed` for that turn, and the session's next turn SHALL notify normally from its new location
+
+#### Scenario: A move reaches the destination before its lookup resolves
+- **WHEN** a session moves during a running turn and the move reaches the destination instance while its lookup for that turn's earlier events is still pending
+- **THEN** the destination MAY treat the turn as its own and submit a second `began` and that turn's `completed`, and the session's next turn SHALL notify normally from its new location
+
+#### Scenario: The owning location is disposed during a turn
+- **WHEN** the session's owning location is disposed during a running turn
+- **THEN** other instances SHALL NOT submit `completed` for that turn, and the session's next turn SHALL notify normally
+
+#### Scenario: A child runs at another location
+- **WHEN** a child session's location differs from its root's location
+- **THEN** the child's events SHALL be submitted from the child's location and SHALL NOT hold completion at the root's location
+
+#### Scenario: The instance has no usable location identity
+- **WHEN** a plugin instance's own location is unusable
+- **THEN** it SHALL continue to act on sessions under the existing rules, including relinquishing a session that moves
+
+#### Scenario: A session lookup fails after a location is known
+- **WHEN** a session lookup fails or returns no usable location, and the instance has usable directory context from an earlier event
+- **THEN** that instance SHALL submit under the existing per-session fallback rules, even if another instance also submits
+
+#### Scenario: A session lookup fails with no known location
+- **WHEN** a session lookup fails or returns no usable location, and the instance has no usable directory context
+- **THEN** that instance SHALL omit the event, and SHALL NOT use its own location as the session directory
+
+#### Scenario: Instances share a directory
+- **WHEN** instances share a directory and session lookups do not identify a workspace
+- **THEN** each SHALL treat the session as its own rather than risk losing its events
+
+#### Scenario: Later events arrive for a session at another location
+- **WHEN** an instance has determined that a session belongs to another location and more of that session's events arrive
+- **THEN** it SHALL ignore them without another lookup until the session moves to this instance's location or is deleted

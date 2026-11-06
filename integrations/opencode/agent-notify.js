@@ -288,6 +288,19 @@ function setupAdapter(ctx) {
     return !stopped && !deleted.has(sessionID) && !departed.has(sessionID) && ownership.get(sessionID) === token;
   }
 
+  // Session lookups omit workspaceID, so instances sharing a directory each keep acting rather than risk loss.
+  function ownedElsewhere(details) {
+    return Boolean(instanceLocation && details?.directory && details.directory !== instanceLocation.directory);
+  }
+
+  // Every live instance keeps receiving a relinquished session's events; departed drops them without a lookup.
+  function relinquish(id) {
+    departed.add(id);
+    sessions.delete(id);
+    for (const [shellID, sessionID] of shells) if (sessionID === id) shells.delete(shellID);
+    for (const queued of queuedControls) if (queued.event.session_id === id) queuedControls.delete(queued);
+  }
+
   function validRelationship(id, metadata) {
     if (!metadata?.relationship) return false;
     let ancestor = metadata.parentID;
@@ -507,6 +520,10 @@ function setupAdapter(ctx) {
   function reduce(event, token, details) {
     const id = event.sessionID;
     if (!validOwner(id, token)) return;
+    if (event.kind !== "moved" && ownedElsewhere(details)) {
+      relinquish(id);
+      return;
+    }
     if (event.kind === "moved" && !sameLocation(details?.location, event.nativeLocation)) details = undefined;
     const session = recordMetadata(event, details);
     if (!session) return;
@@ -563,6 +580,12 @@ function setupAdapter(ctx) {
     }
     const id = normalized.sessionID;
     if (departed.has(id) && normalized.kind !== "moved") {
+      if (normalized.kind === "deleted") {
+        // The owner resets the notifier; here deletion only ends the cache and rejects late events.
+        departed.delete(id);
+        deleted.add(id);
+        return;
+      }
       if (normalized.kind !== "created" || !sameLocation(normalized.nativeLocation, instanceLocation)) return;
       departed.delete(id);
     }
@@ -577,7 +600,8 @@ function setupAdapter(ctx) {
       (normalized.kind === "status" && ["busy", "retry"].includes(normalized.status)) ||
       (normalized.kind === "enqueued" && !observedInbox?.has(normalized.requestID)) ||
       (["delivered", "cancelled"].includes(normalized.kind) && observedInbox?.get(normalized.requestID) === "pending");
-    if (invalidating) invalidate(id);
+    // A deleted ID has no tree here; invalidating it as unknown would cancel every root with no drain to re-arm them.
+    if (invalidating && !deleted.has(id)) invalidate(id);
     if (normalized.kind === "deleted") {
       const directory = sessions.get(id)?.directory ?? normalized.directory;
       ownership.set(id, {});
@@ -601,12 +625,8 @@ function setupAdapter(ctx) {
       const previousToken = ownership.get(id);
       ownership.set(id, {});
       if (!sameLocation(normalized.nativeLocation, instanceLocation)) {
-        // The bus sends this move to both owners, but future events reach only the destination.
         // Drop outgoing observation, not just its candidate token: old success cannot be re-armed.
-        departed.add(id);
-        sessions.delete(id);
-        for (const [shellID, sessionID] of shells) if (sessionID === id) shells.delete(shellID);
-        for (const queued of queuedControls) if (queued.event.session_id === id) queuedControls.delete(queued);
+        relinquish(id);
         drainIntake();
         return;
       }
@@ -675,6 +695,6 @@ function setupAdapter(ctx) {
   return cleanup;
 }
 
-// Plugin.define is an identity helper in 2.0.27; the loader accepts this native definition.
+// A real 2.2.5 loader accepted this plain native definition, without Plugin.define, on 2026-11-05.
 // Keep one default export and one installed file, with no package installation requirement.
 export default { id: "agent-notify", setup: setupAdapter };

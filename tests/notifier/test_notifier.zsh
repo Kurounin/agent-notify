@@ -662,6 +662,66 @@ AGENT_NOTIFY_NOW=1000000 agent_notify_prune_state_forced || { print -u2 -- 'olde
 AGENT_NOTIFY_STATE_DIR=$saved_state_dir
 AGENT_NOTIFY_PRUNE_BATCH_SIZE=$saved_prune_batch_size
 
+# A contender's gate is removed again before recovery returns, so only a record of the reaper publish shows it was raised.
+typeset gate_reapers="$test_root/gate-reapers" young_contended_lock="$AGENT_NOTIFY_STATE_DIR/young-contended.lock" live_contended_lock="$AGENT_NOTIFY_STATE_DIR/live-contended.lock" live_contended_now=5000 live_contended_owner
+functions -c agent_notify_external_publish_reaper agent_notify_unrecorded_publish_reaper
+agent_notify_external_publish_reaper() {
+  print -r -- "$1" >> "$gate_reapers"
+  agent_notify_unrecorded_publish_reaper "$@"
+}
+/bin/mkdir "$young_contended_lock"
+if AGENT_NOTIFY_NOW=$(/bin/date +%s) agent_notify_recover_stale_lock "$young_contended_lock"; then
+  print -u2 -- 'young ownerless lock was recovered'
+  exit 1
+fi
+[[ ! -e $gate_reapers ]] || { print -u2 -- 'young ownerless lock raised a recovery gate'; exit 1; }
+AGENT_NOTIFY_NOW=$(/bin/date +%s) agent_notify_acquire_mkdir_lock "$young_contended_lock" || { print -u2 -- 'young lock holder could not publish its owner'; exit 1; }
+agent_notify_run_owned_lock "$young_contended_lock" "$REPLY" true || { print -u2 -- 'young lock holder could not finish its callback'; exit 1; }
+[[ ! -e $young_contended_lock ]] || { print -u2 -- 'young lock holder did not remove its lock'; exit 1; }
+/bin/mkdir "$live_contended_lock"
+live_contended_owner="$$ $live_contended_now $(agent_notify_lock_nonce "$live_contended_now")"
+print -r -- "$live_contended_owner" > "$live_contended_lock/owner"
+if AGENT_NOTIFY_NOW=$(( live_contended_now + 1000 )) agent_notify_recover_stale_lock "$live_contended_lock"; then
+  print -u2 -- 'live-owner lock was recovered'
+  exit 1
+fi
+[[ ! -e $gate_reapers ]] || { print -u2 -- 'live-owner lock raised a recovery gate'; exit 1; }
+agent_notify_run_owned_lock "$live_contended_lock" "$live_contended_owner" true || { print -u2 -- 'live lock holder could not finish its callback'; exit 1; }
+[[ ! -e $live_contended_lock ]] || { print -u2 -- 'live lock holder did not remove its lock'; exit 1; }
+source "$root/lib/agent-notify/state.zsh"
+
+typeset lock_contention_diagnostics="$test_root/lock-contention-diagnostics" lock_contention_key lock_contention_state
+typeset -a lock_contention_pids lock_contention_requests lock_contention_leftovers
+integer lock_contention_index lock_contention_pid
+AGENT_NOTIFY_STATE_DIR="$test_root/lock-contention-state"
+agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+# Separate processes, as real events arrive: forked subshells share $$ and RANDOM and would all write one lock token.
+# Each clears its own attention so a lost update stays visible, under the production bound of 20 lock attempts rather than this suite's 100.
+for lock_contention_trial in {1..5}; do
+  lock_contention_key=$(agent_notify_session_key opencode "lock-contention-$lock_contention_trial")
+  lock_contention_state="$AGENT_NOTIFY_STATE_DIR/$lock_contention_key.state"
+  lock_contention_requests=()
+  for lock_contention_index in {1..5}; do
+    lock_contention_requests+=("$(agent_notify_request_key "request-$lock_contention_index"):3000:1")
+  done
+  STATE_ACTIVE=1 STATE_STARTED_AT=3000 STATE_ATTENTIONS=${(j:,:)lock_contention_requests} STATE_LAST_ATTENTION_AT=3000 STATE_TERMINAL='' STATE_UPDATED_AT=3000
+  agent_notify_save_state "$lock_contention_state"
+  lock_contention_pids=()
+  for lock_contention_index in {1..5}; do
+    print -rn -- "{\"source\":\"opencode\",\"kind\":\"attention-cleared\",\"session_id\":\"lock-contention-$lock_contention_trial\",\"session_dir\":\"/tmp/lock-contention\",\"request_id\":\"request-$lock_contention_index\"}" | AGENT_NOTIFY_NOW=3000 AGENT_NOTIFY_LOCK_TIMEOUT_ATTEMPTS=20 AGENT_NOTIFY_DIAGNOSTIC_DIR=$lock_contention_diagnostics AGENT_NOTIFY_KEYCHAIN_RUNTIME_HELPER=/nonexistent "$root/bin/agent-notify" event &
+    lock_contention_pids+=($!)
+  done
+  for lock_contention_pid in $lock_contention_pids; do
+    wait "$lock_contention_pid" || { print -u2 -- 'a contending notifier process failed'; exit 1; }
+  done
+  agent_notify_load_state "$lock_contention_state"
+  [[ $STATE_ACTIVE == 1 && -z $STATE_ATTENTIONS ]] || { print -u2 -- 'contended session events were lost'; exit 1; }
+done
+[[ ! -e $lock_contention_diagnostics ]] || { print -u2 -- 'contended session events wrote diagnostics'; exit 1; }
+lock_contention_leftovers=("$AGENT_NOTIFY_STATE_DIR"/(*.lock|*.recovery-gate|*-quarantine.*|*.tmp)(ND))
+assert_equals "${#lock_contention_leftovers}" 0
+AGENT_NOTIFY_STATE_DIR=$saved_state_dir
+
 typeset event_before_prune_dir="$test_root/event-before-prune-state" event_before_prune_key event_before_prune_marker
 AGENT_NOTIFY_STATE_DIR=$event_before_prune_dir
 event_before_prune_key=$(agent_notify_session_key claude-code event-before-prune)

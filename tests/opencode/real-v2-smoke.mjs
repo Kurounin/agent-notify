@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Opt-in real-host check. No managed-service discovery, live-home writes, or models.
-// Contracts: anomalyco/opencode tag v2.0.27, packages/{cli,core,schema,protocol,ai}.
+// Contracts: anomalyco/opencode tag v2.2.5, packages/{cli,core,schema,protocol,ai}.
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
@@ -11,9 +11,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
-const VERSION = "opencode v2.0.27";
-const TARBALL = "https://registry.npmjs.org/@opencode/cli-darwin-arm64/-/cli-darwin-arm64-2.0.27.tgz";
-const INTEGRITY = "0BAaNYZE5QKve/7EFw9gyTQpkyOdff7Lj8Eul6FwK1vDnkj+yiVt/gdmJZl0PVoexl+6ZhjB7vuUPgSXrRATtA==";
+const VERSION = "opencode v2.2.5";
+const TARBALL = "https://registry.npmjs.org/@opencode/cli-darwin-arm64/-/cli-darwin-arm64-2.2.5.tgz";
+const INTEGRITY = "UwGb2MIJqLSh4wfrkvqNiAohG1Wf5t96Nx7113QvmtCn5LGimmXYN0Tb1chD0mMRRdPvnUguevKRdwM0txZY1Q==";
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
 const MAX_CAPTURE = 32_768;
 let phase = "arguments";
@@ -37,6 +37,16 @@ let shellCommand;
 let shellRequests = 0;
 let shellResultConsumed = false;
 let removeFixtureShells;
+const fixtureFifos = [];
+let liveLocations = 0;
+let locationBaseline;
+let locationParent;
+let locationParentRequests = 0;
+let lateShellCommands;
+let lateShellParent;
+let lateShellRequests = 0;
+let lateShellsConsumed = 0;
+let heldLateCompletions;
 
 function check(value) {
   if (!value) throw new Error("categorical check failed");
@@ -163,6 +173,32 @@ async function listenProvider() {
         reply(response, { text: shellResultConsumed ? "fixture-shell-final" : "fixture-shell-waiting" });
         return;
       }
+      if (prompt.includes("fixture-locations-child")) {
+        reply(response, { text: "fixture-locations-child-result" });
+        return;
+      }
+      if (prompt.includes("fixture-locations-parent")) {
+        locationParentRequests += 1;
+        if (locationParentRequests === 1) {
+          check(input.tools.some((tool) => tool.function?.name === "subagent"));
+          reply(response, { calls: [{ agent: "fixture-child", description: "Fixture foreground child", prompt: "fixture-locations-child", background: false }] });
+          return;
+        }
+        reply(response, { text: "fixture-locations-final" });
+        return;
+      }
+      if (prompt.includes("fixture-late-shells-parent")) {
+        lateShellRequests += 1;
+        if (lateShellRequests === 1) {
+          check(input.tools.some((tool) => tool.function?.name === "shell"));
+          reply(response, { tool: "shell", calls: lateShellCommands.map((command) => ({ command, workdir: path.join(root, "project"), background: true })) });
+          return;
+        }
+        const transcript = JSON.stringify(input.messages);
+        lateShellsConsumed = Math.max(lateShellsConsumed, [1, 2].filter((index) => transcript.includes(`fixture-late-shell-result-${index}`)).length);
+        reply(response, { text: lateShellsConsumed === 2 ? "fixture-late-shells-final" : "fixture-late-shells-waiting" });
+        return;
+      }
       check(prompt.includes("fixture-loader"));
       reply(response, { text: "fixture-loader-complete" });
     } catch {
@@ -224,7 +260,7 @@ async function subscribe(url, headers) {
 }
 
 async function stopServer() {
-  if (!server || server.exitCode !== null) return;
+  if (!server || server.exitCode !== null || server.signalCode !== null) return;
   const exited = new Promise((resolve) => server.once("exit", resolve));
   server.stdin.end();
   if (await Promise.race([exited.then(() => true), delay(5000).then(() => false)])) return;
@@ -232,6 +268,29 @@ async function stopServer() {
   if (await Promise.race([exited.then(() => true), delay(5000).then(() => false)])) return;
   server.kill("SIGKILL");
   await exited;
+}
+
+// A server that dies without its finalizers leaves its detached FIFO readers blocked in open().
+// A writer open and close gives them end-of-file, but on macOS a reader can occasionally miss it
+// when the close races its wakeup, so repeat until ENXIO reports that no reader remains.
+async function releaseFixtureFifos() {
+  let failed = false;
+  for (const fifo of fixtureFifos) {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await (await open(fifo, constants.O_WRONLY | constants.O_NONBLOCK)).close();
+      } catch (error) {
+        if (error.code !== "ENXIO" && error.code !== "ENOENT") failed = true;
+        break;
+      }
+      if (attempt === 100) {
+        failed = true;
+        break;
+      }
+      await delay(20);
+    }
+  }
+  check(!failed);
 }
 
 async function main() {
@@ -242,10 +301,13 @@ async function main() {
   process.umask(0o077);
   root = await realpath(await mkdtemp(path.join(tmpdir(), "opencode/agent-notify-v2-smoke.")));
   const project = path.join(root, "project");
+  const locations = ["location-b", "location-c", "location-d"].map((name) => path.join(root, name));
+  const lateLocation = path.join(root, "location-late");
   for (const directory of ["home", "config/opencode/plugins", "data", "cache", "state", "tmp", "project"])
     await mkdir(path.join(root, directory), { recursive: true, mode: 0o700 });
+  for (const directory of [...locations, lateLocation]) await mkdir(directory, { mode: 0o700 });
   phase = "machine-and-ancestor-isolation";
-  await checkIsolation(project);
+  for (const directory of [project, ...locations, lateLocation]) await checkIsolation(directory);
   const env = {
     PATH: "/usr/bin:/bin:/usr/sbin:/sbin", HOME: path.join(root, "home"),
     XDG_CONFIG_HOME: path.join(root, "config"), XDG_DATA_HOME: path.join(root, "data"),
@@ -260,10 +322,10 @@ async function main() {
     const response = await fetch(TARBALL, { signal: AbortSignal.timeout(120_000) });
     check(response.ok);
     const archive = Buffer.from(await response.arrayBuffer());
-    check(archive.length <= 100_000_000 && createHash("sha512").update(archive).digest("base64") === INTEGRITY);
+    check(archive.length <= 110_000_000 && createHash("sha512").update(archive).digest("base64") === INTEGRITY);
     const archivePath = path.join(root, "binary.tgz");
     await writeFile(archivePath, archive, { mode: 0o600 });
-    check(run("/usr/bin/tar", ["-tzf", archivePath], env, project).trim() === "package/package.json\npackage/bin/opencode");
+    check(run("/usr/bin/tar", ["-tzf", archivePath], env, project).split("\n").includes("package/bin/opencode"));
     run("/usr/bin/tar", ["-xzf", archivePath, "-C", root, "package/bin/opencode"], env, project);
     binary = path.join(root, "package/bin/opencode");
   }
@@ -288,6 +350,10 @@ appendFileSync(file, Buffer.concat([...chunks, Buffer.from("\\n")]), { mode: 0o6
   const shellRelease = path.join(project, "shell-release.fifo");
   run("/usr/bin/mkfifo", ["-m", "600", shellRelease], env, project);
   shellCommand = `/bin/cat ${quote(shellRelease)}`;
+  const lateShellReleases = [1, 2].map((index) => path.join(project, `late-shell-${index}.fifo`));
+  for (const fifo of lateShellReleases) run("/usr/bin/mkfifo", ["-m", "600", fifo], env, project);
+  fixtureFifos.push(shellRelease, ...lateShellReleases);
+  lateShellCommands = lateShellReleases.map((fifo) => `/bin/cat ${quote(fifo)}`);
   await writeFile(stub, `#!/bin/zsh -f\n[[ "$1" == event && "$#" == 1 ]] || exit 1\nexec ${quote(process.execPath)} ${quote(stubModule)}\n`, { mode: 0o700 });
   const pluginPath = path.join(root, "config/opencode/plugins/agent-notify.js");
   run("/usr/bin/osascript", ["-l", "JavaScript", path.join(REPO, "installer/opencode-plugin.jxa"),
@@ -298,7 +364,8 @@ appendFileSync(file, Buffer.concat([...chunks, Buffer.from("\\n")]), { mode: 0o6
   const config = {
     update: "disable", snapshots: false, model: "fixture/fixture", default_agent: "fixture-primary",
     permissions: [{ action: "*", resource: "*", effect: "deny" }, { action: "subagent", resource: "fixture-child", effect: "allow" },
-      { action: "shell", resource: shellCommand, effect: "allow" }],
+      { action: "shell", resource: shellCommand, effect: "allow" },
+      ...lateShellCommands.map((command) => ({ action: "shell", resource: command, effect: "allow" }))],
     experimental: { policies: [{ action: "provider.use", resource: "*", effect: "deny" }, { action: "provider.use", resource: "fixture", effect: "allow" }] },
     providers: { fixture: { package: "@opencode/ai/providers/openai-compatible", settings: { baseURL: `http://127.0.0.1:${providerPort}/v1` },
       models: { fixture: { name: "Fixture", capabilities: { tools: true, input: ["text"], output: ["text"] }, limit: { context: 128000, output: 2048 } } } } },
@@ -329,14 +396,19 @@ appendFileSync(file, Buffer.concat([...chunks, Buffer.from("\\n")]), { mode: 0o6
     return Object.hasOwn(value, "data") ? value.data : value;
   };
   removeFixtureShells = async () => {
+    let failed = false;
     for (const id of shellStates.keys())
-      await api(`/api/shell/${encodeURIComponent(id)}?${new URLSearchParams({ "location[directory]": project })}`, "DELETE");
+      await api(`/api/shell/${encodeURIComponent(id)}?${new URLSearchParams({ "location[directory]": project })}`, "DELETE")
+        .catch(() => { failed = true; });
+    check(!failed);
   };
-  check((await api("/api/info")).version === "2.0.27");
-  const plugins = () => api(`/api/plugin?${new URLSearchParams({ "location[directory]": project })}`);
+  check((await api("/api/info")).version === "2.2.5");
+  // Querying a directory's plugin inventory starts that location and its plugin instance.
+  const plugins = (directory = project) => api(`/api/plugin?${new URLSearchParams({ "location[directory]": directory })}`);
   const active = (inventory) => inventory.find((plugin) => plugin.id === "agent-notify");
   phase = "native-loader-id-and-source";
   await waitFor(async () => Boolean(active(await plugins())));
+  liveLocations = 1;
   const loaded = active(await plugins());
   if (loaded?.state.status !== "active" || loaded.source.type !== "local" || loaded.source.path !== pluginPath)
     console.error(`CHECK real-v2-smoke: plugin-present=${Boolean(loaded)} plugin-active=${loaded?.state.status === "active"} local-source=${loaded?.source.type === "local"} generated-source=${loaded?.source.path === pluginPath}`);
@@ -375,7 +447,7 @@ appendFileSync(file, Buffer.concat([...chunks, Buffer.from("\\n")]), { mode: 0o6
   const reloaded = await create("fixture-loader-reloaded");
   await began(reloaded);
   check((await normalized()).filter((event) => event.session_id === reloaded && event.event === "began").length === 1);
-  console.log("PASS real-v2-smoke: exact=2.0.27 isolation=private loader=active source=generated subscription=active unload=silent reload=active");
+  console.log("PASS real-v2-smoke: exact=2.2.5 isolation=private loader=active source=generated subscription=active unload=silent reload=active");
   phase = "native-background-child-barriers";
   const parent = await create("fixture-native-parent");
   nativeParent = parent;
@@ -401,7 +473,7 @@ appendFileSync(file, Buffer.concat([...chunks, Buffer.from("\\n")]), { mode: 0o6
   check(!events.some((event) => children.includes(event.session_id) && ["began", "completed"].includes(event.event)));
   check(!events.some((event) => event.event === "failed"));
   check(sessionStates.get(parent).started === 3 && sessionStates.get(parent).delivered >= 3);
-  console.log("PASS real-v2-smoke: exact=2.0.27 native-children=2 parent-executions=3 results-consumed=2 root-began=1 root-completed=1 child-completed=0");
+  console.log("PASS real-v2-smoke: exact=2.2.5 native-children=2 parent-executions=3 results-consumed=2 root-began=1 root-completed=1 child-completed=0");
   phase = "native-background-shell-barrier";
   const shellParent = await create("fixture-shell-parent");
   await waitFor(() => shellStates.size === 1 && [...shellStates.values()].every((shell) =>
@@ -411,8 +483,11 @@ appendFileSync(file, Buffer.concat([...chunks, Buffer.from("\\n")]), { mode: 0o6
   check(!(await normalized()).some((event) => event.session_id === shellParent && event.event === "completed"));
   phase = "native-shell-output-consumption";
   // One FIFO write releases only this fixture's fixed native command; no lifecycle injection.
-  const writer = await open(shellRelease, constants.O_WRONLY | constants.O_NONBLOCK);
-  try { await writer.writeFile("fixture-shell-result\n"); } finally { await writer.close(); }
+  const release = async (fifo, output) => {
+    const writer = await open(fifo, constants.O_WRONLY | constants.O_NONBLOCK);
+    try { await writer.writeFile(output); } finally { await writer.close(); }
+  };
+  await release(shellRelease, "fixture-shell-result\n");
   await waitFor(() => [...shellStates.values()].every((shell) => shell.status === "exited") &&
     shellResultConsumed && sessionStates.get(shellParent)?.succeeded >= 2);
   phase = "native-shell-root-completion";
@@ -423,7 +498,59 @@ appendFileSync(file, Buffer.concat([...chunks, Buffer.from("\\n")]), { mode: 0o6
   check(shellEvents.filter((event) => event.event === "completed").length === 1);
   check(!shellEvents.some((event) => event.event === "failed"));
   check(sessionStates.get(shellParent).started === 2 && sessionStates.get(shellParent).delivered >= 2);
-  console.log("PASS real-v2-smoke: exact=2.0.27 native-shells=1 held-root-completed=0 parent-executions=2 output-consumed=1 root-began=1 root-completed=1");
+  console.log("PASS real-v2-smoke: exact=2.2.5 native-shells=1 held-root-completed=0 parent-executions=2 output-consumed=1 root-began=1 root-completed=1");
+  phase = "multi-location-instance-startup";
+  for (const directory of locations) {
+    await waitFor(async () => active(await plugins(directory))?.state.status === "active");
+    liveLocations += 1;
+  }
+  await delay(300);
+  phase = "multi-location-single-submission";
+  locationBaseline = new Set(sessionStates.keys());
+  locationParent = await create("fixture-locations-parent");
+  await complete(locationParent);
+  await delay(300);
+  const locationChildren = [...sessionStates.keys()].filter((id) => !locationBaseline.has(id) && id !== locationParent);
+  check(locationChildren.length === 1 && sessionStates.get(locationChildren[0]).succeeded === 1);
+  const locationEvents = (await normalized()).filter((event) => !locationBaseline.has(event.session_id));
+  check(locationEvents.filter((event) => event.session_id === locationParent && event.event === "began").length === 1);
+  check(locationEvents.filter((event) => event.session_id === locationChildren[0] && event.event === "reset").length === 1);
+  check(locationEvents.filter((event) => event.session_id === locationParent && event.event === "completed").length === 1);
+  check(locationEvents.length === 3);
+  console.log("PASS real-v2-smoke: exact=2.2.5 live-locations=4 root-began=1 child-reset=1 root-completed=1 submissions=3");
+  phase = "late-location-shell-barrier";
+  lateShellParent = await create("fixture-late-shells-parent");
+  const lateShells = () => [...shellStates.values()].filter((shell) => shell.sessionID === lateShellParent);
+  const lateCompletions = async () => (await normalized()).filter((event) =>
+    event.session_id === lateShellParent && event.event === "completed").length;
+  await waitFor(() => lateShells().length === 2 && lateShells().every((shell) => shell.status === "running") &&
+    sessionStates.get(lateShellParent)?.succeeded === 1);
+  phase = "late-location-startup-after-shells";
+  await waitFor(async () => active(await plugins(lateLocation))?.state.status === "active");
+  liveLocations += 1;
+  await delay(300);
+  check(lateShells().every((shell) => shell.status === "running"));
+  check(await lateCompletions() === 0);
+  phase = "late-location-first-shell-wakeup";
+  await release(lateShellReleases[0], "fixture-late-shell-result-1\n");
+  await waitFor(() => lateShells().filter((shell) => shell.status === "exited").length === 1 && lateShellsConsumed === 1 &&
+    sessionStates.get(lateShellParent)?.succeeded >= 2);
+  await delay(300); // >50 ms: no location may complete the root while its second shell runs.
+  check(lateShells().filter((shell) => shell.status === "running").length === 1);
+  heldLateCompletions = await lateCompletions();
+  check(heldLateCompletions === 0);
+  phase = "late-location-second-shell-completion";
+  await release(lateShellReleases[1], "fixture-late-shell-result-2\n");
+  await waitFor(() => lateShells().every((shell) => shell.status === "exited") && lateShellsConsumed === 2 &&
+    sessionStates.get(lateShellParent)?.succeeded >= 3);
+  await complete(lateShellParent);
+  await delay(300);
+  const lateEvents = (await normalized()).filter((event) => event.session_id === lateShellParent);
+  check(lateEvents.filter((event) => event.event === "began").length === 1);
+  check(lateEvents.filter((event) => event.event === "completed").length === 1);
+  check(!lateEvents.some((event) => event.event === "failed"));
+  check(sessionStates.get(lateShellParent).started === 3 && sessionStates.get(lateShellParent).delivered >= 3);
+  console.log("PASS real-v2-smoke: exact=2.2.5 live-locations=5 late-location=after-shells native-shells=2 held-root-completed=0 parent-executions=3 outputs-consumed=2 root-began=1 root-completed=1");
 }
 
 try {
@@ -435,6 +562,16 @@ try {
   if (nativeParent) {
     const events = await normalized().catch(() => []);
     console.error(`CHECK real-v2-smoke: held-native-children=${heldChildren.size} parent-executions=${sessionStates.get(nativeParent)?.started ?? 0} results-consumed=${resultConsumptions} root-began=${events.filter((event) => event.session_id === nativeParent && event.event === "began").length} root-completed=${events.filter((event) => event.session_id === nativeParent && event.event === "completed").length}`);
+  }
+  if (locationBaseline) {
+    const events = (await normalized().catch(() => [])).filter((event) => !locationBaseline.has(event.session_id) && event.session_id !== lateShellParent);
+    const count = (kind, isRoot) => events.filter((event) => event.event === kind && (event.session_id === locationParent) === isRoot).length;
+    console.error(`CHECK real-v2-smoke: live-locations=${liveLocations} root-began=${count("began", true)} child-reset=${count("reset", false)} root-completed=${count("completed", true)} submissions=${events.length}`);
+  }
+  if (lateShellParent) {
+    const events = (await normalized().catch(() => [])).filter((event) => event.session_id === lateShellParent);
+    const shells = [...shellStates.values()].filter((shell) => shell.sessionID === lateShellParent);
+    console.error(`CHECK real-v2-smoke: live-locations=${liveLocations} native-shells=${shells.length} running-shells=${shells.filter((shell) => shell.status === "running").length} parent-executions=${sessionStates.get(lateShellParent)?.started ?? 0} outputs-consumed=${lateShellsConsumed} held-root-completed=${heldLateCompletions ?? "unchecked"} root-began=${events.filter((event) => event.event === "began").length} root-completed=${events.filter((event) => event.event === "completed").length}`);
   }
   console.error(`FAIL real-v2-smoke: ${phase}; no raw diagnostics emitted`);
   process.exitCode = 1;
@@ -451,6 +588,7 @@ try {
       provider.closeAllConnections();
       await new Promise((resolve) => provider.close(resolve));
     }
+    await releaseFixtureFifos();
     // This unique mkdtemp tree was created by this invocation; no user-owned files are removed.
     if (root) await rm(root, { recursive: true, force: true });
   } catch {

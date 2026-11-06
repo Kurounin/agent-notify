@@ -67,7 +67,9 @@ agent_notify_save_state() {
       print -- "UPDATED_AT=$STATE_UPDATED_AT"
     } > "$temporary"
   ) || return 1
-  /bin/chmod 600 "$temporary" && /bin/mv -f "$temporary" "$state_path"
+  # Record saves replace only nothing or a regular file, because mv moves a file into a directory or through a link to one; -h covers a link that appears after the check.
+  [[ ! -L $state_path && ( ! -e $state_path || -f $state_path ) ]] || { /bin/rm -f "$temporary"; return 1; }
+  /bin/chmod 600 "$temporary" && /bin/mv -fh "$temporary" "$state_path"
 }
 
 agent_notify_lock_path_is_safe() {
@@ -80,16 +82,20 @@ agent_notify_lock_path_is_safe() {
   [[ $basename =~ '^(\.?[[:alnum:]][[:alnum:]_.-]*)\.lock$' ]] || return 1
 }
 
+# Re-sourcing keeps a live counter. Any other value, such as one from the environment, is replaced unevaluated, because typeset -gi alone would evaluate it as arithmetic.
+[[ ${(t)AGENT_NOTIFY_LOCK_NONCE_COUNTER-} == integer* ]] || typeset -gi AGENT_NOTIFY_LOCK_NONCE_COUNTER=0
+
 agent_notify_lock_nonce() {
   local now=$1
-  print -r -- "p$$-t$now-r$RANDOM-$RANDOM"
+  (( ++AGENT_NOTIFY_LOCK_NONCE_COUNTER ))
+  REPLY="p$$-t$now-n$AGENT_NOTIFY_LOCK_NONCE_COUNTER"
 }
 
 agent_notify_lock_owned() {
   local lock_path=$1 token=$2 owner_path="$1/owner" owner
   agent_notify_lock_path_is_safe "$lock_path" || return 1
   [[ -r $owner_path ]] || return 1
-  owner=$(<"$owner_path")
+  { owner=$(<"$owner_path") } 2>/dev/null || return 1
   [[ $owner == "$token" ]]
 }
 
@@ -116,7 +122,7 @@ agent_notify_lock_snapshot() {
   (( owner_modified > AGENT_NOTIFY_LOCK_SNAPSHOT_FALLBACK_MODIFIED )) && AGENT_NOTIFY_LOCK_SNAPSHOT_FALLBACK_MODIFIED=$owner_modified
   if [[ -r $owner_path ]]; then
     AGENT_NOTIFY_LOCK_SNAPSHOT_OWNER_STATE=readable
-    AGENT_NOTIFY_LOCK_SNAPSHOT_OWNER_RECORD=$(<"$owner_path")
+    { AGENT_NOTIFY_LOCK_SNAPSHOT_OWNER_RECORD=$(<"$owner_path") } 2>/dev/null || return 1
   else
     AGENT_NOTIFY_LOCK_SNAPSHOT_OWNER_STATE=unreadable
   fi
@@ -289,7 +295,7 @@ agent_notify_prune_state_locked() {
   integer inspected=0 index start=1 offset
   state_paths=("$AGENT_NOTIFY_STATE_DIR"/*.state(NOm))
   (( ${#state_paths} )) || return 0
-  [[ -r $(agent_notify_prune_cursor_path) ]] && cursor=$(<"$(agent_notify_prune_cursor_path)")
+  [[ -r $(agent_notify_prune_cursor_path) ]] && { cursor=$(<"$(agent_notify_prune_cursor_path)") } 2>/dev/null || cursor=''
   if [[ $cursor =~ '^[[:alnum:]][[:alnum:]_.-]*\.state$' ]]; then
     for (( index = 1; index <= ${#state_paths}; index++ )); do
       [[ ${state_paths[index]:t} == "$cursor" ]] || continue
@@ -308,7 +314,8 @@ agent_notify_prune_state_locked() {
     last_cursor=$state_basename
     (( inspected++ ))
   done
-  [[ -z $last_cursor ]] || agent_notify_save_prune_cursor "$last_cursor"
+  # The cursor only rotates passes, so a failed save must not also stop the caller from saving the rate-limit marker.
+  [[ -z $last_cursor ]] || agent_notify_save_prune_cursor "$last_cursor" || true
 }
 
 agent_notify_prune_marker_path() {
@@ -320,7 +327,8 @@ agent_notify_save_prune_marker() {
   marker=$(agent_notify_prune_marker_path)
   temporary="$marker.$$.tmp"
   (umask 077; print -r -- "$now" > "$temporary") || return 1
-  /bin/chmod 600 "$temporary" && /bin/mv -f "$temporary" "$marker"
+  [[ ! -L $marker && ( ! -e $marker || -f $marker ) ]] || { /bin/rm -f "$temporary"; return 1; }
+  /bin/chmod 600 "$temporary" && /bin/mv -fh "$temporary" "$marker"
 }
 
 agent_notify_prune_cursor_path() {
@@ -333,7 +341,8 @@ agent_notify_save_prune_cursor() {
   marker=$(agent_notify_prune_cursor_path)
   temporary="$marker.$$.tmp"
   (umask 077; print -r -- "$cursor" > "$temporary") || return 1
-  /bin/chmod 600 "$temporary" && /bin/mv -f "$temporary" "$marker"
+  [[ ! -L $marker && ( ! -e $marker || -f $marker ) ]] || { /bin/rm -f "$temporary"; return 1; }
+  /bin/chmod 600 "$temporary" && /bin/mv -fh "$temporary" "$marker"
 }
 
 agent_notify_prune_state_forced() {
@@ -351,7 +360,7 @@ agent_notify_prune_if_due_locked() {
   local now=$1 marker previous
   marker=$(agent_notify_prune_marker_path)
   previous=''
-  [[ -r $marker ]] && previous=$(<"$marker")
+  [[ -r $marker ]] && { previous=$(<"$marker") } 2>/dev/null || previous=''
   if [[ $previous =~ '^[0-9]+$' ]] && (( now - previous < AGENT_NOTIFY_PRUNE_INTERVAL_SECONDS )); then
     return 0
   fi
@@ -365,7 +374,7 @@ agent_notify_prune_state_if_due() {
   now=$(agent_notify_now)
   marker=$(agent_notify_prune_marker_path)
   previous=''
-  [[ -r $marker ]] && previous=$(<"$marker")
+  [[ -r $marker ]] && { previous=$(<"$marker") } 2>/dev/null || previous=''
   if [[ $previous =~ '^[0-9]+$' ]] && (( now - previous < AGENT_NOTIFY_PRUNE_INTERVAL_SECONDS )); then
     return 0
   fi
@@ -402,7 +411,7 @@ agent_notify_lock_snapshot_at() {
   (( ${owner_details#*:} > AGENT_NOTIFY_LOCK_SNAPSHOT_FALLBACK_MODIFIED )) && AGENT_NOTIFY_LOCK_SNAPSHOT_FALLBACK_MODIFIED=${owner_details#*:}
   if [[ -r $owner_path ]]; then
     AGENT_NOTIFY_LOCK_SNAPSHOT_OWNER_STATE=readable
-    AGENT_NOTIFY_LOCK_SNAPSHOT_OWNER_RECORD=$(<"$owner_path")
+    { AGENT_NOTIFY_LOCK_SNAPSHOT_OWNER_RECORD=$(<"$owner_path") } 2>/dev/null || return 1
   else
     AGENT_NOTIFY_LOCK_SNAPSHOT_OWNER_STATE=unreadable
   fi
@@ -425,7 +434,7 @@ agent_notify_external_snapshot_reaper() {
   (( ${owner_details#*:} > AGENT_NOTIFY_EXTERNAL_REAPER_MTIME )) && AGENT_NOTIFY_EXTERNAL_REAPER_MTIME=${owner_details#*:}
   if [[ -r $path ]]; then
     AGENT_NOTIFY_EXTERNAL_REAPER_STATE=readable
-    AGENT_NOTIFY_EXTERNAL_REAPER_RECORD=$(<"$path")
+    { AGENT_NOTIFY_EXTERNAL_REAPER_RECORD=$(<"$path") } 2>/dev/null || return 1
   else
     AGENT_NOTIFY_EXTERNAL_REAPER_STATE=unreadable
   fi
@@ -454,7 +463,7 @@ agent_notify_external_reaper_owned() {
   [[ -d $directory && ! -L $directory ]] || return 1
   current=$(/usr/bin/stat -f '%i' "$directory" 2>/dev/null) || return 1
   [[ $current == "$inode" && -r $directory/reaper ]] || return 1
-  owner=$(<"$directory/reaper")
+  { owner=$(<"$directory/reaper") } 2>/dev/null || return 1
   [[ $owner == "$token" ]]
 }
 
@@ -472,7 +481,8 @@ agent_notify_external_reserve_container() {
   agent_notify_lock_path_is_safe "$lock_path" || return 1
   now=$(agent_notify_now)
   while (( attempt++ < 4 )); do
-    nonce=$(agent_notify_lock_nonce "$now")
+    agent_notify_lock_nonce "$now"
+    nonce=$REPLY
     directory="$AGENT_NOTIFY_STATE_DIR/.${lock_path:t}.${family}-quarantine.$nonce"
     [[ ${directory:h:A} == ${AGENT_NOTIFY_STATE_DIR:A} && ! -e $directory && ! -L $directory ]] || continue
     (umask 077; /bin/mkdir "$directory") 2>/dev/null || continue
@@ -573,7 +583,8 @@ agent_notify_recover_stale_lock() {
   (umask 077; /bin/mkdir "$gate") 2>/dev/null || return 1
   local now gate_token gate_inode
   now=$(agent_notify_now)
-  gate_token="$$ $now $(agent_notify_lock_nonce "$now")"
+  agent_notify_lock_nonce "$now"
+  gate_token="$$ $now $REPLY"
   agent_notify_external_publish_reaper "$gate" "$gate_token" || { /bin/rmdir "$gate" 2>/dev/null || true; return 1; }
   gate_inode=$(/usr/bin/stat -f '%i' "$gate" 2>/dev/null) || return 1
   agent_notify_external_reaper_owned "$gate" "$gate_token" "$gate_inode" || return 1
@@ -638,7 +649,8 @@ agent_notify_acquire_mkdir_lock() {
     return 1
   fi
   now=$(agent_notify_now)
-  token="$$ $now $(agent_notify_lock_nonce "$now")"
+  agent_notify_lock_nonce "$now"
+  token="$$ $now $REPLY"
   agent_notify_publish_lock_owner "$lock_path" "$token" || { /bin/rmdir "$lock_path" 2>/dev/null || true; return 1; }
   REPLY=$token
 }
@@ -685,7 +697,7 @@ agent_notify_with_mkdir_lock() {
     if [[ -r $lock_path/owner ]]; then
       local owner_record=''
       local -a owner_fields=()
-      owner_record=$(<"$lock_path/owner")
+      { owner_record=$(<"$lock_path/owner") } 2>/dev/null || owner_record=''
       owner_fields=(${(s: :)owner_record})
       if (( ${#owner_fields} == 2 || ${#owner_fields} == 3 )) && [[ ${owner_fields[1]:-} =~ '^[0-9]+$' ]] && /bin/kill -0 "${owner_fields[1]}" 2>/dev/null; then
         (( attempt++ >= AGENT_NOTIFY_LOCK_TIMEOUT_ATTEMPTS )) && return 1

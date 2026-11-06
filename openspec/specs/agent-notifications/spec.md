@@ -126,11 +126,13 @@ Neither accepted nor rejected raw tmux names, `TMUX` or `TMUX_PANE`, pane or soc
 ### Requirement: Keep notifier event processing live under abandoned housekeeping locks
 The notifier SHALL process the current event before retention cleanup and SHALL treat cleanup as best-effort work that does not wait for a global prune lock or a locked session record. It SHALL rate-limit and batch full retention scans, SHALL rotate bounded passes so persistently locked records cannot permanently starve later records, and SHALL preserve the existing retention and maximum-active-age rules. Every lock mutation SHALL be restricted to a validated non-symlink lock directly under the canonical state directory.
 
-Each acquired lock SHALL carry a unique ownership token. Stale-lock recovery SHALL raise a recovery gate only after a read-only check finds the lock recoverable under the rules below, so a lock that check finds young or live does not raise one. It SHALL then derive a canonical recovery gate directly in that state directory, acquire a unique reaper token for that gate before the authoritative stale-lock snapshot, and use unique gate- or lock-quarantine containers as hard fences. Before and after moving a canonical gate or lock, recovery SHALL verify owned-container and moved-object identity, including the applicable inode and owner/reaper snapshot. A process SHALL NOT remove a replacement gate, quarantine, or lock with mismatched identity. Normal acquisition, callback execution, and owned-lock cleanup SHALL honor canonical gates and quarantine fences.
+Each acquired lock SHALL carry a unique ownership token. Tokens SHALL also differ between acquisitions by one process, including the same lock acquired again within one second, and between that process's locks, recovery gates, and quarantine containers. Stale-lock recovery SHALL raise a recovery gate only after a read-only check finds the lock recoverable under the rules below, so a lock that check finds young or live does not raise one. It SHALL then derive a canonical recovery gate directly in that state directory, acquire a unique reaper token for that gate before the authoritative stale-lock snapshot, and use unique gate- or lock-quarantine containers as hard fences. Before and after moving a canonical gate or lock, recovery SHALL verify owned-container and moved-object identity, including the applicable inode and owner/reaper snapshot. A process SHALL NOT remove a replacement gate, quarantine, or lock with mismatched identity. Normal acquisition, callback execution, and owned-lock cleanup SHALL honor canonical gates and quarantine fences.
 
-Recovery cleanup SHALL handle no more than one stale gate or quarantine per attempt. It SHALL preserve a valid live gate or quarantine reaper regardless of its age. A dead, ownerless, malformed, unreadable, or empty gate or quarantine container SHALL be recoverable only when its newest relevant filesystem metadata is older than the configured stale-lock interval. A valid lock owner remains authoritative while its process is live; absent or malformed lock ownership uses the same conservative age rule. These guarantees apply to cooperative `agent-notify` processes that treat owned unique quarantines as immutable.
+Recovery cleanup SHALL handle no more than one stale gate or quarantine per attempt. It SHALL preserve a valid live gate or quarantine reaper regardless of its age. A dead, ownerless, malformed, unreadable (denied read permission), or empty gate or quarantine container SHALL be recoverable only when its newest relevant filesystem metadata is older than the configured stale-lock interval. A valid lock owner remains authoritative while its process is live; absent or malformed lock ownership uses the same conservative age rule. A lock owner, gate, or quarantine record that grants read permission but cannot be read as a file, such as a readable directory, is neither ownership nor evidence of staleness, so its lock, gate, or quarantine stays in place; a record that denies read permission is unreadable, and one that does not resolve to an existing entry is absent. These guarantees apply to cooperative `agent-notify` processes that treat owned unique quarantines as immutable.
 
 The notifier SHALL serialize the current session's read, eligibility decision, delivery reservation, and state write, then SHALL release that session lock before Keychain access or Pushover transport.
+
+The notifier SHALL replace a session state record, the retention-cleanup marker, or the retention-cleanup cursor only when no entry exists at that path or the entry is a regular file that is not a symbolic link. Otherwise the save SHALL fail without writing into, through, or over that entry, and the notifier SHALL leave the entry in place and SHALL remove its own temporary file. The notifier SHALL NOT follow a symbolic link to a directory that appears at that path while the save is in progress; a directory that appears there in that window MAY receive that save's temporary file. A failed cursor save SHALL NOT prevent the marker from being saved. While such an entry occupies the marker path, passes no longer update the rate limit, and while one occupies the cursor path, bounded passes do not rotate.
 
 #### Scenario: Retention encounters an ownerless stale lock
 - **WHEN** best-effort retention cleanup encounters a lock with no valid owner metadata whose directory age exceeds the stale-lock interval
@@ -156,6 +158,10 @@ The notifier SHALL serialize the current session's read, eligibility decision, d
 - **WHEN** several notifier processes submit events for one session at the same time, within the current-session lock bound
 - **THEN** each event SHALL be applied and no lock directory SHALL remain
 
+#### Scenario: One process creates several locks in one second
+- **WHEN** one notifier process acquires several locks, acquires a lock again after releasing it, raises a recovery gate, or reserves quarantine containers within the same second
+- **THEN** each SHALL carry a different token, a token from an earlier acquisition SHALL NOT be accepted as owner of a later one, and a second quarantine container reserved for the same lock SHALL receive a different name
+
 #### Scenario: A live recovery gate is present
 - **WHEN** a stale lock has a canonical recovery gate with a valid reaper whose process is live
 - **THEN** recovery SHALL preserve the gate and SHALL NOT acquire the lock or invoke its callback
@@ -175,6 +181,11 @@ The notifier SHALL serialize the current session's read, eligibility decision, d
 #### Scenario: A contended prune prefix persists
 - **WHEN** one bounded prune pass skips a full batch of persistently locked records
 - **THEN** a later pass SHALL advance beyond that batch and inspect eligible later records
+
+#### Scenario: A record to be replaced is not a regular file
+- **WHEN** the notifier saves a session state record, the retention-cleanup marker, or the retention-cleanup cursor, and the entry at that path is a directory, a FIFO, a symbolic link, or anything else that is not a regular file
+- **THEN** the save SHALL fail without writing to standard error, SHALL leave that entry and anything it links to unchanged, and SHALL leave no temporary file behind
+- **AND** a failed state save SHALL fail that event's state processing, with no delivery for that event, while still returning success to the calling integration, and a failed cursor save SHALL NOT stop the marker from being saved
 
 ### Requirement: Deliver privacy-minimized Pushover messages
 The system SHALL retrieve the Pushover user key and application token from the logged-in user's macOS Keychain and deliver messages only to Pushover's fixed HTTPS endpoint with TLS verification, redirects disabled, a five-second total timeout, and no retries. Pushover and downstream push services SHALL receive only the agent name; a sanitized, length-bounded display context consisting of the valid tmux session name when one is available or otherwise the basename of the session directory; a normalized state message; and — when excerpts are enabled and an excerpt is available — a sanitized, bounded single-line excerpt. Claude completion excerpts SHALL be sourced only from final assistant output, while Claude failure excerpts SHALL use the categorical error identifier and never free-text error detail. OpenCode completion excerpts SHALL use relevant root-session assistant text, while OpenCode failure excerpts SHALL use the structured error message when present and the error type otherwise, never the response body. The selected source SHALL be transmitted in full when it already fits the bound and SHALL be truncated when longer; model output or OpenCode error messages can repeat sensitive content such as secrets or paths. It SHALL use normal priority for completion, attention, and agent-error notifications. Adapter values SHALL be treated as untrusted data and SHALL NOT alter transport options, destination, or request structure.
@@ -299,6 +310,8 @@ The system SHALL return success to adapter-invoked lifecycle processing when cre
 
 After Pushover accepts a lifecycle message, the system SHALL record a diagnostic whose categorical code names the source and message kind. It SHALL NOT record one for a rejected send or for the smoke test. When the notifier receives empty input, the system SHALL record a categorical code distinct from the code for a malformed event.
 
+While processing an event, the notifier SHALL write nothing to standard error because a lock owner, recovery gate, quarantine, or retention-cleanup record is removed after the notifier finds it or cannot be read as a file.
+
 #### Scenario: Pushover is unavailable
 - **WHEN** the Pushover request times out or returns an error
 - **THEN** the system SHALL record only scrubbed diagnostic metadata locally and return success to the calling integration
@@ -323,6 +336,14 @@ After Pushover accepts a lifecycle message, the system SHALL record a diagnostic
 #### Scenario: An adapter submits a malformed event
 - **WHEN** the notifier receives non-empty input that is not a valid normalized event
 - **THEN** the system SHALL record the malformed-event code
+
+#### Scenario: A lock record disappears while it is read
+- **WHEN** during event processing, a lock owner, recovery gate, or quarantine record is removed after the notifier finds it, or is present but cannot be read as a file
+- **THEN** the notifier SHALL write nothing to standard error, SHALL NOT treat that lock, gate, or quarantine as its own or acquire, recover, or remove it on the basis of that read, and SHALL return success to the calling integration
+
+#### Scenario: A retention-cleanup record cannot be read
+- **WHEN** during event processing, the retention-cleanup marker or cursor is removed after the notifier finds it, or is present but cannot be read as a file
+- **THEN** the notifier SHALL write nothing to standard error and SHALL continue cleanup as if that record were absent
 
 ### Requirement: Integrate supported Claude Code and OpenCode events
 The system SHALL map Claude Code main-agent attention, completion, and failure hooks to normalized events. Claude attention SHALL be limited to `permission_prompt`, `elicitation_dialog`, and `elicitation_url_dialog`; all other notification types, including background-agent and subagent events, SHALL be ignored. Claude `began` events SHALL clear stale Claude attention; the adapter SHALL NOT claim a request-specific clear when Claude does not expose one.

@@ -551,6 +551,7 @@ done
 typeset state_source
 state_source=$(<"$root/lib/agent-notify/state.zsh")
 [[ $state_source != *uuidgen* ]] || { print -u2 -- 'state locking still invokes uuidgen'; exit 1; }
+[[ $state_source != *'$(agent_notify_lock_nonce'* ]] || { print -u2 -- 'a lock nonce is still read through command substitution'; exit 1; }
 typeset -A state_function_counts
 typeset state_source_line state_function_name
 while IFS= read -r state_source_line; do
@@ -679,7 +680,9 @@ AGENT_NOTIFY_NOW=$(/bin/date +%s) agent_notify_acquire_mkdir_lock "$young_conten
 agent_notify_run_owned_lock "$young_contended_lock" "$REPLY" true || { print -u2 -- 'young lock holder could not finish its callback'; exit 1; }
 [[ ! -e $young_contended_lock ]] || { print -u2 -- 'young lock holder did not remove its lock'; exit 1; }
 /bin/mkdir "$live_contended_lock"
-live_contended_owner="$$ $live_contended_now $(agent_notify_lock_nonce "$live_contended_now")"
+agent_notify_lock_nonce "$live_contended_now"
+live_contended_owner="$$ $live_contended_now $REPLY"
+[[ $live_contended_owner =~ '^[0-9]+ [0-9]+ [[:alnum:]-]+$' ]] || { print -u2 -- 'live-owner fixture token is not a three-field token'; exit 1; }
 print -r -- "$live_contended_owner" > "$live_contended_lock/owner"
 if AGENT_NOTIFY_NOW=$(( live_contended_now + 1000 )) agent_notify_recover_stale_lock "$live_contended_lock"; then
   print -u2 -- 'live-owner lock was recovered'
@@ -690,12 +693,13 @@ agent_notify_run_owned_lock "$live_contended_lock" "$live_contended_owner" true 
 [[ ! -e $live_contended_lock ]] || { print -u2 -- 'live lock holder did not remove its lock'; exit 1; }
 source "$root/lib/agent-notify/state.zsh"
 
-typeset lock_contention_diagnostics="$test_root/lock-contention-diagnostics" lock_contention_key lock_contention_state
+typeset lock_contention_diagnostics="$test_root/lock-contention-diagnostics" lock_contention_errors="$test_root/lock-contention-errors" lock_contention_key lock_contention_state lock_contention_error
 typeset -a lock_contention_pids lock_contention_requests lock_contention_leftovers
 integer lock_contention_index lock_contention_pid
 AGENT_NOTIFY_STATE_DIR="$test_root/lock-contention-state"
 agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
-# Separate processes, as real events arrive: forked subshells share $$ and RANDOM and would all write one lock token.
+/bin/mkdir "$lock_contention_errors"
+# Separate processes, as real events arrive: forked subshells share $$ and the nonce counter and would all write one lock token.
 # Each clears its own attention so a lost update stays visible, under the production bound of 20 lock attempts rather than this suite's 100.
 for lock_contention_trial in {1..5}; do
   lock_contention_key=$(agent_notify_session_key opencode "lock-contention-$lock_contention_trial")
@@ -708,7 +712,7 @@ for lock_contention_trial in {1..5}; do
   agent_notify_save_state "$lock_contention_state"
   lock_contention_pids=()
   for lock_contention_index in {1..5}; do
-    print -rn -- "{\"source\":\"opencode\",\"kind\":\"attention-cleared\",\"session_id\":\"lock-contention-$lock_contention_trial\",\"session_dir\":\"/tmp/lock-contention\",\"request_id\":\"request-$lock_contention_index\"}" | AGENT_NOTIFY_NOW=3000 AGENT_NOTIFY_LOCK_TIMEOUT_ATTEMPTS=20 AGENT_NOTIFY_DIAGNOSTIC_DIR=$lock_contention_diagnostics AGENT_NOTIFY_KEYCHAIN_RUNTIME_HELPER=/nonexistent "$root/bin/agent-notify" event &
+    print -rn -- "{\"source\":\"opencode\",\"kind\":\"attention-cleared\",\"session_id\":\"lock-contention-$lock_contention_trial\",\"session_dir\":\"/tmp/lock-contention\",\"request_id\":\"request-$lock_contention_index\"}" | AGENT_NOTIFY_NOW=3000 AGENT_NOTIFY_LOCK_TIMEOUT_ATTEMPTS=20 AGENT_NOTIFY_DIAGNOSTIC_DIR=$lock_contention_diagnostics AGENT_NOTIFY_KEYCHAIN_RUNTIME_HELPER=/nonexistent "$root/bin/agent-notify" event 2> "$lock_contention_errors/$lock_contention_trial-$lock_contention_index" &
     lock_contention_pids+=($!)
   done
   for lock_contention_pid in $lock_contention_pids; do
@@ -718,8 +722,297 @@ for lock_contention_trial in {1..5}; do
   [[ $STATE_ACTIVE == 1 && -z $STATE_ATTENTIONS ]] || { print -u2 -- 'contended session events were lost'; exit 1; }
 done
 [[ ! -e $lock_contention_diagnostics ]] || { print -u2 -- 'contended session events wrote diagnostics'; exit 1; }
+for lock_contention_error in "$lock_contention_errors"/*; do
+  [[ ! -s $lock_contention_error ]] || { print -u2 -- 'a contending notifier process wrote to stderr'; exit 1; }
+done
 lock_contention_leftovers=("$AGENT_NOTIFY_STATE_DIR"/(*.lock|*.recovery-gate|*-quarantine.*|*.tmp)(ND))
 assert_equals "${#lock_contention_leftovers}" 0
+AGENT_NOTIFY_STATE_DIR=$saved_state_dir
+
+# A fixed clock puts every token in these cases in one second, so only the nonce can tell them apart.
+typeset token_status token_reuse_lock token_reuse_first token_reuse_marker="$test_root/token-reuse-callback"
+AGENT_NOTIFY_STATE_DIR="$test_root/token-reuse-state"
+agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+token_reuse_lock="$AGENT_NOTIFY_STATE_DIR/token-reuse.lock"
+agent_notify_token_reuse_callback() { print -- ran > "$token_reuse_marker"; }
+/bin/mkdir "$token_reuse_lock"
+AGENT_NOTIFY_NOW=7000 agent_notify_acquire_mkdir_lock "$token_reuse_lock" || { print -u2 -- 'first same-second lock was not acquired'; exit 1; }
+token_reuse_first=$REPLY
+agent_notify_run_owned_lock "$token_reuse_lock" "$token_reuse_first" true || { print -u2 -- 'first same-second lock was not released'; exit 1; }
+/bin/mkdir "$token_reuse_lock"
+AGENT_NOTIFY_NOW=7000 agent_notify_acquire_mkdir_lock "$token_reuse_lock" || { print -u2 -- 'second same-second lock was not acquired'; exit 1; }
+[[ $REPLY != "$token_reuse_first" ]] || { print -u2 -- 'a lock acquired again in the same second reused its token'; exit 1; }
+if agent_notify_run_owned_lock "$token_reuse_lock" "$token_reuse_first" agent_notify_token_reuse_callback; then token_status=0; else token_status=$?; fi
+assert_equals "$token_status" 1
+[[ -d $token_reuse_lock && ! -e $token_reuse_marker ]] || { print -u2 -- 'a superseded token ran the later holder callback'; exit 1; }
+
+typeset token_recovery_lock token_recovery_token
+typeset -a token_recovery_tokens token_recovery_leftovers
+AGENT_NOTIFY_STATE_DIR="$test_root/token-recovery-state"
+agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+token_recovery_lock="$AGENT_NOTIFY_STATE_DIR/token-recovery.lock"
+/bin/mkdir "$token_recovery_lock"
+print -- '999999 0 stale-owner' > "$token_recovery_lock/owner"
+functions -c agent_notify_external_publish_reaper agent_notify_untracked_publish_reaper
+functions -c agent_notify_publish_lock_owner agent_notify_untracked_publish_lock_owner
+agent_notify_external_publish_reaper() {
+  token_recovery_tokens+=("$2")
+  agent_notify_untracked_publish_reaper "$@"
+}
+agent_notify_publish_lock_owner() {
+  token_recovery_tokens+=("$2")
+  agent_notify_untracked_publish_lock_owner "$@"
+}
+if AGENT_NOTIFY_NOW=7000 agent_notify_try_mkdir_lock "$token_recovery_lock" true; then token_status=0; else token_status=$?; fi
+source "$root/lib/agent-notify/state.zsh"
+assert_equals "$token_status" 0
+assert_equals "${#token_recovery_tokens}" 4
+assert_equals "${#${(@u)token_recovery_tokens}}" 4
+for token_recovery_token in $token_recovery_tokens; do
+  [[ $token_recovery_token =~ "^$$ 7000 [[:alnum:]-]+\$" ]] || { print -u2 -- 'a recovery token was not built from a fresh nonce'; exit 1; }
+done
+token_recovery_leftovers=("$AGENT_NOTIFY_STATE_DIR"/(*.lock|*.recovery-gate|*-quarantine.*)(ND))
+assert_equals "${#token_recovery_leftovers}" 0
+
+typeset container_reuse_lock container_reuse_first
+AGENT_NOTIFY_STATE_DIR="$test_root/container-reuse-state"
+agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+container_reuse_lock="$AGENT_NOTIFY_STATE_DIR/container-reuse.lock"
+if AGENT_NOTIFY_NOW=7000 agent_notify_external_reserve_container "$container_reuse_lock" lock; then token_status=0; else token_status=$?; fi
+assert_equals "$token_status" 0
+container_reuse_first=$AGENT_NOTIFY_EXTERNAL_CONTAINER
+if AGENT_NOTIFY_NOW=7000 agent_notify_external_reserve_container "$container_reuse_lock" lock; then token_status=0; else token_status=$?; fi
+assert_equals "$token_status" 0
+[[ $AGENT_NOTIFY_EXTERNAL_CONTAINER != "$container_reuse_first" && -d $container_reuse_first ]] || { print -u2 -- 'a second quarantine reservation in one second reused the first name'; exit 1; }
+
+# env keeps the value out of this shell, whose counter is an integer and would evaluate it.
+typeset inherited_counter_errors="$test_root/inherited-counter-errors"
+AGENT_NOTIFY_STATE_DIR="$test_root/inherited-counter-state"
+agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+if print -rn -- '{"source":"opencode","kind":"began","session_id":"inherited-counter","session_dir":"/tmp/inherited-counter"}' | /usr/bin/env AGENT_NOTIFY_LOCK_NONCE_COUNTER=abc AGENT_NOTIFY_DIAGNOSTIC_DIR="$test_root/inherited-counter-diagnostics" AGENT_NOTIFY_KEYCHAIN_RUNTIME_HELPER=/nonexistent "$root/bin/agent-notify" event 2> "$inherited_counter_errors"; then token_status=0; else token_status=$?; fi
+assert_equals "$token_status" 0
+[[ -f $AGENT_NOTIFY_STATE_DIR/$(agent_notify_session_key opencode inherited-counter).state && ! -s $inherited_counter_errors ]] || { print -u2 -- 'an inherited nonce counter stopped event processing'; exit 1; }
+AGENT_NOTIFY_STATE_DIR=$saved_state_dir
+
+typeset record_read_library record_read_line
+for record_read_library in "$root"/lib/agent-notify/*.zsh; do
+  while IFS= read -r record_read_line; do
+    [[ ! $record_read_line =~ '\$\([[:space:]]*([0-9]*>[^[:space:])]*[[:space:]]+)*<[^<(]' || $record_read_line == *'} 2>/dev/null'* ]] || { print -u2 -- "a record read in ${record_read_library:t} can write to stderr"; exit 1; }
+  done < "$record_read_library"
+done
+
+typeset record_read_errors="$test_root/record-read-errors" record_read_status
+assert_quiet_status() {
+  local expected=$1 label=$2 actual
+  shift 2
+  if "$@" 2> "$record_read_errors/$label"; then actual=0; else actual=$?; fi
+  [[ $actual == "$expected" ]] || { print -u2 -- "$label: expected status $expected, got $actual"; exit 1; }
+  [[ ! -s $record_read_errors/$label ]] || { print -u2 -- "$label wrote to stderr"; exit 1; }
+}
+/bin/mkdir "$record_read_errors"
+
+# A directory passes each readability check and then fails the read, as a record removed in between does.
+typeset record_owned_lock record_snapshot_lock record_snapshot_at_lock record_snapshot_reaper_gate record_reaper_owned_gate record_waiter_lock
+AGENT_NOTIFY_STATE_DIR="$test_root/record-read-state"
+agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+record_owned_lock="$AGENT_NOTIFY_STATE_DIR/record-owned.lock"
+record_snapshot_lock="$AGENT_NOTIFY_STATE_DIR/record-snapshot.lock"
+record_snapshot_at_lock="$AGENT_NOTIFY_STATE_DIR/record-snapshot-at.lock"
+record_waiter_lock="$AGENT_NOTIFY_STATE_DIR/record-waiter.lock"
+record_snapshot_reaper_gate=$(agent_notify_external_gate_path "$AGENT_NOTIFY_STATE_DIR/record-snapshot-reaper.lock")
+record_reaper_owned_gate=$(agent_notify_external_gate_path "$AGENT_NOTIFY_STATE_DIR/record-reaper-owned.lock")
+/bin/mkdir -p "$record_owned_lock/owner" "$record_snapshot_lock/owner" "$record_snapshot_at_lock/owner" "$record_waiter_lock/owner" "$record_snapshot_reaper_gate/reaper" "$record_reaper_owned_gate/reaper"
+assert_quiet_status 1 lock-owned agent_notify_lock_owned "$record_owned_lock" "$$ 7000 other-owner"
+assert_quiet_status 1 lock-owned-empty-token agent_notify_lock_owned "$record_owned_lock" ''
+assert_quiet_status 1 lock-snapshot agent_notify_lock_snapshot "$record_snapshot_lock"
+assert_quiet_status 1 lock-snapshot-at agent_notify_lock_snapshot_at "$record_snapshot_at_lock"
+assert_quiet_status 1 snapshot-reaper agent_notify_external_snapshot_reaper "$record_snapshot_reaper_gate"
+assert_quiet_status 1 reaper-owned agent_notify_external_reaper_owned "$record_reaper_owned_gate" "$$ 7000 other-reaper" "$(/usr/bin/stat -f '%i' "$record_reaper_owned_gate")"
+assert_quiet_status 1 reaper-owned-empty-token agent_notify_external_reaper_owned "$record_reaper_owned_gate" '' "$(/usr/bin/stat -f '%i' "$record_reaper_owned_gate")"
+AGENT_NOTIFY_LOCK_TIMEOUT_ATTEMPTS=1 assert_quiet_status 1 waiter agent_notify_with_mkdir_lock "$record_waiter_lock" true
+STATE_ACTIVE=0 STATE_STARTED_AT=0 STATE_ATTENTIONS='' STATE_LAST_ATTENTION_AT=0 STATE_TERMINAL=completed STATE_UPDATED_AT=1000000
+agent_notify_save_state "$AGENT_NOTIFY_STATE_DIR/record-prune.state"
+/bin/mkdir "$(agent_notify_prune_cursor_path)"
+assert_quiet_status 0 prune-cursor agent_notify_prune_state_locked 1000000
+/bin/mkdir "$(agent_notify_prune_marker_path)"
+STATE_UPDATED_AT=0
+agent_notify_save_state "$AGENT_NOTIFY_STATE_DIR/record-prune-expired.state"
+AGENT_NOTIFY_NOW=1000000 assert_quiet_status 1 prune-marker agent_notify_prune_state_if_due
+[[ ! -e $AGENT_NOTIFY_STATE_DIR/record-prune-expired.state && -f $AGENT_NOTIFY_STATE_DIR/record-prune.state ]] || { print -u2 -- 'an unreadable prune marker stopped retention cleanup'; exit 1; }
+
+typeset record_directory_owner_lock record_directory_owner_marker="$test_root/record-directory-owner-callback"
+typeset -a record_directory_owner_fences
+AGENT_NOTIFY_STATE_DIR="$test_root/record-directory-owner-state"
+agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+record_directory_owner_lock="$AGENT_NOTIFY_STATE_DIR/record-directory-owner.lock"
+/bin/mkdir -p "$record_directory_owner_lock/owner"
+/usr/bin/touch -t 197001010000 "$record_directory_owner_lock/owner" "$record_directory_owner_lock"
+agent_notify_record_directory_owner_callback() { print -- ran > "$record_directory_owner_marker"; }
+if AGENT_NOTIFY_NOW=1000000 agent_notify_try_mkdir_lock "$record_directory_owner_lock" agent_notify_record_directory_owner_callback; then record_read_status=0; else record_read_status=$?; fi
+assert_equals "$record_read_status" 1
+[[ -d $record_directory_owner_lock/owner && ! -e $record_directory_owner_marker ]] || { print -u2 -- 'a stale lock with a directory owner was recovered'; exit 1; }
+record_directory_owner_fences=("$AGENT_NOTIFY_STATE_DIR"/(*.recovery-gate|*-quarantine.*)(ND))
+assert_equals "${#record_directory_owner_fences}" 0
+
+typeset record_churn_lock record_churn_errors="$test_root/record-churn-errors"
+integer record_churn_pid record_churn_index
+AGENT_NOTIFY_STATE_DIR="$test_root/record-churn-state"
+agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+record_churn_lock="$AGENT_NOTIFY_STATE_DIR/record-churn.lock"
+/bin/mkdir "$record_churn_lock"
+while true; do
+  print -r -- "$$ 7000 churn-owner" > "$record_churn_lock/owner"
+  /bin/rm -f "$record_churn_lock/owner"
+done &
+record_churn_pid=$!
+for (( record_churn_index = 0; record_churn_index < 3000; record_churn_index++ )); do
+  agent_notify_lock_owned "$record_churn_lock" "$$ 7000 other-owner" || true
+done 2> "$record_churn_errors"
+/bin/kill "$record_churn_pid"
+wait "$record_churn_pid" || true
+[[ ! -s $record_churn_errors ]] || { print -u2 -- 'a vanishing owner record wrote to stderr'; exit 1; }
+
+typeset record_event_key record_event_errors="$test_root/record-event-errors"
+AGENT_NOTIFY_STATE_DIR="$test_root/record-event-state"
+agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+record_event_key=$(agent_notify_session_key opencode record-event)
+/bin/mkdir -p "$AGENT_NOTIFY_STATE_DIR/$record_event_key.lock/owner"
+if print -rn -- '{"source":"opencode","kind":"began","session_id":"record-event","session_dir":"/tmp/record-event"}' | AGENT_NOTIFY_LOCK_TIMEOUT_ATTEMPTS=1 AGENT_NOTIFY_DIAGNOSTIC_DIR="$test_root/record-event-diagnostics" AGENT_NOTIFY_KEYCHAIN_RUNTIME_HELPER=/nonexistent "$root/bin/agent-notify" event 2> "$record_event_errors"; then record_read_status=0; else record_read_status=$?; fi
+assert_equals "$record_read_status" 0
+[[ ! -s $record_event_errors ]] || { print -u2 -- 'an event with a directory lock owner wrote to stderr'; exit 1; }
+AGENT_NOTIFY_STATE_DIR=$saved_state_dir
+
+typeset record_gate_lock record_gate record_gate_quarantine_lock record_gate_quarantine record_lock_quarantine_lock record_lock_quarantine record_gate_marker="$test_root/record-gate-callback"
+typeset -a record_gate_fences
+AGENT_NOTIFY_STATE_DIR="$test_root/record-gate-state"
+agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+record_gate_lock="$AGENT_NOTIFY_STATE_DIR/record-gate.lock"
+record_gate=$(agent_notify_external_gate_path "$record_gate_lock")
+/bin/mkdir -p "$record_gate_lock" "$record_gate/reaper"
+print -- '999999 0 stale-owner' > "$record_gate_lock/owner"
+record_gate_quarantine_lock="$AGENT_NOTIFY_STATE_DIR/record-gate-quarantine.lock"
+record_gate_quarantine="$AGENT_NOTIFY_STATE_DIR/.record-gate-quarantine.lock.gate-quarantine.planted"
+/bin/mkdir -p "$record_gate_quarantine/reaper" "$record_gate_quarantine/object"
+print -- '999999 0 dead-reaper' > "$record_gate_quarantine/object/reaper"
+record_lock_quarantine_lock="$AGENT_NOTIFY_STATE_DIR/record-lock-quarantine.lock"
+record_lock_quarantine="$AGENT_NOTIFY_STATE_DIR/.record-lock-quarantine.lock.lock-quarantine.planted"
+/bin/mkdir -p "$record_lock_quarantine/object/owner"
+print -- '999999 0 dead-reaper' > "$record_lock_quarantine/reaper"
+/usr/bin/touch -t 197001010000 "$record_gate_lock/owner" "$record_gate_lock" "$record_gate/reaper" "$record_gate" "$record_gate_quarantine/reaper" "$record_gate_quarantine/object/reaper" "$record_gate_quarantine/object" "$record_gate_quarantine" "$record_lock_quarantine/object/owner" "$record_lock_quarantine/object" "$record_lock_quarantine/reaper" "$record_lock_quarantine"
+agent_notify_record_gate_callback() { print -- ran > "$record_gate_marker"; }
+AGENT_NOTIFY_NOW=1000000 assert_quiet_status 1 record-gate-first agent_notify_try_mkdir_lock "$record_gate_lock" agent_notify_record_gate_callback
+AGENT_NOTIFY_NOW=1000000 assert_quiet_status 1 record-gate-second agent_notify_try_mkdir_lock "$record_gate_lock" agent_notify_record_gate_callback
+AGENT_NOTIFY_NOW=1000000 assert_quiet_status 1 record-gate-quarantine agent_notify_try_mkdir_lock "$record_gate_quarantine_lock" agent_notify_record_gate_callback
+AGENT_NOTIFY_NOW=1000000 assert_quiet_status 1 record-lock-quarantine agent_notify_try_mkdir_lock "$record_lock_quarantine_lock" agent_notify_record_gate_callback
+[[ -d $record_gate/reaper && $(<"$record_gate_lock/owner") == '999999 0 stale-owner' && -d $record_gate_quarantine/reaper && -d $record_lock_quarantine/object/owner && ! -e $record_gate_quarantine_lock && ! -e $record_lock_quarantine_lock && ! -e $record_gate_marker ]] || { print -u2 -- 'a stale gate or quarantine with a directory record was recovered'; exit 1; }
+record_gate_fences=("$AGENT_NOTIFY_STATE_DIR"/*-quarantine.*(ND))
+assert_equals "${#record_gate_fences}" 2
+AGENT_NOTIFY_STATE_DIR=$saved_state_dir
+
+typeset record_save_site record_save_kind record_save_outside record_save_target record_save_before
+typeset -a record_save_entries
+integer record_save_expected
+for record_save_site in state marker cursor; do
+  for record_save_kind in absent regular directory directory-link file-link dangling-link fifo; do
+    AGENT_NOTIFY_STATE_DIR="$test_root/record-save-$record_save_site-$record_save_kind"
+    record_save_outside="$test_root/record-save-outside-$record_save_site-$record_save_kind"
+    agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+    /bin/mkdir "$record_save_outside"
+    print -r -- outside > "$record_save_outside/file"
+    case $record_save_site in
+      state) record_save_target="$AGENT_NOTIFY_STATE_DIR/record-save.state" ;;
+      marker) record_save_target=$(agent_notify_prune_marker_path) ;;
+      cursor) record_save_target=$(agent_notify_prune_cursor_path) ;;
+    esac
+    case $record_save_kind in
+      regular) print -r -- previous > "$record_save_target" ;;
+      directory) /bin/mkdir "$record_save_target" ;;
+      directory-link) /bin/ln -s "$record_save_outside" "$record_save_target" ;;
+      file-link) /bin/ln -s "$record_save_outside/file" "$record_save_target" ;;
+      dangling-link) /bin/ln -s "$record_save_outside/missing" "$record_save_target" ;;
+      fifo) /usr/bin/mkfifo "$record_save_target" ;;
+    esac
+    if [[ $record_save_kind == (absent|regular) ]]; then
+      record_save_expected=0
+    else
+      record_save_expected=1
+      record_save_before=$(/usr/bin/stat -f '%HT:%i' "$record_save_target")
+    fi
+    STATE_ACTIVE=0 STATE_STARTED_AT=0 STATE_ATTENTIONS='' STATE_LAST_ATTENTION_AT=0 STATE_TERMINAL=completed STATE_UPDATED_AT=1000000
+    case $record_save_site in
+      state) assert_quiet_status $record_save_expected "save-$record_save_site-$record_save_kind" agent_notify_save_state "$record_save_target" ;;
+      marker) assert_quiet_status $record_save_expected "save-$record_save_site-$record_save_kind" agent_notify_save_prune_marker 1000000 ;;
+      cursor) assert_quiet_status $record_save_expected "save-$record_save_site-$record_save_kind" agent_notify_save_prune_cursor record-save.state ;;
+    esac
+    record_save_entries=("$AGENT_NOTIFY_STATE_DIR"/**/*(ND) "$record_save_outside"/**/*(ND))
+    [[ ${(j: :)record_save_entries} == "$record_save_target $record_save_outside/file" && $(<"$record_save_outside/file") == outside ]] || { print -u2 -- "a $record_save_site save into a $record_save_kind left a file behind or wrote through it"; exit 1; }
+    if (( record_save_expected )); then
+      [[ $(/usr/bin/stat -f '%HT:%i' "$record_save_target") == "$record_save_before" ]] || { print -u2 -- "a $record_save_site save replaced a $record_save_kind"; exit 1; }
+    else
+      [[ -f $record_save_target && ! -L $record_save_target && $(/usr/bin/stat -f '%Lp' "$record_save_target") == 600 && $(<"$record_save_target") != previous ]] || { print -u2 -- "a $record_save_site save did not write over a $record_save_kind record"; exit 1; }
+    fi
+  done
+done
+
+typeset record_race_site record_race_target record_race_outside
+typeset -a record_race_entries
+integer record_race_planted
+for record_race_site in state marker cursor; do
+  AGENT_NOTIFY_STATE_DIR="$test_root/record-race-$record_race_site"
+  record_race_outside="$test_root/record-race-outside-$record_race_site"
+  agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+  /bin/mkdir "$record_race_outside"
+  case $record_race_site in
+    state) record_race_target="$AGENT_NOTIFY_STATE_DIR/record-race.state" ;;
+    marker) record_race_target=$(agent_notify_prune_marker_path) ;;
+    cursor) record_race_target=$(agent_notify_prune_cursor_path) ;;
+  esac
+  record_race_planted=0
+  # The chmod between a save's check and its move plants a link to an outside directory, as a racing process could.
+  function /bin/chmod {
+    command /bin/chmod "$@" || return
+    /bin/ln -s "$record_race_outside" "$record_race_target"
+    record_race_planted=1
+  }
+  STATE_ACTIVE=0 STATE_STARTED_AT=0 STATE_ATTENTIONS='' STATE_LAST_ATTENTION_AT=0 STATE_TERMINAL=completed STATE_UPDATED_AT=1000000
+  case $record_race_site in
+    state) assert_quiet_status 0 "race-$record_race_site" agent_notify_save_state "$record_race_target" ;;
+    marker) assert_quiet_status 0 "race-$record_race_site" agent_notify_save_prune_marker 1000000 ;;
+    cursor) assert_quiet_status 0 "race-$record_race_site" agent_notify_save_prune_cursor record-race.state ;;
+  esac
+  unfunction /bin/chmod
+  record_race_entries=("$record_race_outside"/*(ND) "$AGENT_NOTIFY_STATE_DIR"/*.tmp(ND))
+  [[ $record_race_planted == 1 && -f $record_race_target && ! -L $record_race_target && ${#record_race_entries} == 0 ]] || { print -u2 -- "a $record_race_site save followed a link that appeared after its check"; exit 1; }
+done
+
+typeset -a record_cursor_entries
+AGENT_NOTIFY_STATE_DIR="$test_root/record-cursor-state"
+agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+STATE_ACTIVE=0 STATE_STARTED_AT=0 STATE_ATTENTIONS='' STATE_LAST_ATTENTION_AT=0 STATE_TERMINAL=completed STATE_UPDATED_AT=0
+agent_notify_save_state "$AGENT_NOTIFY_STATE_DIR/record-cursor.state"
+/bin/mkdir "$(agent_notify_prune_cursor_path)"
+AGENT_NOTIFY_NOW=1000000 assert_quiet_status 0 prune-cursor-marker agent_notify_prune_state_if_due
+record_cursor_entries=("$(agent_notify_prune_cursor_path)"/*(ND) "$AGENT_NOTIFY_STATE_DIR"/*.tmp(ND))
+[[ ! -e $AGENT_NOTIFY_STATE_DIR/record-cursor.state && -f $(agent_notify_prune_marker_path) && $(<"$(agent_notify_prune_marker_path)") == 1000000 && ${#record_cursor_entries} == 0 ]] || { print -u2 -- 'a directory prune cursor received a file or stopped retention cleanup or its marker'; exit 1; }
+
+typeset record_state_path
+typeset -a record_state_entries record_state_diagnostics
+integer record_state_deliveries
+AGENT_NOTIFY_STATE_DIR="$test_root/record-state-state"
+agent_notify_prepare_directory "$AGENT_NOTIFY_STATE_DIR"
+record_state_path="$AGENT_NOTIFY_STATE_DIR/$(agent_notify_session_key opencode record-state).state"
+/bin/mkdir "$record_state_path"
+# A fresh marker skips retention, whose rm of a directory state record prints.
+print -r -- 1000000 > "$(agent_notify_prune_marker_path)"
+record_state_deliveries=$deliveries
+agent_notify_diag() { record_state_diagnostics+=("$1 $2"); }
+if AGENT_NOTIFY_NOW=1000000 agent_notify_event <<< '{"source":"opencode","kind":"failed","session_id":"record-state","session_dir":"/tmp/record-state"}' 2> "$record_read_errors/record-state"; then record_read_status=0; else record_read_status=$?; fi
+agent_notify_diag() { :; }
+assert_equals "$record_read_status" 0
+assert_equals "$deliveries" "$record_state_deliveries"
+assert_equals "${(j:,:)record_state_diagnostics}" 'state processing_failed'
+record_state_entries=("$record_state_path"/*(ND) "$AGENT_NOTIFY_STATE_DIR"/*.tmp(ND))
+[[ -d $record_state_path && ${#record_state_entries} == 0 && ! -s $record_read_errors/record-state ]] || { print -u2 -- 'an event wrote into a directory state record'; exit 1; }
 AGENT_NOTIFY_STATE_DIR=$saved_state_dir
 
 typeset event_before_prune_dir="$test_root/event-before-prune-state" event_before_prune_key event_before_prune_marker
